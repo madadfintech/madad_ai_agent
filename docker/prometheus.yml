@@ -1,0 +1,22 @@
+# Scrape the /metrics endpoint each service exposes (PrometheusMiddleware).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: madad-services
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - workflow:8001
+          - communication:8002
+          - cms:8003
+          - nudge:8004
+          - document:8005
+          - visibility:8006
+        labels:
+          platform: madad
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

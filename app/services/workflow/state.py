@@ -1,0 +1,54 @@
+"""Onboarding workflow state and reply helpers."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.shared.workflow.state import WorkflowState
+
+
+class OnboardingState(WorkflowState):
+    """Typed state for the Phase 1.a onboarding workflow (Steps 1–8)."""
+
+    locale: str = "en"
+
+    # Step 1–2: campaign + consent + CR.
+    entry_reply: str = ""
+    consent: bool = False
+    cr_ref: str | None = None
+
+    # Step 3–4: eligibility + financials + pre-qualification.
+    eligible: bool | None = None
+    financials_received: bool = False
+    application_ref: str | None = None  # Madad account ref (e.g. #7388266)
+    prequalified: bool | None = None
+
+    # Step 5–6: checklist + document collection.
+    missing_documents: list[str] = []
+
+    # Step 7–8: score, payment, offers, credit line.
+    score: int | None = None
+    risk_qualified: bool | None = None
+    paid: bool = False
+    offers: list[dict[str, Any]] = []
+    selected_offer: dict[str, Any] | None = None
+    credit_line_active: bool = False
+
+    # Terminal/decline tracking.
+    outcome: str | None = None  # completed | declined | not_eligible | ...
+
+
+def reply_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("text") or "").strip()
+    return str(value or "").strip()
+
+
+def reply_attachments(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        return list(value.get("attachments") or [])
+    return []
+
+
+def is_yes(value: Any) -> bool:
+    return reply_text(value).upper() in {"YES", "Y", "نعم"}

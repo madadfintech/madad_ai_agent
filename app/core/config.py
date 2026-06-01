@@ -1,0 +1,223 @@
+"""Application configuration.
+
+Settings are loaded from environment variables / ``.env``. Nested groups use a
+double-underscore delimiter, e.g. ``REDIS__URL`` maps to ``settings.redis.url``.
+
+Only the configuration the shared workflow runtime needs is defined here. Other
+service-specific settings will be layered on in their own modules.
+"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class RedisSettings(BaseModel):
+    """Redis connection + keyspace settings (sessions, events, scheduling)."""
+
+    url: str = "redis://localhost:6379/0"
+    key_prefix: str = "madad"
+    # Stream used by the Redis event-bus adapter.
+    event_stream: str = "stream:workflow"
+    # Consumer group for workflow event consumers.
+    event_group: str = "workflow-runtime"
+    max_stream_len: int = 100_000
+
+
+class PostgresSettings(BaseModel):
+    """PostgreSQL settings for the LangGraph checkpointer and run store.
+
+    The runtime persists ONLY orchestration state in the ``workflow`` schema.
+    Business data lives in Madad's backend (accessed via their APIs).
+    """
+
+    dsn: str = "postgresql+asyncpg://madad:change_me@localhost:5432/madad"
+    schema_name: str = "workflow"
+    # SQLAlchemy connection pool: ``pool_size`` persistent connections + up to
+    # ``max_overflow`` extra under load; recycle to avoid stale server-side conns.
+    pool_size: int = 10
+    max_overflow: int = 5
+    pool_recycle_seconds: int = 1800
+
+
+class PersistenceSettings(BaseModel):
+    """Selects in-memory (dev/tests) vs durable backends per concern.
+
+    ``backend=postgres`` makes every service use its PostgreSQL store (over
+    ``PostgresSettings.dsn``); ``cms_cache=redis`` enables cross-instance CMS
+    cache invalidation. Defaults keep tests/dev fully in-memory.
+    """
+
+    backend: str = "memory"  # memory | postgres
+    cms_cache: str = "memory"  # memory | redis
+
+
+class CelerySettings(BaseModel):
+    """Celery broker/result backend + beat schedule intervals (seconds).
+
+    Periodic platform jobs run under Celery beat: draining due nudges, re-driving
+    crash-interrupted workflow runs, and timing out lapsed waiting sessions.
+    Dedicated Redis logical DBs (1 = broker, 2 = results) keep this traffic off
+    the application keyspace (DB 0).
+    """
+
+    broker_url: str = "redis://localhost:6379/1"
+    result_backend: str = "redis://localhost:6379/2"
+    timezone: str = "UTC"
+
+    # Beat intervals (seconds). Nudges tick frequently; recovery/sweeps are coarse.
+    nudge_run_due_seconds: float = 60.0
+    workflow_recover_seconds: float = 300.0
+    workflow_timeout_sweep_seconds: float = 300.0
+
+
+class EventBusSettings(BaseModel):
+    """Unified cross-process event bus (Redis Streams in production).
+
+    Each service keeps its in-process typed bus as the domain transport; this is
+    the single cross-process stream that the Operational Visibility consumer
+    reads. ``transport=memory`` keeps tests/dev fully in-process.
+    """
+
+    transport: str = "memory"  # memory | redis
+    stream: str = "stream:events"
+    group: str = "visibility"
+    consumer: str = "visibility-1"
+    max_len: int = 100_000
+    block_ms: int = 5_000
+    batch_size: int = 100
+
+
+class McpSettings(BaseModel):
+    """Shared MCP client config. The agentic platform consumes Madad/Tess/channel
+    capabilities only through the MCP cluster (owned by a separate team).
+
+    ``enabled=False`` (default) keeps every service on its in-memory gateway, so
+    dev/tests need no MCP cluster. When enabled, services route through the real
+    client. ``endpoint``/``auth_token`` and the on-the-wire protocol are the only
+    catalog-blocked seams; tool names live in ``app.shared.mcp.registry``.
+    """
+
+    enabled: bool = False
+    endpoint: str = "https://mcp.ai.madadfintech.com"
+    auth_token: str | None = None
+    timeout_seconds: float = 10.0
+    retry_max_attempts: int = 1  # >1 retries transient transport failures
+    retry_base_delay_seconds: float = 0.5
+    retry_max_delay_seconds: float = 10.0
+
+
+class SecuritySettings(BaseModel):
+    """Public-API auth seams. Both are dev-open until a secret is configured.
+
+    ``jwt_*`` gate the service/public API (api.ai.madadfintech.com) with a bearer
+    JWT; ``webhook_*`` verify the HMAC signature on Madad-platform callbacks
+    (offer-acceptance + backend status). Exact schemes are confirmable with
+    Madad later without touching route handlers.
+    """
+
+    jwt_secret: str | None = None
+    jwt_algorithm: str = "HS256"
+    jwt_issuer: str | None = None
+    jwt_audience: str | None = None
+
+    webhook_secret: str | None = None
+    webhook_signature_header: str = "X-Madad-Signature"
+
+
+class ObservabilitySettings(BaseModel):
+    """Metrics + error tracking.
+
+    Prometheus metrics are exposed at ``/metrics`` (scraped, not authed). Sentry
+    is initialised only when ``sentry_dsn`` is set, so dev/tests run with neither
+    a Sentry account nor the SDK imported.
+    """
+
+    metrics_enabled: bool = True
+    sentry_dsn: str | None = None
+    sentry_traces_sample_rate: float = 0.0
+
+
+class DomainSettings(BaseModel):
+    """Public domain structure (``*.ai.madadfintech.com``).
+
+    The agentic platform is hosted under the ``ai`` sub-domain of madadfintech.com,
+    separate from Madad's core systems.
+    """
+
+    base: str = "ai.madadfintech.com"
+    api: str = "api.ai.madadfintech.com"  # conversational/workflow + communication
+    ops: str = "ops.ai.madadfintech.com"  # operational visibility (admin)
+    cms: str = "cms.ai.madadfintech.com"  # CMS & configuration (admin)
+    mcp: str = "mcp.ai.madadfintech.com"  # MCP gateway (restricted)
+
+    @property
+    def admin_cors_origins(self) -> list[str]:
+        """Allowed browser origins for the admin panels (ops + cms)."""
+
+        return [f"https://{self.ops}", f"https://{self.cms}"]
+
+
+class WorkflowSettings(BaseModel):
+    """Tunables for the shared workflow runtime."""
+
+    # Which adapters to wire. "memory" needs no external services (tests/dev).
+    # "redis" / "postgres" enable the production adapters.
+    session_backend: str = "memory"  # memory | redis
+    event_backend: str = "memory"  # memory | redis
+    checkpoint_backend: str = "memory"  # memory | postgres
+
+    # Single-step execution budget (seconds) before a step is timed out.
+    step_timeout_seconds: float = 60.0
+    # How long a session may wait for inbound input before it is considered
+    # lapsed (drives nudge/timeout sweeps). 0 disables.
+    session_ttl_seconds: int = 60 * 60 * 24 * 14  # 14 days
+
+    # Default retry policy applied to a workflow step on transient failure.
+    retry_max_attempts: int = 3
+    retry_base_delay_seconds: float = 0.5
+    retry_max_delay_seconds: float = 30.0
+    retry_jitter: bool = True
+
+    # Recovery sweep: re-drive runs left mid-step by a crash.
+    recovery_batch_size: int = 100
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_nested_delimiter="__",
+        extra="ignore",
+    )
+
+    app_name: str = "madad_fintech_ai"
+    app_env: str = "development"
+    app_host: str = "0.0.0.0"
+    app_port: int = 8000
+    log_level: str = "INFO"
+    # Emit logs as JSON (production) or human-friendly console (local dev).
+    log_json: bool = False
+
+    # Bearer token gating the admin services (CMS, Operational Visibility).
+    # Unset = open (local dev only); set in staging/prod. JWT/OIDC can replace it.
+    admin_api_token: str | None = None
+
+    # Inbound/outbound request-correlation header. Echoed on every response and
+    # bound to the structured-logging context for end-to-end tracing.
+    request_id_header: str = "X-Request-ID"
+
+    domains: DomainSettings = Field(default_factory=DomainSettings)
+    persistence: PersistenceSettings = Field(default_factory=PersistenceSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
+    postgres: PostgresSettings = Field(default_factory=PostgresSettings)
+    workflow: WorkflowSettings = Field(default_factory=WorkflowSettings)
+    celery: CelerySettings = Field(default_factory=CelerySettings)
+    events: EventBusSettings = Field(default_factory=EventBusSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
+    mcp: McpSettings = Field(default_factory=McpSettings)
+
+
+settings = Settings()

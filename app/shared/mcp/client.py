@@ -1,15 +1,19 @@
 """Shared MCP client — the single contract every service dispatches through.
 
 The platform never calls Madad/Tess/WhatsApp/Email directly; it calls MCP tools
-on the cluster (owned by a separate team). This module defines:
+on the cluster via Streamable HTTP. This module defines:
 
-* ``MCPToolCaller`` — the structural protocol adapters depend on (one definition,
-  was previously duplicated per service).
-* ``MCPClient`` — an abstract base adding timeout + optional transport retry +
+* :class:`MCPToolCaller` — the structural protocol adapters depend on.
+* :class:`MCPClient` — base class adding timeout + idempotency-gated retry +
   error normalisation around a subclass ``_invoke``.
-* ``InMemoryMCPClient`` — a recording fake (tests/dev) driven by per-tool handlers.
-* ``HttpMCPClient`` — the real client. The on-the-wire protocol (path/envelope)
-  is PROVISIONAL and is the only catalog-blocked seam; everything else is ready.
+* :class:`InMemoryMCPClient` — recording fake driven by per-tool handlers (tests).
+* :class:`HttpMCPClient` — production client. Wraps :class:`fastmcp.Client`
+  over Streamable HTTP. Authentication is configurable via ``McpSettings``
+  (Phase 0 ships the bearer mode; Cloud Run IAM lands in a follow-up).
+
+Retry semantics: writes are single-shot by default. A tool participates in
+retry only if it appears in ``settings.idempotent_tools`` (typically populated
+with ``Tools.read_only()`` plus ``Tools.payment_idempotent_writes()``).
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from app.core.config import McpSettings
@@ -24,7 +29,7 @@ from app.core.exceptions import UpstreamError
 from app.core.logging import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover
-    import httpx
+    import fastmcp
 
 SleepFn = Callable[[float], Awaitable[None]]
 HandlerFn = Callable[[dict[str, Any]], dict[str, Any]]
@@ -44,15 +49,25 @@ class MCPToolCaller(Protocol):
 
 
 class MCPClient(ABC):
-    """Base client: timeout + optional retry + error normalisation."""
+    """Base client: timeout + idempotency-gated retry + error normalisation."""
 
     def __init__(self, settings: McpSettings, *, sleep: SleepFn | None = None) -> None:
         self._settings = settings
         self._sleep: SleepFn = sleep or asyncio.sleep
         self._log = get_logger("mcp.client")
 
+    def is_idempotent(self, name: str) -> bool:
+        """A tool call is safe to retry only if explicitly registered as
+        idempotent (read-only or backend-honoured idempotency-key writes)."""
+
+        return name in self._settings.idempotent_tools
+
     async def call_tool(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        attempts = max(1, self._settings.retry_max_attempts)
+        # Writes that are NOT idempotency-key-honoured run single-shot regardless
+        # of the configured retry budget — protects against duplicate uploads,
+        # duplicate payment links, etc. (Q10 — backend support is still partial).
+        requested = max(1, self._settings.retry_max_attempts)
+        attempts = requested if self.is_idempotent(name) else 1
         delay = self._settings.retry_base_delay_seconds
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
@@ -63,7 +78,11 @@ class MCPClient(ABC):
             except Exception as exc:  # noqa: BLE001 - normalise + (optionally) retry
                 last_error = exc
                 self._log.warning(
-                    "mcp.call_failed", tool=name, attempt=attempt, error=str(exc)
+                    "mcp.call_failed",
+                    tool=name,
+                    attempt=attempt,
+                    attempts=attempts,
+                    error=str(exc),
                 )
                 if attempt >= attempts:
                     break
@@ -71,7 +90,7 @@ class MCPClient(ABC):
                 delay = min(delay * 2, self._settings.retry_max_delay_seconds)
         raise MCPError(
             f"MCP tool {name!r} failed after {attempts} attempt(s)",
-            details={"tool": name},
+            details={"tool": name, "attempts": attempts},
         ) from last_error
 
     @abstractmethod
@@ -86,7 +105,7 @@ class MCPClient(ABC):
 class InMemoryMCPClient(MCPClient):
     """Recording fake. ``handlers`` maps a tool name to a response builder;
     unmapped tools return ``{}``. ``fail_times`` makes the first N invocations
-    raise, to exercise the base client's retry."""
+    raise, to exercise the base client's retry behaviour."""
 
     def __init__(
         self,
@@ -111,45 +130,59 @@ class InMemoryMCPClient(MCPClient):
         return handler(payload) if handler is not None else {}
 
 
+# Factory hook so subclasses (and tests) can override how the underlying
+# fastmcp.Client is constructed. Default uses bearer auth from settings.
+def _build_fastmcp_client(settings: McpSettings) -> fastmcp.Client[Any]:
+    import fastmcp
+
+    auth: Any = None
+    if settings.auth_mode == "bearer" and settings.auth_token:
+        auth = settings.auth_token  # fastmcp.Client accepts a bearer token string
+    # IAM mode is wired in a follow-up commit (Cloud Run ID-token via google-auth).
+    return fastmcp.Client(settings.endpoint, auth=auth, timeout=settings.timeout_seconds)
+
+
 class HttpMCPClient(MCPClient):
-    """Real MCP client over HTTPS.
+    """Production MCP client wrapping :class:`fastmcp.Client`.
 
-    Holds ONE persistent ``httpx.AsyncClient`` so connections (and TLS) are
-    pooled and reused across tool calls instead of dialled per call.
-
-    CATALOG-DEPENDENT: the request path/envelope below is a placeholder for the
-    MCP cluster's actual contract — confirm and adjust when the catalog lands.
-    ``httpx`` is imported lazily so this module stays importable without it.
+    Holds ONE persistent ``fastmcp.Client`` whose connection lifecycle is
+    managed by an ``AsyncExitStack`` (entered lazily on first call, closed
+    by :meth:`aclose`). This pools transport state across tool calls instead
+    of paying the connect cost per call.
     """
 
-    def __init__(self, settings: McpSettings, *, sleep: SleepFn | None = None) -> None:
+    def __init__(
+        self,
+        settings: McpSettings,
+        *,
+        sleep: SleepFn | None = None,
+        client_factory: Callable[[McpSettings], fastmcp.Client[Any]] | None = None,
+    ) -> None:
         super().__init__(settings, sleep=sleep)
-        self._client: httpx.AsyncClient | None = None
+        self._client_factory = client_factory or _build_fastmcp_client
+        self._stack = AsyncExitStack()
+        self._client: fastmcp.Client[Any] | None = None
 
-    def _http(self) -> httpx.AsyncClient:
-        import httpx
-
+    async def _ensure_connected(self) -> fastmcp.Client[Any]:
         if self._client is None:
-            headers = {"Content-Type": "application/json"}
-            if self._settings.auth_token:
-                headers["Authorization"] = f"Bearer {self._settings.auth_token}"
-            self._client = httpx.AsyncClient(
-                base_url=self._settings.endpoint.rstrip("/"),
-                timeout=self._settings.timeout_seconds,
-                headers=headers,
+            self._client = await self._stack.enter_async_context(
+                self._client_factory(self._settings)
             )
+        assert self._client is not None  # narrowing for mypy
         return self._client
 
     async def _invoke(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        # PROVISIONAL path/envelope — reconcile with the MCP cluster contract.
-        response = await self._http().post(
-            f"/tools/{name}/call", json={"tool": name, "arguments": payload}
-        )
-        response.raise_for_status()
-        data: Any = response.json()
-        return data if isinstance(data, dict) else {"result": data}
+        client = await self._ensure_connected()
+        result = await client.call_tool(name, payload)
+        if getattr(result, "is_error", False):
+            raise MCPError(f"MCP tool {name!r} returned is_error", details={"tool": name})
+        data = getattr(result, "data", None)
+        if isinstance(data, dict):
+            return data
+        # Tools that return a scalar / list / None — wrap so the contract stays
+        # ``dict[str, Any]``. Adapters that need the raw shape can read ``result``.
+        return {"result": data}
 
     async def aclose(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        await self._stack.aclose()
+        self._client = None

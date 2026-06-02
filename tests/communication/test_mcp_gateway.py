@@ -23,27 +23,35 @@ def _msg(channel: Channel) -> Message:
     )
 
 
-async def test_whatsapp_routes_to_whatsapp_tool():
+async def test_whatsapp_routes_to_whatsapp_text_tool():
     caller = InMemoryMCPClient(
-        handlers={Tools.WHATSAPP_SEND: lambda p: {"accepted": True, "provider_message_id": "wa1"}}
+        handlers={
+            Tools.EXT_SEND_WHATSAPP_TEXT: lambda p: {
+                "accepted": True,
+                "provider_message_id": "wa1",
+            }
+        }
     )
     gateway = McpCommunicationGateway(caller)
 
     result = await gateway.send(_msg(Channel.WHATSAPP))
 
-    assert caller.calls[0][0] == Tools.WHATSAPP_SEND
+    assert caller.calls[0][0] == Tools.EXT_SEND_WHATSAPP_TEXT
     assert caller.calls[0][1]["to"] == "+97455500001"
     assert caller.calls[0][1]["text"] == "hello"
     assert result.accepted is True
     assert result.provider_message_id == "wa1"
 
 
-async def test_email_routes_to_email_tool():
-    caller = InMemoryMCPClient(handlers={Tools.EMAIL_SEND: lambda p: {"accepted": True}})
+async def test_email_routes_to_email_otp_tool():
+    # NB: the cluster only exposes an OTP-only email tool today (no arbitrary
+    # email send). The gateway routes Channel.EMAIL there for now; Phase 2 will
+    # split OTP-style vs informational sends per Q2.
+    caller = InMemoryMCPClient(handlers={Tools.EXT_SEND_EMAIL_OTP: lambda p: {"accepted": True}})
     gateway = McpCommunicationGateway(caller)
 
     await gateway.send(_msg(Channel.EMAIL))
-    assert caller.calls[0][0] == Tools.EMAIL_SEND
+    assert caller.calls[0][0] == Tools.EXT_SEND_EMAIL_OTP
 
 
 async def test_transport_failure_is_normalised_to_gateway_error():

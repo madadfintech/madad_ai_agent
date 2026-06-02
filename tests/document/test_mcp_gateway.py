@@ -13,10 +13,10 @@ from app.services.document.gateways import McpMadadDocumentGateway
 from app.shared.mcp import InMemoryMCPClient, Tools
 
 
-async def test_routes_to_document_process_tool_and_parses_result():
+async def test_routes_to_kyc_upload_document_base64_tool_and_parses_result():
     caller = InMemoryMCPClient(
         handlers={
-            Tools.DOCUMENT_PROCESS: lambda p: {
+            Tools.KYC_UPLOAD_DOCUMENT_BASE64: lambda p: {
                 "document_type": "trade_license",
                 "valid": True,
                 "madad_ref": "mref_1",
@@ -33,7 +33,7 @@ async def test_routes_to_document_process_tool_and_parses_result():
     )
 
     name, payload = caller.calls[0]
-    assert name == Tools.DOCUMENT_PROCESS
+    assert name == Tools.KYC_UPLOAD_DOCUMENT_BASE64
     assert payload["application_ref"] == "app1"
     assert payload["filename"] == "trade.pdf"
     # Bytes are passed transiently, base64-encoded (Madad stores, we do not).

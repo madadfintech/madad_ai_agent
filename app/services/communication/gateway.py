@@ -65,9 +65,13 @@ class InMemoryCommunicationGateway(CommunicationGateway):
 
 
 # Tool names come from the shared registry (single source, catalog-reconciled).
+# WhatsApp maps to the backend-routed free-text WhatsApp tool. Email currently
+# maps to the OTP-only tool — the cluster has no arbitrary-email-send tool yet
+# (Q2: arbitrary email content is not exposed via MCP). Refine in Phase 2 when
+# the workflow distinguishes OTP-style sends from informational sends.
 _TOOL_BY_CHANNEL: dict[Channel, str] = {
-    Channel.WHATSAPP: Tools.WHATSAPP_SEND,
-    Channel.EMAIL: Tools.EMAIL_SEND,
+    Channel.WHATSAPP: Tools.EXT_SEND_WHATSAPP_TEXT,
+    Channel.EMAIL: Tools.EXT_SEND_EMAIL_OTP,
 }
 
 

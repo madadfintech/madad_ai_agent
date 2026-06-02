@@ -95,7 +95,7 @@ class McpMadadDocumentGateway(MadadDocumentGateway):
     """Routes documents to Madad's extraction microservice via an MCP tool."""
 
     def __init__(
-        self, tool_caller: MCPToolCaller, *, tool: str = Tools.DOCUMENT_PROCESS
+        self, tool_caller: MCPToolCaller, *, tool: str = Tools.KYC_UPLOAD_DOCUMENT_BASE64
     ) -> None:
         self._tools = tool_caller
         self._tool = tool

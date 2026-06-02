@@ -16,6 +16,10 @@ celery==5.6.3
 # Security
 PyJWT==2.12.1
 
+# MCP client (Anthropic fastmcp SDK over Streamable HTTP) + Cloud Run IAM auth
+fastmcp>=3.3,<4.0
+google-auth>=2.30,<3.0
+
 # Observability
 prometheus-client==0.24.1
 sentry-sdk==2.42.1

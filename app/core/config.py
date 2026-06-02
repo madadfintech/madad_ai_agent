@@ -95,17 +95,32 @@ class McpSettings(BaseModel):
 
     ``enabled=False`` (default) keeps every service on its in-memory gateway, so
     dev/tests need no MCP cluster. When enabled, services route through the real
-    client. ``endpoint``/``auth_token`` and the on-the-wire protocol are the only
-    catalog-blocked seams; tool names live in ``app.shared.mcp.registry``.
+    fastmcp client over Streamable HTTP. The deployed UAT endpoint is the Cloud
+    Run URL; ``auth_mode`` selects bearer-token (UAT) or Cloud Run IAM ID-token
+    (production). Tool names live in ``app.shared.mcp.registry``.
     """
 
     enabled: bool = False
-    endpoint: str = "https://mcp.ai.madadfintech.com"
-    auth_token: str | None = None
+    endpoint: str = "https://madad-mcp-cluster-626656664233.me-central1.run.app/mcp"
+    transport: str = "streamable-http"  # informational; only one transport today
+    protocol_version: str = "2025-06-18"  # MCP spec version we target
+
+    # Auth seams.
+    auth_mode: str = "bearer"  # bearer (UAT) | iam (Cloud Run prod)
+    auth_token: str | None = None  # bearer token if auth_mode=bearer
+    iam_audience: str | None = None  # Cloud Run audience for ID token (no /mcp suffix)
+    signing_secret: str | None = None  # HMAC secret for the optional signed header
+    signing_header: str = "X-Madad-Agent-Signature"
+    ip_allowlist: list[str] = Field(default_factory=list)  # informational
+
+    # Transport behaviour.
     timeout_seconds: float = 10.0
-    retry_max_attempts: int = 1  # >1 retries transient transport failures
+    retry_max_attempts: int = 1  # single-shot by default; tools must opt-in for retry
     retry_base_delay_seconds: float = 0.5
     retry_max_delay_seconds: float = 10.0
+    # Tool names safe to retry transparently. Reads are always safe; payment write
+    # tools are safe because Ishan now honours an ``idempotency_key`` parameter.
+    idempotent_tools: set[str] = Field(default_factory=set)
 
 
 class SecuritySettings(BaseModel):

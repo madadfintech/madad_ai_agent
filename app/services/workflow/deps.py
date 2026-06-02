@@ -71,29 +71,13 @@ def build_onboarding_platform(
 def get_onboarding_platform() -> OnboardingPlatform:
     """Process-singleton platform for the FastAPI app.
 
-    With ``mcp.enabled`` the full production chain is wired: outbound through the
-    Communication service, reminders through Nudge, and Madad/Tess/document
-    routing through the MCP client. Otherwise the in-memory fakes are used
-    (dev/tests), so the default behaviour is unchanged.
+    Uses in-memory adapters for the onboarding business ports (MadadClient,
+    PaymentClient, DocumentIntake). The MCP-backed replacements for these are
+    introduced in later integration phases (channel-session, KYC, monetization
+    payment) — each will plug into ``build_onboarding_platform(...)`` once its
+    adapter exists. ``settings.mcp.enabled`` switches the *transport* (real
+    fastmcp client vs in-memory fake); the workflow-level adapters select
+    themselves once they ship.
     """
 
-    from app.core.config import settings
-
-    if not settings.mcp.enabled:
-        return build_onboarding_platform()
-
-    from app.services.communication.deps import get_communication_service
-    from app.services.nudge.deps import get_nudge_service
-    from app.shared.mcp import get_mcp_client
-
-    from .adapters import CommunicationMessenger, NudgeReminders
-    from .mcp_adapters import McpDocumentIntake, McpMadadClient, McpPaymentClient
-
-    client = get_mcp_client()
-    return build_onboarding_platform(
-        messenger=CommunicationMessenger(get_communication_service()),
-        reminders=NudgeReminders(get_nudge_service()),
-        documents=McpDocumentIntake(client),
-        madad=McpMadadClient(client),
-        payments=McpPaymentClient(client),
-    )
+    return build_onboarding_platform()

@@ -76,6 +76,9 @@ async def require_api_auth(request: Request) -> None:
 def _decode_jwt(token: str, sec: SecuritySettings) -> dict[str, object]:
     import jwt
 
+    # Caller (``require_api_auth``) guarantees ``sec.jwt_secret`` is set before
+    # we get here. Narrow it for the typed jwt.decode signature.
+    assert sec.jwt_secret is not None  # noqa: S101 — invariant from caller
     # Verify the audience only when one is configured; issuer is enforced only
     # when ``jwt_issuer`` is set (PyJWT skips it when None).
     try:

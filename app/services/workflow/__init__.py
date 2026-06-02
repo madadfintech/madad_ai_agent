@@ -15,7 +15,6 @@ from .deps import (
     get_onboarding_platform,
 )
 from .dispatcher import OnboardingDispatcher
-from .mcp_adapters import McpDocumentIntake, McpMadadClient, McpPaymentClient
 from .onboarding import TEMPLATE_KEYS, OnboardingWorkflow
 from .ports import (
     DocumentIntake,
@@ -56,8 +55,4 @@ __all__ = [
     # real adapters
     "CommunicationMessenger",
     "NudgeReminders",
-    # MCP-backed adapters (CATALOG-DEPENDENT scaffolds)
-    "McpMadadClient",
-    "McpPaymentClient",
-    "McpDocumentIntake",
 ]

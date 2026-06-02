@@ -46,3 +46,8 @@ logs/
 # Docker volumes / data
 data/
 volumes/
+
+# Local project artifacts (drafts, internal/third-party docs, working notes)
+/Docs/
+*.txt
+!requirements*.txt

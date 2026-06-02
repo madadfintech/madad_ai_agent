@@ -19,10 +19,13 @@ with ``Tools.read_only()`` plus ``Tools.payment_idempotent_writes()``).
 from __future__ import annotations
 
 import asyncio
+import time
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Generator
 from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+import httpx
 
 from app.core.config import McpSettings
 from app.core.exceptions import UpstreamError
@@ -33,6 +36,13 @@ if TYPE_CHECKING:  # pragma: no cover
 
 SleepFn = Callable[[float], Awaitable[None]]
 HandlerFn = Callable[[dict[str, Any]], dict[str, Any]]
+IamTokenFetcher = Callable[[str], str]
+# google-auth's id_token.fetch_id_token is a (audience: str) -> str function
+# under the hood. We pass it through this alias so tests can inject a stub.
+
+# Refresh ID tokens this many seconds BEFORE expiry to keep calls smooth.
+_ID_TOKEN_LIFETIME_SECONDS = 3300  # google-issued ID tokens are valid for 1h
+_ID_TOKEN_REFRESH_LEEWAY_SECONDS = 60
 
 
 class MCPError(UpstreamError):
@@ -130,15 +140,88 @@ class InMemoryMCPClient(MCPClient):
         return handler(payload) if handler is not None else {}
 
 
+def _default_iam_token_fetcher(audience: str) -> str:
+    """Mint a Google-signed ID token for the given Cloud Run audience.
+
+    Uses Application Default Credentials. On Cloud Run this is the runtime
+    service account; locally use ``gcloud auth application-default login``.
+    Lazy-imported so the module stays importable without ``google-auth``.
+    """
+
+    from google.auth.transport.requests import Request
+    from google.oauth2 import id_token
+
+    return id_token.fetch_id_token(Request(), audience)  # type: ignore[no-untyped-call,no-any-return]
+
+
+class IamIdTokenAuth(httpx.Auth):
+    """``httpx.Auth`` that injects a fresh Cloud Run ID token on every request.
+
+    Tokens are cached and refreshed about a minute before expiry so a long-
+    lived MCP client doesn't drop traffic when Google rotates tokens. The
+    ``fetcher`` argument lets tests inject a deterministic stub.
+    """
+
+    def __init__(
+        self,
+        audience: str,
+        *,
+        fetcher: IamTokenFetcher = _default_iam_token_fetcher,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        if not audience:
+            raise ValueError("IamIdTokenAuth requires a non-empty audience")
+        self._audience = audience
+        self._fetcher = fetcher
+        self._clock = clock
+        self._token: str | None = None
+        self._expires_at: float = 0.0
+
+    def _token_is_fresh(self, now: float) -> bool:
+        return (
+            self._token is not None
+            and now < self._expires_at - _ID_TOKEN_REFRESH_LEEWAY_SECONDS
+        )
+
+    def _refresh(self) -> str:
+        now = self._clock()
+        self._token = self._fetcher(self._audience)
+        self._expires_at = now + _ID_TOKEN_LIFETIME_SECONDS
+        return self._token
+
+    def auth_flow(
+        self, request: httpx.Request
+    ) -> Generator[httpx.Request, httpx.Response, None]:
+        token = self._token if self._token_is_fresh(self._clock()) else self._refresh()
+        request.headers["Authorization"] = f"Bearer {token}"
+        yield request
+
+
 # Factory hook so subclasses (and tests) can override how the underlying
-# fastmcp.Client is constructed. Default uses bearer auth from settings.
-def _build_fastmcp_client(settings: McpSettings) -> fastmcp.Client[Any]:
+# fastmcp.Client is constructed.
+def _build_fastmcp_client(
+    settings: McpSettings,
+    *,
+    iam_token_fetcher: IamTokenFetcher = _default_iam_token_fetcher,
+) -> fastmcp.Client[Any]:
     import fastmcp
 
     auth: Any = None
-    if settings.auth_mode == "bearer" and settings.auth_token:
-        auth = settings.auth_token  # fastmcp.Client accepts a bearer token string
-    # IAM mode is wired in a follow-up commit (Cloud Run ID-token via google-auth).
+    if settings.auth_mode == "bearer":
+        if settings.auth_token:
+            auth = settings.auth_token  # fastmcp accepts a raw bearer string
+    elif settings.auth_mode == "iam":
+        if not settings.iam_audience:
+            raise MCPError(
+                "MCP auth_mode='iam' requires settings.iam_audience to be set",
+                details={"endpoint": settings.endpoint},
+            )
+        auth = IamIdTokenAuth(settings.iam_audience, fetcher=iam_token_fetcher)
+    else:
+        raise MCPError(
+            f"Unknown MCP auth_mode {settings.auth_mode!r}",
+            details={"auth_mode": settings.auth_mode},
+        )
     return fastmcp.Client(settings.endpoint, auth=auth, timeout=settings.timeout_seconds)
 
 

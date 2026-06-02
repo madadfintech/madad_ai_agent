@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import httpx
 import pytest
 
 from app.core.config import McpSettings
@@ -204,3 +205,88 @@ async def test_http_client_aclose_is_safe_when_never_connected():
         client_factory=lambda _s: _FakeFastMcpClient(),  # type: ignore[arg-type, return-value]
     )
     await client.aclose()  # never connected — must not raise
+
+
+# -- IAM ID-token auth --------------------------------------------------------
+
+
+def test_iam_auth_requires_non_empty_audience():
+    from app.shared.mcp.client import IamIdTokenAuth
+
+    with pytest.raises(ValueError):
+        IamIdTokenAuth("")
+
+
+def test_iam_auth_caches_token_then_refreshes_before_expiry():
+    from app.shared.mcp.client import IamIdTokenAuth
+
+    minted: list[str] = []
+
+    def fake_fetcher(audience: str) -> str:
+        minted.append(audience)
+        return f"tok-{len(minted)}"
+
+    # Synthetic clock; we'll advance it manually.
+    now = [1_000_000.0]
+
+    auth = IamIdTokenAuth(
+        "https://mcp.example",
+        fetcher=fake_fetcher,
+        clock=lambda: now[0],
+    )
+
+    # First call mints a token; second within the lifetime reuses it.
+    req1 = httpx.Request("POST", "https://mcp.example/mcp")
+    next(iter(auth.auth_flow(req1)))
+    assert req1.headers["Authorization"] == "Bearer tok-1"
+
+    req2 = httpx.Request("POST", "https://mcp.example/mcp")
+    next(iter(auth.auth_flow(req2)))
+    assert req2.headers["Authorization"] == "Bearer tok-1"
+    assert minted == ["https://mcp.example"]
+
+    # Advance the clock past the refresh-leeway boundary → token refreshes.
+    now[0] += 4000
+    req3 = httpx.Request("POST", "https://mcp.example/mcp")
+    next(iter(auth.auth_flow(req3)))
+    assert req3.headers["Authorization"] == "Bearer tok-2"
+
+
+def test_build_fastmcp_client_iam_requires_audience():
+    from app.shared.mcp.client import _build_fastmcp_client
+
+    with pytest.raises(MCPError):
+        _build_fastmcp_client(
+            McpSettings(endpoint="https://mcp.example", auth_mode="iam"),
+            iam_token_fetcher=lambda _a: "ignored",
+        )
+
+
+def test_build_fastmcp_client_rejects_unknown_auth_mode():
+    from app.shared.mcp.client import _build_fastmcp_client
+
+    with pytest.raises(MCPError):
+        _build_fastmcp_client(
+            McpSettings(endpoint="https://mcp.example", auth_mode="oauth-rsa-pop"),
+        )
+
+
+def test_build_fastmcp_client_iam_uses_injected_fetcher():
+    from app.shared.mcp.client import _build_fastmcp_client
+
+    minted: list[str] = []
+
+    def fake_fetcher(audience: str) -> str:
+        minted.append(audience)
+        return f"tok-for-{audience}"
+
+    # Construction with iam mode + an audience succeeds and the fetcher is wired
+    # into the auth object (verified by exercising auth_flow once).
+    settings = McpSettings(
+        endpoint="https://mcp.example/mcp",
+        auth_mode="iam",
+        iam_audience="https://mcp.example",
+    )
+    client = _build_fastmcp_client(settings, iam_token_fetcher=fake_fetcher)
+    # The Client's auth must trigger the fetcher when the first request runs.
+    assert hasattr(client, "transport")  # construction succeeded

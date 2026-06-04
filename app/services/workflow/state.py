@@ -2,9 +2,47 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any
 
 from app.shared.workflow.state import WorkflowState
+
+
+class JourneyStatus(StrEnum):
+    """Canonical Madad onboarding journey statuses.
+
+    Values are the exact strings returned by ``madad_auth_me`` in
+    ``user.journeyStatus``. Authoritative meanings live in Ishan's MCP cluster
+    README (status reference table, 2026-06-01). The Phase 2 router branches on
+    these — see [[project_mcp_catalog]] § 'CANONICAL JOURNEY STATUS REFERENCE'.
+    """
+
+    SIGN_UP = "SIGN_UP"
+    ONBOARDED = "ONBOARDED"
+    IN_ELIGIBLE = "IN_ELIGIBLE"
+    ELIGIBLE = "ELIGIBLE"
+    INCOMPLETE = "INCOMPLETE"
+    UNVERIFIED = "UNVERIFIED"
+    VERIFIED = "VERIFIED"
+    PRE_QUALIFIED = "PRE_QUALIFIED"
+    QUALIFIED = "QUALIFIED"
+    UNQUALIFIED = "UNQUALIFIED"
+    ACCEPTED = "ACCEPTED"
+    NOT_ACCEPTED = "NOT_ACCEPTED"
+    OFFER_ACCEPTED = "OFFER_ACCEPTED"
+    OFFER_EXPIRED = "OFFER_EXPIRED"
+    OPEN = "OPEN"
+    ACTIVATED = "ACTIVATED"
+
+
+# Terminal status groups — used by the polling worker (Phase 4) to skip runs
+# that won't advance further from the agent's side.
+TERMINAL_FAIL_STATUSES: frozenset[JourneyStatus] = frozenset(
+    {JourneyStatus.IN_ELIGIBLE, JourneyStatus.UNQUALIFIED, JourneyStatus.NOT_ACCEPTED}
+)
+TERMINAL_SUCCESS_STATUSES: frozenset[JourneyStatus] = frozenset(
+    {JourneyStatus.ACTIVATED}
+)
 
 
 class OnboardingState(WorkflowState):

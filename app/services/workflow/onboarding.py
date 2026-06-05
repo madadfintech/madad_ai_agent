@@ -950,12 +950,24 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "check_contact" if state.entry_reply == "YES" else "declined"
 
     def _route_check_contact(self, state: OnboardingState) -> str:
-        result = state.check_contact_result
+        result: Any = state.check_contact_result
         if result is None:
             return "new"
-        if result.exists:
+        # LangGraph's checkpointer may round-trip the Pydantic model as a
+        # plain dict between nodes. Read both shapes so the router doesn't
+        # silently fall through to "new" when the cluster confirmed an
+        # existing user.
+        if isinstance(result, dict):
+            exists = bool(result.get("exists", False))
+            domain_exists = bool(
+                result.get("domain_exists") or result.get("domainExists", False)
+            )
+        else:
+            exists = bool(getattr(result, "exists", False))
+            domain_exists = bool(getattr(result, "domain_exists", False))
+        if exists:
             return "existing"
-        if result.domain_exists:
+        if domain_exists:
             return "blocked"
         return "new"
 

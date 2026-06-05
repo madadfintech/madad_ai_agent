@@ -51,3 +51,12 @@ volumes/
 /Docs/
 *.txt
 !requirements*.txt
+
+# SSH keys + server access bundles — NEVER commit
+/staging_server_access/
+*.pem
+*_ed25519
+*_rsa
+*_ecdsa
+id_*
+!*.pub

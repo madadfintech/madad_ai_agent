@@ -13,28 +13,28 @@ def test_mcp_kyc_adapter_satisfies_protocol() -> None:
     assert isinstance(McpKycClient(InMemoryMCPClient()), KycClient)
 
 
-async def test_upload_commercial_registration_calls_correct_tool() -> None:
+async def test_upload_commercial_registration_routes_through_generic_base64_tool() -> None:
+    # The specialised CR tool takes `file_path` (backend-resolvable) not
+    # base64; for WhatsApp-attachment base64 we route via the generic
+    # KYC_UPLOAD_DOCUMENT_BASE64 with document_type=commercial_registration.
     caller = InMemoryMCPClient(
         handlers={
-            Tools.KYC_UPLOAD_COMMERCIAL_REGISTRATION: lambda p: {
-                "document_id": "doc-cr-1",
-                "filename": p["filename"],
-            }
+            Tools.KYC_UPLOAD_DOCUMENT_BASE64: lambda p: {"document_id": "doc-cr-1"}
         }
     )
 
-    out = await McpKycClient(caller).upload_commercial_registration(
+    await McpKycClient(caller).upload_commercial_registration(
         access_token=TOKEN, content_base64="QkE=", filename="CR.pdf"
     )
 
-    assert out == {"document_id": "doc-cr-1", "filename": "CR.pdf"}
     name, payload = caller.calls[0]
-    assert name == Tools.KYC_UPLOAD_COMMERCIAL_REGISTRATION
-    assert payload == {
-        "access_token": TOKEN,
-        "content_base64": "QkE=",
-        "filename": "CR.pdf",
-    }
+    assert name == Tools.KYC_UPLOAD_DOCUMENT_BASE64
+    assert payload["file_name"] == "CR.pdf"
+    assert payload["base64"] == "QkE="
+    assert payload["mime_type"] == "application/pdf"
+    assert payload["metadata"]["access_token"] == TOKEN
+    assert payload["metadata"]["document_entity_type"] == "BUSINESS"
+    assert payload["metadata"]["document_type"] == "COMMERCIAL_REGISTRATION"
 
 
 async def test_update_eligibility_merges_data_into_payload() -> None:
@@ -56,9 +56,9 @@ async def test_update_eligibility_merges_data_into_payload() -> None:
     }
 
 
-async def test_upload_audited_financial_report_calls_correct_tool() -> None:
+async def test_upload_audited_financial_report_routes_through_generic_base64_tool() -> None:
     caller = InMemoryMCPClient(
-        handlers={Tools.KYC_UPLOAD_AUDITED_FINANCIAL_REPORT: lambda p: {"document_id": "fr-1"}}
+        handlers={Tools.KYC_UPLOAD_DOCUMENT_BASE64: lambda p: {"document_id": "fr-1"}}
     )
 
     await McpKycClient(caller).upload_audited_financial_report(
@@ -66,9 +66,10 @@ async def test_upload_audited_financial_report_calls_correct_tool() -> None:
     )
 
     name, payload = caller.calls[0]
-    assert name == Tools.KYC_UPLOAD_AUDITED_FINANCIAL_REPORT
-    assert payload["filename"] == "Audited.pdf"
-    assert payload["access_token"] == TOKEN
+    assert name == Tools.KYC_UPLOAD_DOCUMENT_BASE64
+    assert payload["file_name"] == "Audited.pdf"
+    assert payload["metadata"]["document_type"] == "AUDITED_FINANCIAL_REPORT"
+    assert payload["metadata"]["access_token"] == TOKEN
 
 
 async def test_get_admin_requested_documents_sends_only_access_token() -> None:
@@ -88,7 +89,12 @@ async def test_get_admin_requested_documents_sends_only_access_token() -> None:
     assert payload == {"access_token": TOKEN}
 
 
-async def test_upload_document_base64_includes_document_type() -> None:
+async def test_upload_document_base64_uses_real_uat_schema() -> None:
+    """UAT KYC_UPLOAD_DOCUMENT_BASE64 schema is
+    ``{file_name, mime_type, base64, metadata}``; access_token lives
+    inside metadata. The metadata also requires document_entity_type and
+    document_type (in SCREAMING_SNAKE_CASE)."""
+
     caller = InMemoryMCPClient(
         handlers={
             Tools.KYC_UPLOAD_DOCUMENT_BASE64: lambda p: {"document_id": "doc-1"}
@@ -103,11 +109,14 @@ async def test_upload_document_base64_includes_document_type() -> None:
     )
 
     _, payload = caller.calls[0]
-    assert payload == {
+    assert payload["file_name"] == "TL.pdf"
+    assert payload["mime_type"] == "application/pdf"
+    assert payload["base64"] == "QkE="
+    assert payload["metadata"] == {
         "access_token": TOKEN,
-        "content_base64": "QkE=",
-        "filename": "TL.pdf",
-        "document_type": "trade_license",
+        "document_entity_type": "BUSINESS",
+        "document_type": "TRADE_LICENSE",
+        "document_label": "TL.pdf",
     }
 
 

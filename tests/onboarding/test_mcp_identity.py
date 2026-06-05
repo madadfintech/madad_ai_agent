@@ -150,7 +150,8 @@ async def test_complete_onboarding_passes_token_and_returns_raw_dict() -> None:
     assert payload["onboarding_token"] == "OT-abc"
     assert payload["first_name"] == "Aisha"
     assert payload["last_name"] == "Karim"
-    assert payload["phone_number"] == "+97455500099"
+    # UAT schema requires the `phone` arg, not `phone_number`.
+    assert payload["phone"] == "+97455500099"
 
 
 # -- me / refresh / logout ----------------------------------------------------

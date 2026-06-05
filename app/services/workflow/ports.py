@@ -145,6 +145,10 @@ class MadadIdentityClient(Protocol):
         onboarding_token: str,
         email: str | None = None,
         phone_number: str | None = None,
+        legal_entity_name: str | None = None,
+        cr_number: str | None = None,
+        is_qatar_based: bool | None = None,
+        role: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def me(self, *, access_token: str) -> dict[str, Any]: ...
@@ -254,6 +258,10 @@ class InMemoryMadadIdentityClient:
         onboarding_token: str,
         email: str | None = None,
         phone_number: str | None = None,
+        legal_entity_name: str | None = None,
+        cr_number: str | None = None,
+        is_qatar_based: bool | None = None,
+        role: str | None = None,
     ) -> dict[str, Any]:
         self._record(
             "complete_onboarding",
@@ -262,6 +270,10 @@ class InMemoryMadadIdentityClient:
             onboarding_token=onboarding_token,
             email=email,
             phone_number=phone_number,
+            legal_entity_name=legal_entity_name,
+            cr_number=cr_number,
+            is_qatar_based=is_qatar_based,
+            role=role,
         )
         user_id = new_id("usr")
         if phone_number is not None:

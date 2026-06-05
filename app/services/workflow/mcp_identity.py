@@ -103,7 +103,18 @@ class McpMadadIdentityClient:
         onboarding_token: str,
         email: str | None = None,
         phone_number: str | None = None,
+        legal_entity_name: str | None = None,
+        cr_number: str | None = None,
+        is_qatar_based: bool | None = None,
+        role: str | None = None,
     ) -> dict[str, Any]:
+        # UAT cluster requires ALL of: first_name, last_name,
+        # legal_entity_name, cr_number, is_qatar_based, email, phone, role,
+        # onboarding_token. Phase 2's collect-onboarding-details node only
+        # asked for first/last name; the new fields are gathered by the
+        # extended intake form (Phase 2.x staging update) and pass through
+        # here. Optional in the signature so the InMemoryMadadIdentityClient
+        # tests stay green; the cluster will 400 if any is missing.
         payload: dict[str, Any] = {
             "first_name": first_name,
             "last_name": last_name,
@@ -112,7 +123,15 @@ class McpMadadIdentityClient:
         if email is not None:
             payload["email"] = email
         if phone_number is not None:
-            payload["phone_number"] = phone_number
+            payload["phone"] = phone_number
+        if legal_entity_name is not None:
+            payload["legal_entity_name"] = legal_entity_name
+        if cr_number is not None:
+            payload["cr_number"] = cr_number
+        if is_qatar_based is not None:
+            payload["is_qatar_based"] = is_qatar_based
+        if role is not None:
+            payload["role"] = role
         return await self._tools.call_tool(Tools.AUTH_COMPLETE_ONBOARDING, payload)
 
     async def me(self, *, access_token: str) -> dict[str, Any]:

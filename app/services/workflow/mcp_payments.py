@@ -70,14 +70,16 @@ class McpMonetizationPaymentAdapter:
         amount_qar: int,
         idempotency_key: str,
     ) -> dict[str, Any]:
+        # UAT names the amount field ``payable_amount`` (not the workflow's
+        # internal ``amount_qar``).
         return await self._tools.call_tool(
             Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT,
             {
                 "access_token": access_token,
+                "idempotency_key": idempotency_key,
                 "business_details_id": business_details_id,
                 "product_id": product_id,
-                "amount_qar": amount_qar,
-                "idempotency_key": idempotency_key,
+                "payable_amount": amount_qar,
             },
         )
 
@@ -90,15 +92,20 @@ class McpMonetizationPaymentAdapter:
         identity: str,
         idempotency_key: str,
     ) -> dict[str, Any]:
+        # UAT schema doesn't take a `channel` field; the recipient is
+        # split into recipient_phone vs recipient_email and the backend
+        # picks the channel from whichever is set.
+        payload: dict[str, Any] = {
+            "access_token": access_token,
+            "idempotency_key": idempotency_key,
+            "payment_id": payment_id,
+        }
+        if channel is Channel.EMAIL:
+            payload["recipient_email"] = identity
+        else:
+            payload["recipient_phone"] = identity
         return await self._tools.call_tool(
-            Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK,
-            {
-                "access_token": access_token,
-                "payment_id": payment_id,
-                "channel": channel.value.upper(),
-                "identity": identity,
-                "idempotency_key": idempotency_key,
-            },
+            Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK, payload
         )
 
     async def get_monetization_payment(

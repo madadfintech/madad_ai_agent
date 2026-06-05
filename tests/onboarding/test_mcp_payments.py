@@ -83,16 +83,17 @@ async def test_create_monetization_payment_threads_idempotency_key() -> None:
     assert out["payment_id"] == "pay-1"
     name, payload = caller.calls[0]
     assert name == Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT
+    # UAT names the amount field `payable_amount`, not `amount_qar`.
     assert payload == {
         "access_token": TOKEN,
+        "idempotency_key": "run-1:create_monetization_payment",
         "business_details_id": "biz-1",
         "product_id": "prod-monetization",
-        "amount_qar": 6000,
-        "idempotency_key": "run-1:create_monetization_payment",
+        "payable_amount": 6000,
     }
 
 
-async def test_send_monetization_payment_link_uppercase_channel_and_key() -> None:
+async def test_send_monetization_payment_link_recipient_split_by_channel() -> None:
     caller = InMemoryMCPClient(
         handlers={
             Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK: lambda p: {
@@ -101,6 +102,7 @@ async def test_send_monetization_payment_link_uppercase_channel_and_key() -> Non
         }
     )
 
+    # WhatsApp → recipient_phone
     out = await McpMonetizationPaymentAdapter(
         caller
     ).send_monetization_payment_link(
@@ -115,11 +117,28 @@ async def test_send_monetization_payment_link_uppercase_channel_and_key() -> Non
     _, payload = caller.calls[0]
     assert payload == {
         "access_token": TOKEN,
-        "payment_id": "pay-1",
-        "channel": "WHATSAPP",
-        "identity": "+97455500001",
         "idempotency_key": "run-1:send_monetization_payment_link",
+        "payment_id": "pay-1",
+        "recipient_phone": "+97455500001",
     }
+
+    # Email → recipient_email (no channel field, no recipient_phone)
+    email_caller = InMemoryMCPClient(
+        handlers={
+            Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK: lambda p: {"payment_link": "x"}
+        }
+    )
+    await McpMonetizationPaymentAdapter(email_caller).send_monetization_payment_link(
+        access_token=TOKEN,
+        payment_id="pay-2",
+        channel=Channel.EMAIL,
+        identity="sme@example.com",
+        idempotency_key="run-1:send_monetization_payment_link",
+    )
+    _, email_payload = email_caller.calls[0]
+    assert email_payload["recipient_email"] == "sme@example.com"
+    assert "recipient_phone" not in email_payload
+    assert "channel" not in email_payload
 
 
 async def test_get_monetization_payment_passes_payment_id() -> None:

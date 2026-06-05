@@ -95,8 +95,13 @@ def _build_journey_handlers() -> dict[str, Any]:
         return {"required": required, "missing": missing}
 
     def _upload_doc(p: dict[str, Any]) -> dict[str, Any]:
-        state.setdefault("uploaded", set()).add(p["document_type"])
-        return {"document_id": f"doc-{p['document_type']}"}
+        # UAT schema: {file_name, mime_type, base64, metadata.{...}}.
+        # The adapter SCREAMING-snake-cases workflow document_type when
+        # writing metadata.document_type; lowercase back to the workflow
+        # convention so the admin-requested-docs missing check converges.
+        doc_type = p["metadata"]["document_type"].lower()
+        state.setdefault("uploaded", set()).add(doc_type)
+        return {"document_id": f"doc-{doc_type}"}
 
     return {
         "_state": state,
@@ -131,7 +136,11 @@ def _build_journey_handlers() -> dict[str, Any]:
         },
         Tools.PAYMENTS_LIST_MONETIZATION_PRODUCTS: lambda _p: {
             "products": [
-                {"product_id": "prod-monetization", "name": "Onboarding Fee", "amount_qar": 6000}
+                {
+                    "product_id": "prod-monetization",
+                    "name": "Onboarding Fee",
+                    "payable_amount": 6000,
+                }
             ]
         },
         Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT: lambda p: {
@@ -210,14 +219,19 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
     # Tool-name call order: every MCP tool the workflow needs is invoked
     # exactly when expected; nothing fabricated.
     call_names = [name for name, _ in mcp.calls]
+    # CR + audited financial report ROUTE through KYC_UPLOAD_DOCUMENT_BASE64
+    # (the specialised tools take file_path, not base64). The metadata
+    # discriminator carries document_type=COMMERCIAL_REGISTRATION /
+    # AUDITED_FINANCIAL_REPORT so the backend stores them under the right
+    # entity slot.
     assert call_names == [
         Tools.AUTH_CHECK_CONTACT,
         Tools.MCP_CREATE_CHANNEL_SESSION,        # new-lead first bridge
         Tools.AUTH_COMPLETE_ONBOARDING,
         Tools.MCP_CREATE_CHANNEL_SESSION,        # second bridge (post-promotion)
-        Tools.KYC_UPLOAD_COMMERCIAL_REGISTRATION,
+        Tools.KYC_UPLOAD_DOCUMENT_BASE64,         # CR (routed via generic tool)
         Tools.KYC_UPDATE_ELIGIBILITY,
-        Tools.KYC_UPLOAD_AUDITED_FINANCIAL_REPORT,
+        Tools.KYC_UPLOAD_DOCUMENT_BASE64,         # audited report (routed via generic tool)
         Tools.KYC_GET_ADMIN_REQUESTED_DOCUMENTS,  # documents_list_fetch
         Tools.KYC_ADD_BUYER,
         Tools.KYC_ADD_SHAREHOLDERS,
@@ -226,7 +240,6 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
         Tools.KYC_GET_ADMIN_REQUESTED_DOCUMENTS,  # re-check missing
         Tools.AUTH_ME,                            # status_poll_on_demand (ELIGIBLE)
         Tools.AUTH_ME,                            # status_poll_on_demand (PRE_QUALIFIED)
-        # Payment block (Phase 3 wires).
         Tools.KYC_GET_BUSINESS_DETAILS,
         Tools.PAYMENTS_LIST_MONETIZATION_PRODUCTS,
         Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT,
@@ -285,23 +298,27 @@ async def test_payloads_match_adapter_translation_at_the_seam() -> None:
     assert first_bridge["create_onboarding_token"] is True
 
     # complete_onboarding carries the onboarding_token from the first bridge,
-    # plus the captured name + the channel as phone_number.
+    # plus the captured name + the channel as `phone` (UAT renames
+    # phone_number → phone).
     complete = by_name[Tools.AUTH_COMPLETE_ONBOARDING][0]
     assert complete["onboarding_token"] == "OT-1"
     assert complete["first_name"] == "Aisha"
     assert complete["last_name"] == "Karim"
-    assert complete["phone_number"] == IDENTITY
+    assert complete["phone"] == IDENTITY
 
     # Second bridge call no longer asks for an onboarding_token.
     second_bridge = by_name[Tools.MCP_CREATE_CHANNEL_SESSION][1]
     assert second_bridge["create_onboarding_token"] is False
 
-    # CR upload threads access_token + filename + base64 content.
+    # CR upload uses the UAT generic-base64 schema (file_name, mime_type,
+    # base64, metadata{access_token, document_entity_type, document_type}).
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": "QkE="}]})
     cr = mcp.calls[-1][1]
-    assert cr["access_token"] == "AT-real-1"
-    assert cr["filename"] == "CR.pdf"
-    assert cr["content_base64"] == "QkE="
+    assert cr["file_name"] == "CR.pdf"
+    assert cr["base64"] == "QkE="
+    assert cr["mime_type"] == "application/pdf"
+    assert cr["metadata"]["access_token"] == "AT-real-1"
+    assert cr["metadata"]["document_type"] == "COMMERCIAL_REGISTRATION"
 
     # Eligibility form data is merged with access_token (no envelope keys).
     await resume({"annual_revenue_qar": 5_000_000, "sector": "trade", "type": "form"})

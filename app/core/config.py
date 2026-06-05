@@ -139,6 +139,12 @@ class SecuritySettings(BaseModel):
 
     webhook_secret: str | None = None
     webhook_signature_header: str = "X-Madad-Signature"
+    # Subset of backend event types this deployment accepts on the webhook
+    # chokepoint. Empty (the default) means "use the dispatcher's bundled
+    # ALL_BACKEND_EVENTS set" — operators override per-environment when a
+    # specific environment (e.g. staging) should reject Phase 1.b events
+    # until those workflows ship.
+    webhook_allowed_event_types: set[str] = Field(default_factory=set)
 
 
 class ObservabilitySettings(BaseModel):

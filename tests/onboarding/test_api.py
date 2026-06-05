@@ -1,4 +1,10 @@
-"""API-level test: drive the reshaped Phase 2 onboarding flow over HTTP."""
+"""API-level test: drive the reshaped Phase 4 onboarding flow over HTTP.
+
+Phase 4 separates inbound user replies (``/workflow/inbound``) from backend
+webhook events (``/workflow/madad/events/{event_type}``). The eligibility
+form and counterparty captures arrive as inbound ``data`` payloads;
+``payment.completed`` and ``status_update`` arrive at the webhook chokepoint.
+"""
 
 from __future__ import annotations
 
@@ -23,10 +29,15 @@ def _inbound(**body):
     )
 
 
-def _madad_status(event, payload):
+def _backend_event(event_type, payload=None, event_id=None):
     return client.post(
-        f"/workflow/madad/status/{event}",
-        json={"channel": "whatsapp", "identity": IDENTITY, "payload": payload},
+        f"/workflow/madad/events/{event_type}",
+        json={
+            "channel": "whatsapp",
+            "identity": IDENTITY,
+            "event_id": event_id,
+            "payload": payload or {},
+        },
     )
 
 
@@ -43,38 +54,25 @@ def test_full_flow_over_http() -> None:
     assert started.json()["prompt"]["step"] == "campaign"
 
     assert _inbound(text="YES").json()["prompt"]["step"] == "collect_details"
-    assert (
-        client.post(
-            "/workflow/inbound",
-            json={
-                "channel": "whatsapp",
-                "identity": IDENTITY,
-                "text": "Aisha Karim",
-            },
-        ).json()["prompt"]["step"]
-        == "consent_cr"
-    )
+    assert _inbound(text="Aisha Karim").json()["prompt"]["step"] == "consent_cr"
     assert (
         _inbound(attachments=[{"filename": "CR.pdf"}]).json()["prompt"]["step"]
         == "eligibility"
     )
-    # Eligibility form arrives as a status_update-style payload (no attachments).
-    eligibility = _madad_status("status_update", {"annual_revenue_qar": 1000})
-    assert eligibility.status_code == 200
-    assert eligibility.json()["prompt"]["step"] == "financials"
+    # Eligibility form: structured data via the inbound `data` field.
+    assert (
+        _inbound(data={"annual_revenue_qar": 1000}).json()["prompt"]["step"]
+        == "financials"
+    )
 
     assert (
         _inbound(attachments=[{"filename": "Audited.pdf"}]).json()["prompt"]["step"]
         == "buyers"
     )
-    # Buyer info (no attachments — handled as a status_update payload).
+    assert _inbound(data={"name": "ACME"}).json()["prompt"]["step"] == "shareholders"
     assert (
-        _madad_status("status_update", {"name": "ACME"}).json()["prompt"]["step"]
-        == "shareholders"
-    )
-    assert (
-        _madad_status(
-            "status_update", {"shareholders": [{"name": "A", "percentage": 100}]}
+        _inbound(
+            data={"shareholders": [{"name": "A", "percentage": 100}]}
         ).json()["prompt"]["step"]
         == "documents"
     )
@@ -92,30 +90,56 @@ def test_full_flow_over_http() -> None:
     )
     assert docs.json()["prompt"]["step"] == "journey_wait"
 
-    # Advance the backend status and resume — journey_wait_await → poll →
-    # PRE_QUALIFIED → payment_send.
+    # Backend event advances journey → payment chain → payment_await.
     platform = get_onboarding_platform()
     platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
-    assert (
-        _madad_status("status_update", {}).json()["prompt"]["step"] == "payment"
-    )
+    advanced = _backend_event("eligibility.updated", event_id="evt-1")
+    assert advanced.json()["prompt"]["step"] == "payment"
 
-    # Payment paid → lender wait.
-    assert (
-        _madad_status("payment", {"paid": True}).json()["prompt"]["step"]
-        == "lender_wait"
-    )
+    # Payment paid → lender_wait.
+    paid = _backend_event("payment.completed", {"paid": True}, event_id="evt-2")
+    assert paid.json()["prompt"]["step"] == "lender_wait"
 
-    # Backend advances to ACCEPTED → offers → handoff terminal.
+    # ACCEPTED → offers_fetch → offer handoff terminal.
     platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
-    final = _madad_status("status_update", {})
+    final = _backend_event("offers.available", event_id="evt-3")
     assert final.json()["completed"] is True
     assert final.json()["outcome"] == "offer_handoff"
 
 
-def test_unknown_status_event_rejected() -> None:
+def test_unknown_backend_event_rejected_with_400() -> None:
     response = client.post(
-        "/workflow/madad/status/nonsense",
-        json={"channel": "whatsapp", "identity": "+97455509999", "payload": {}},
+        "/workflow/madad/events/nonsense",
+        json={
+            "channel": "whatsapp",
+            "identity": "+97455599999",
+            "payload": {},
+        },
     )
     assert response.status_code == 400
+    assert response.json()["code"] == "unknown_event_type"
+
+
+def test_duplicate_event_id_is_deduped() -> None:
+    # Start a fresh run identity so this test is independent of the full-flow.
+    identity = "+97455509777"
+    client.post("/workflow/campaign/start", json={"channel": "whatsapp", "identity": identity})
+
+    def event():
+        return client.post(
+            "/workflow/madad/events/eligibility.updated",
+            json={
+                "channel": "whatsapp",
+                "identity": identity,
+                "event_id": "dup-key-1",
+                "payload": {},
+            },
+        )
+
+    first = event()
+    # The first call may not advance the workflow (it's still in campaign_await),
+    # but the dedupe layer accepts it. Status code 200 either way.
+    assert first.status_code == 200
+    second = event()
+    assert second.status_code == 200
+    assert second.json() == {"deduped": True}

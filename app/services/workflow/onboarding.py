@@ -693,11 +693,16 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         status = await self._poll_journey_status(state)
+        # Preserve the source set by the upstream await (webhook vs poll
+        # trigger). Default to "poll" if nothing set it — this node is by
+        # definition an active poll, and the first entry (from
+        # documents_complete) has no upstream source.
+        source = state.last_status_source or "poll"
         return self._step(
             "status_poll_on_demand",
             ctx,
             journey_status=status,
-            last_status_source="poll",
+            last_status_source=source,
             last_polled_at=ctx.clock.now(),
         )
 
@@ -705,9 +710,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         # Suspend until a status_update / webhook resume arrives. The resume
-        # payload is discarded — the next node re-polls auth_me for truth.
-        await_input({"waiting_for": "journey_status", "step": "journey_wait"})
-        return self._step("journey_wait_await", ctx)
+        # payload's ``last_status_source`` (set by the dispatcher on backend
+        # webhook arrivals — see translate_backend_event) is carried into
+        # state so the polling worker can suppress its next cycle.
+        payload = await_input({"waiting_for": "journey_status", "step": "journey_wait"})
+        source = _extract_status_source(payload)
+        return self._step("journey_wait_await", ctx, last_status_source=source)
 
     async def _not_qualified(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -826,19 +834,21 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         status = await self._poll_journey_status(state)
+        source = state.last_status_source or "poll"
         return self._step(
             "lender_status_poll",
             ctx,
             journey_status=status,
-            last_status_source="poll",
+            last_status_source=source,
             last_polled_at=ctx.clock.now(),
         )
 
     async def _lender_wait_await(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        await_input({"waiting_for": "journey_status", "step": "lender_wait"})
-        return self._step("lender_wait_await", ctx)
+        payload = await_input({"waiting_for": "journey_status", "step": "lender_wait"})
+        source = _extract_status_source(payload)
+        return self._step("lender_wait_await", ctx, last_status_source=source)
 
     async def _offers_fetch(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -980,3 +990,16 @@ class OnboardingWorkflow(WorkflowDefinition):
 def _channel(ctx: WorkflowContext) -> Channel:
     assert ctx.channel is not None
     return ctx.channel
+
+
+def _extract_status_source(payload: Any) -> str:
+    """Pull ``last_status_source`` off a resume payload, defaulting to
+    "poll". The dispatcher's :func:`translate_backend_event` stamps
+    "webhook" on real Madad-backend events; explicit poller resumes (or
+    test-driven manual resumes) get "poll"."""
+
+    if isinstance(payload, dict):
+        source = payload.get("last_status_source")
+        if isinstance(source, str):
+            return source
+    return "poll"

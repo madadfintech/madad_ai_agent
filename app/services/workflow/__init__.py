@@ -14,7 +14,14 @@ from .deps import (
     build_onboarding_platform,
     get_onboarding_platform,
 )
-from .dispatcher import OnboardingDispatcher
+from .dispatcher import (
+    ALL_BACKEND_EVENTS,
+    PHASE1A_BACKEND_EVENTS,
+    PHASE1B_BACKEND_EVENTS,
+    OnboardingDispatcher,
+    UnknownEventTypeError,
+    translate_backend_event,
+)
 from .mcp_identity import McpMadadIdentityClient
 from .mcp_kyc import McpKycClient
 from .mcp_payments import McpMonetizationPaymentAdapter, McpTessLoanPaymentAdapter
@@ -32,6 +39,11 @@ from .ports import (
     Reminders,
 )
 from .state import OnboardingState
+from .webhook_dedupe import (
+    InMemoryWebhookDedupe,
+    RedisWebhookDedupe,
+    WebhookDedupe,
+)
 
 __all__ = [
     # workflow + state
@@ -43,6 +55,14 @@ __all__ = [
     "build_onboarding_platform",
     "get_onboarding_platform",
     "OnboardingDispatcher",
+    "UnknownEventTypeError",
+    "translate_backend_event",
+    "ALL_BACKEND_EVENTS",
+    "PHASE1A_BACKEND_EVENTS",
+    "PHASE1B_BACKEND_EVENTS",
+    "WebhookDedupe",
+    "InMemoryWebhookDedupe",
+    "RedisWebhookDedupe",
     # ports
     "Messenger",
     "MadadIdentityClient",

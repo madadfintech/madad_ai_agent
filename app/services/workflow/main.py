@@ -2,11 +2,14 @@
 
 Drives the onboarding workflow:
 * ``POST /workflow/campaign/start`` — start onboarding (campaign entry / Step 0)
-* ``POST /workflow/inbound``        — feed an inbound channel message (start/resume)
-* ``POST /workflow/madad/status/{event}`` — resume on a backend status callback
-  (``payment``, ``status_update``). Phase 4 expands this to the eight canonical
-  webhook events.
-* ``GET  /workflow/status``         — current run status for a channel-identity
+* ``POST /workflow/inbound``        — feed an inbound channel message
+  (start / resume on user reply).
+* ``POST /workflow/madad/events/{event_type}`` — backend webhook chokepoint.
+  Accepts any of the 14 canonical event types (8 Phase 1.a + 6 Phase 1.b,
+  see :data:`dispatcher.ALL_BACKEND_EVENTS`). HMAC-verified;
+  ``event_id`` (from ``X-Madad-Event-Id`` header or body) is deduped through
+  the dispatcher's :class:`WebhookDedupe`.
+* ``GET  /workflow/status``         — current run status for a channel-identity.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -26,6 +29,7 @@ from app.shared.workflow import Channel, ExecutionResult
 from app.shared.workflow.errors import SessionNotFoundError
 
 from .deps import OnboardingPlatform, get_onboarding_platform
+from .dispatcher import UnknownEventTypeError
 
 
 @asynccontextmanager
@@ -60,25 +64,26 @@ class InboundRequest(BaseModel):
     identity: str
     text: str | None = None
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+    # Structured user-input payload — used when the active step expects a
+    # form-shaped reply (eligibility intake, buyers / shareholders capture)
+    # rather than free text or attachments. The dispatcher merges this into
+    # the resume payload as top-level keys.
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
-class MadadStatusRequest(BaseModel):
-    """A backend status update pushed by Madad's core (NOT Tess/external).
+class BackendEventRequest(BaseModel):
+    """A backend webhook event pushed by Madad's core.
 
-    Carries the async events the agent is waiting on: monetization-payment
-    completion and journey-status transitions polled from ``madad_auth_me``.
+    Carries the channel-identity to address (the workflow is keyed on this
+    pair), the optional ``event_id`` the dispatcher dedupes on, and the raw
+    event ``payload`` whose shape is event-specific. The ``event_type`` is
+    a URL path segment so logs and metrics can group by event.
     """
 
     channel: Channel
     identity: str
+    event_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
-
-
-# Phase 2 graph resume sources. ``payment`` resolves payment_await once the
-# monetization fee clears; ``status_update`` wakes journey_wait_await /
-# lender_wait_await so the next poll picks up the new journey_status. Phase 4
-# expands this to the eight canonical webhook event types.
-_MADAD_STATUS_EVENTS = {"payment", "status_update"}
 
 
 class RunStatusDTO(BaseModel):
@@ -117,26 +122,51 @@ async def start_campaign(req: CampaignStartRequest, platform: Platform) -> RunSt
 @app.post("/workflow/inbound", response_model=RunStatusDTO)
 async def inbound(req: InboundRequest, platform: Platform) -> RunStatusDTO:
     result = await platform.dispatcher.inbound(
-        req.channel, req.identity, text=req.text, attachments=req.attachments
+        req.channel,
+        req.identity,
+        text=req.text,
+        attachments=req.attachments,
+        data=req.data or None,
     )
     return RunStatusDTO.from_result(result)
 
 
 @app.post(
-    "/workflow/madad/status/{event}",
-    response_model=RunStatusDTO,
+    "/workflow/madad/events/{event_type}",
+    response_model=None,
     dependencies=[Depends(verify_webhook_signature)],
 )
-async def madad_status(event: str, req: MadadStatusRequest, platform: Platform) -> RunStatusDTO:
-    """Backend status callback from Madad's core for the async financing
-    decisions (pre-qualification, score, offers ready, payment confirmed)."""
+async def madad_event(
+    event_type: str,
+    req: BackendEventRequest,
+    platform: Platform,
+    x_madad_event_id: Annotated[str | None, Header()] = None,
+) -> RunStatusDTO | JSONResponse:
+    """Backend webhook chokepoint — accepts any of the 14 canonical event
+    types defined in :data:`dispatcher.ALL_BACKEND_EVENTS`.
 
-    if event not in _MADAD_STATUS_EVENTS:
-        return JSONResponse(  # type: ignore[return-value]
-            status_code=400, content={"code": "unknown_status_event", "message": event}
+    Dedupe key resolves to ``X-Madad-Event-Id`` header first, falling back to
+    ``event_id`` in the body (lets backend choose either transport).
+    Duplicate posts return 200 with ``{"deduped": true}`` so the backend
+    doesn't retry. Unknown event types return 400.
+    """
+
+    event_id = x_madad_event_id or req.event_id
+    try:
+        result = await platform.dispatcher.on_backend_event(
+            event_type=event_type,
+            event_id=event_id,
+            channel=req.channel,
+            identity=req.identity,
+            payload=req.payload,
         )
-    payload = {"type": event, **req.payload}
-    result = await platform.dispatcher.resume_external(req.channel, req.identity, payload)
+    except UnknownEventTypeError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "unknown_event_type", "message": exc.event_type},
+        )
+    if result is None:
+        return JSONResponse(status_code=200, content={"deduped": True})
     return RunStatusDTO.from_result(result)
 
 

@@ -7,7 +7,7 @@ from functools import lru_cache
 
 from app.shared.workflow import WorkflowRuntime, build_runtime
 
-from .dispatcher import OnboardingDispatcher
+from .dispatcher import ALL_BACKEND_EVENTS, OnboardingDispatcher
 from .onboarding import OnboardingWorkflow
 from .ports import (
     InMemoryKycClient,
@@ -21,6 +21,7 @@ from .ports import (
     RecordingReminders,
     Reminders,
 )
+from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
 
 
 @dataclass
@@ -46,6 +47,8 @@ def build_onboarding_platform(
     payments: MonetizationPaymentClient | None = None,
     reminders: Reminders | None = None,
     runtime: WorkflowRuntime | None = None,
+    dedupe: WebhookDedupe | None = None,
+    allowed_event_types: frozenset[str] | set[str] | None = None,
 ) -> OnboardingPlatform:
     runtime = runtime or build_runtime()
     workflow = OnboardingWorkflow(
@@ -56,7 +59,11 @@ def build_onboarding_platform(
         reminders=reminders or RecordingReminders(),
     )
     runtime.register(workflow)
-    dispatcher = OnboardingDispatcher(runtime)
+    dispatcher = OnboardingDispatcher(
+        runtime,
+        dedupe=dedupe or InMemoryWebhookDedupe(),
+        allowed_event_types=allowed_event_types or ALL_BACKEND_EVENTS,
+    )
     return OnboardingPlatform(runtime=runtime, workflow=workflow, dispatcher=dispatcher)
 
 

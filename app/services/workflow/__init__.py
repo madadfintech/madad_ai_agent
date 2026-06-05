@@ -15,15 +15,15 @@ from .deps import (
     get_onboarding_platform,
 )
 from .dispatcher import OnboardingDispatcher
+from .mcp_identity import McpMadadIdentityClient
+from .mcp_kyc import McpKycClient
 from .onboarding import TEMPLATE_KEYS, OnboardingWorkflow
 from .ports import (
-    DocumentIntake,
-    InMemoryDocumentIntake,
-    InMemoryMadadClient,
-    InMemoryPaymentClient,
-    MadadClient,
+    InMemoryKycClient,
+    InMemoryMadadIdentityClient,
+    KycClient,
+    MadadIdentityClient,
     Messenger,
-    PaymentClient,
     RecordingMessenger,
     RecordingReminders,
     Reminders,
@@ -42,16 +42,17 @@ __all__ = [
     "OnboardingDispatcher",
     # ports
     "Messenger",
-    "DocumentIntake",
-    "MadadClient",
-    "PaymentClient",
+    "MadadIdentityClient",
+    "KycClient",
     "Reminders",
     # in-memory / recording fakes
     "RecordingMessenger",
-    "InMemoryDocumentIntake",
-    "InMemoryMadadClient",
-    "InMemoryPaymentClient",
+    "InMemoryMadadIdentityClient",
+    "InMemoryKycClient",
     "RecordingReminders",
+    # MCP-backed adapters
+    "McpMadadIdentityClient",
+    "McpKycClient",
     # real adapters
     "CommunicationMessenger",
     "NudgeReminders",

@@ -1,8 +1,8 @@
 """Full-stack integration: onboarding → real Communication + CMS + Nudge.
 
-Drives the onboarding workflow with the real Communication service (rendering CMS
-templates) and the real Nudge service, proving the cross-service wiring works
-end-to-end (not just the in-memory fakes).
+Drives the reshaped Phase 2 onboarding workflow with the real Communication
+service (rendering CMS templates) and the real Nudge service, proving the
+cross-service wiring works end-to-end (not just the in-memory fakes).
 """
 
 from __future__ import annotations
@@ -13,9 +13,8 @@ from app.services.nudge import CmsNudgeConfigProvider, build_nudge_service
 from app.services.workflow import (
     TEMPLATE_KEYS,
     CommunicationMessenger,
-    InMemoryDocumentIntake,
-    InMemoryMadadClient,
-    InMemoryPaymentClient,
+    InMemoryKycClient,
+    InMemoryMadadIdentityClient,
     NudgeReminders,
     build_onboarding_platform,
 )
@@ -28,7 +27,7 @@ IDENTITY = "+97455500004"
 
 async def test_onboarding_drives_real_communication_and_nudge():
     cms = build_cms_service()
-    # Seed all onboarding templates (plain bodies so rendering is deterministic).
+    # Seed all onboarding templates so rendering is deterministic.
     for key in TEMPLATE_KEYS:
         await cms.upsert_template(key, Locale.EN, f"[{key}]")
     # Seed a nudge schedule so the real Nudge service accepts the scheduling.
@@ -43,12 +42,8 @@ async def test_onboarding_drives_real_communication_and_nudge():
 
     platform = build_onboarding_platform(
         messenger=CommunicationMessenger(comms),
-        documents=InMemoryDocumentIntake(
-            required=["trade_license", "tax_card"],
-            type_by_keyword={"trade": "trade_license", "tax": "tax_card"},
-        ),
-        madad=InMemoryMadadClient(),
-        payments=InMemoryPaymentClient(),
+        identity=InMemoryMadadIdentityClient(journey_status="ELIGIBLE"),
+        kyc=InMemoryKycClient(required_documents=["trade_license", "tax_card"]),
         reminders=NudgeReminders(nudge),
     )
     runtime = platform.runtime
@@ -59,14 +54,22 @@ async def test_onboarding_drives_real_communication_and_nudge():
         return await runtime.resume(WA, IDENTITY, message=message)
 
     await resume({"text": "YES"})
+    await resume({"first_name": "Aisha", "last_name": "Karim"})
     await resume({"attachments": [{"filename": "CR.pdf"}]})
+    await resume({"annual_revenue_qar": 5_000_000})
     await resume({"attachments": [{"filename": "Audited.pdf"}]})
-    await resume({"type": "prequalification", "qualified": True})
-    await resume({"attachments": [{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}]})
-    await resume({"type": "score", "score": 78, "qualified": True})
+    await resume({"name": "ACME LLC"})
+    await resume({"shareholders": [{"name": "Aisha", "percentage": 100}]})
+    await resume(
+        {"attachments": [{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}]}
+    )
+
+    # Advance backend to drive the rest of the flow.
+    platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
+    await resume({"type": "status_update"})
     await resume({"type": "payment", "paid": True})
-    await resume({"type": "offers", "offers": [{"offer_id": "o1"}]})
-    result = await resume({"type": "offer_selection", "offer_id": "o1"})
+    platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
+    result = await resume({"type": "status_update"})
 
     assert result.status == RunStatus.COMPLETED
 
@@ -75,4 +78,4 @@ async def test_onboarding_drives_real_communication_and_nudge():
     messages = await comms.get_messages(conversation.conversation_id)
     texts = [m.text for m in messages]
     assert "[onboarding.campaign.intro]" in texts
-    assert "[onboarding.creditline.active]" in texts
+    assert "[onboarding.offer.handoff]" in texts

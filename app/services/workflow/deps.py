@@ -10,13 +10,11 @@ from app.shared.workflow import WorkflowRuntime, build_runtime
 from .dispatcher import OnboardingDispatcher
 from .onboarding import OnboardingWorkflow
 from .ports import (
-    DocumentIntake,
-    InMemoryDocumentIntake,
-    InMemoryMadadClient,
-    InMemoryPaymentClient,
-    MadadClient,
+    InMemoryKycClient,
+    InMemoryMadadIdentityClient,
+    KycClient,
+    MadadIdentityClient,
     Messenger,
-    PaymentClient,
     RecordingMessenger,
     RecordingReminders,
     Reminders,
@@ -32,34 +30,25 @@ class OnboardingPlatform:
     dispatcher: OnboardingDispatcher
 
 
-# Default required onboarding documents (the dynamic checklist lives in CMS; this
-# seeds the in-memory intake used when no CMS-backed intake is wired).
+# Default admin-requested documents used by the in-memory KYC fake — the real
+# list lives in the Madad backend and is fetched per run via
+# ``madad_kyc_get_admin_requested_documents``.
 DEFAULT_REQUIRED_DOCS = ["trade_license", "tax_card", "bank_statement"]
-DEFAULT_DOC_KEYWORDS = {
-    "trade": "trade_license",
-    "tax": "tax_card",
-    "bank": "bank_statement",
-}
 
 
 def build_onboarding_platform(
     *,
     messenger: Messenger | None = None,
-    documents: DocumentIntake | None = None,
-    madad: MadadClient | None = None,
-    payments: PaymentClient | None = None,
+    identity: MadadIdentityClient | None = None,
+    kyc: KycClient | None = None,
     reminders: Reminders | None = None,
     runtime: WorkflowRuntime | None = None,
 ) -> OnboardingPlatform:
     runtime = runtime or build_runtime()
     workflow = OnboardingWorkflow(
         messenger=messenger or RecordingMessenger(),
-        documents=documents
-        or InMemoryDocumentIntake(
-            required=DEFAULT_REQUIRED_DOCS, type_by_keyword=DEFAULT_DOC_KEYWORDS
-        ),
-        madad=madad or InMemoryMadadClient(),
-        payments=payments or InMemoryPaymentClient(),
+        identity=identity or InMemoryMadadIdentityClient(),
+        kyc=kyc or InMemoryKycClient(required_documents=DEFAULT_REQUIRED_DOCS),
         reminders=reminders or RecordingReminders(),
     )
     runtime.register(workflow)
@@ -71,13 +60,11 @@ def build_onboarding_platform(
 def get_onboarding_platform() -> OnboardingPlatform:
     """Process-singleton platform for the FastAPI app.
 
-    Uses in-memory adapters for the onboarding business ports (MadadClient,
-    PaymentClient, DocumentIntake). The MCP-backed replacements for these are
-    introduced in later integration phases (channel-session, KYC, monetization
-    payment) — each will plug into ``build_onboarding_platform(...)`` once its
-    adapter exists. ``settings.mcp.enabled`` switches the *transport* (real
-    fastmcp client vs in-memory fake); the workflow-level adapters select
-    themselves once they ship.
+    Defaults to in-memory adapters for the onboarding business ports
+    (MadadIdentityClient, KycClient). The MCP-backed replacements ship via
+    ``McpMadadIdentityClient`` (Phase 1) and ``McpKycClient`` (Phase 2);
+    operators wire them through ``build_onboarding_platform(...)`` once
+    ``settings.mcp.enabled`` flips on in staging / production.
     """
 
     return build_onboarding_platform()

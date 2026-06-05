@@ -83,27 +83,33 @@ class OnboardingState(WorkflowState):
     last_polled_at: datetime | None = None
     last_status_source: StatusSource | None = None
 
+    # Step 1: new-lead onboarding-details capture (precedes complete_onboarding).
+    onboarding_first_name: str | None = None
+    onboarding_last_name: str | None = None
+
     # Step 1–2: campaign + consent + CR.
     entry_reply: str = ""
     consent: bool = False
     cr_ref: str | None = None
+    cr_content_base64: str | None = None
 
-    # Step 3–4: eligibility + financials + pre-qualification.
+    # Step 3–4: eligibility + financials.
+    eligibility_form_data: dict[str, Any] = Field(default_factory=dict)
     eligible: bool | None = None
     financials_received: bool = False
+    financials_filename: str | None = None
+    financials_content_base64: str | None = None
     application_ref: str | None = None  # Madad account ref (e.g. #7388266)
-    prequalified: bool | None = None
 
-    # Step 5–6: checklist + document collection.
+    # Step 5–6: dynamic checklist + counterparties.
     missing_documents: list[str] = []
+    buyers: list[dict[str, Any]] = []
+    shareholders: list[dict[str, Any]] = []
 
-    # Step 7–8: score, payment, offers, credit line.
-    score: int | None = None
-    risk_qualified: bool | None = None
+    # Step 7–8: payment + offers.
     paid: bool = False
     offers: list[dict[str, Any]] = []
     selected_offer: dict[str, Any] | None = None
-    credit_line_active: bool = False
 
     # -- Step 5: monetization payment (Phase 3 will populate) ----------------
     business_details_id: str | None = None

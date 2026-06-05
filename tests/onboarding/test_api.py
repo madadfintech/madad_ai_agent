@@ -1,9 +1,10 @@
-"""API-level test: drive the full onboarding flow over HTTP."""
+"""API-level test: drive the reshaped Phase 2 onboarding flow over HTTP."""
 
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from app.services.workflow.deps import get_onboarding_platform
 from app.services.workflow.main import app
 
 client = TestClient(app)
@@ -29,13 +30,6 @@ def _madad_status(event, payload):
     )
 
 
-def _offer_acceptance(offer_id):
-    return client.post(
-        "/workflow/webhooks/offer-acceptance",
-        json={"channel": "whatsapp", "identity": IDENTITY, "offer_id": offer_id},
-    )
-
-
 def test_health() -> None:
     response = client.get("/health")
     assert response.status_code == 200
@@ -48,40 +42,75 @@ def test_full_flow_over_http() -> None:
     assert started.json()["waiting"] is True
     assert started.json()["prompt"]["step"] == "campaign"
 
-    assert _inbound(text="YES").json()["prompt"]["step"] == "consent_cr"
-    assert _inbound(attachments=[{"filename": "CR.pdf"}]).json()["prompt"]["step"] == "financials"
+    assert _inbound(text="YES").json()["prompt"]["step"] == "collect_details"
+    assert (
+        client.post(
+            "/workflow/inbound",
+            json={
+                "channel": "whatsapp",
+                "identity": IDENTITY,
+                "text": "Aisha Karim",
+            },
+        ).json()["prompt"]["step"]
+        == "consent_cr"
+    )
+    assert (
+        _inbound(attachments=[{"filename": "CR.pdf"}]).json()["prompt"]["step"]
+        == "eligibility"
+    )
+    # Eligibility form arrives as a status_update-style payload (no attachments).
+    eligibility = _madad_status("status_update", {"annual_revenue_qar": 1000})
+    assert eligibility.status_code == 200
+    assert eligibility.json()["prompt"]["step"] == "financials"
+
     assert (
         _inbound(attachments=[{"filename": "Audited.pdf"}]).json()["prompt"]["step"]
-        == "prequalification"
+        == "buyers"
+    )
+    # Buyer info (no attachments — handled as a status_update payload).
+    assert (
+        _madad_status("status_update", {"name": "ACME"}).json()["prompt"]["step"]
+        == "shareholders"
+    )
+    assert (
+        _madad_status(
+            "status_update", {"shareholders": [{"name": "A", "percentage": 100}]}
+        ).json()["prompt"]["step"]
+        == "documents"
     )
 
     status = client.get("/workflow/status", params={"channel": "whatsapp", "identity": IDENTITY})
     assert status.status_code == 200
     assert status.json()["status"] == "waiting_for_input"
 
-    # Async financing decisions arrive as Madad backend status callbacks.
-    assert (
-        _madad_status("prequalification", {"qualified": True}).json()["prompt"]["step"]
-        == "documents"
-    )
     docs = _inbound(
-        attachments=[{"filename": "Trade.pdf"}, {"filename": "Tax.pdf"}, {"filename": "Bank.pdf"}]
+        attachments=[
+            {"filename": "Trade_License.pdf"},
+            {"filename": "Tax_Card.pdf"},
+            {"filename": "Bank_Statement.pdf"},
+        ]
     )
-    assert docs.json()["prompt"]["step"] == "risk_assessment"
+    assert docs.json()["prompt"]["step"] == "journey_wait"
+
+    # Advance the backend status and resume — journey_wait_await → poll →
+    # PRE_QUALIFIED → payment_send.
+    platform = get_onboarding_platform()
+    platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
     assert (
-        _madad_status("score", {"score": 78, "qualified": True}).json()["prompt"]["step"]
-        == "payment"
-    )
-    assert _madad_status("payment", {"paid": True}).json()["prompt"]["step"] == "lender_evaluation"
-    assert (
-        _madad_status("offers", {"offers": [{"offer_id": "o1"}]}).json()["prompt"]["step"]
-        == "offer_preview"
+        _madad_status("status_update", {}).json()["prompt"]["step"] == "payment"
     )
 
-    # Offer acceptance is the one event that comes back via the webhook receiver.
-    final = _offer_acceptance("o1")
+    # Payment paid → lender wait.
+    assert (
+        _madad_status("payment", {"paid": True}).json()["prompt"]["step"]
+        == "lender_wait"
+    )
+
+    # Backend advances to ACCEPTED → offers → handoff terminal.
+    platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
+    final = _madad_status("status_update", {})
     assert final.json()["completed"] is True
-    assert final.json()["outcome"] == "completed"
+    assert final.json()["outcome"] == "offer_handoff"
 
 
 def test_unknown_status_event_rejected() -> None:

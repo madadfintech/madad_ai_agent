@@ -1,4 +1,4 @@
-"""Dispatcher: inbound starts then resumes; external webhook resume."""
+"""Dispatcher: inbound starts then resumes; external resume via status_update."""
 
 from __future__ import annotations
 
@@ -13,19 +13,18 @@ IDENTITY = "+97455500003"
 async def test_inbound_starts_then_resumes_same_run(harness):
     dispatcher = harness.platform.dispatcher
 
-    first = await dispatcher.inbound(WA, IDENTITY, text="hi")  # organic contact -> start
+    first = await dispatcher.inbound(WA, IDENTITY, text="hi")  # organic contact → start
     assert first.status == RunStatus.WAITING_FOR_INPUT
     assert first.prompt["step"] == "campaign"
     run_id = first.run.run_id
 
-    second = await dispatcher.inbound(WA, IDENTITY, text="YES")  # reply -> resume same run
+    second = await dispatcher.inbound(WA, IDENTITY, text="YES")  # YES → resume same run
     assert second.run.run_id == run_id
-    assert second.prompt["step"] == "consent_cr"
+    assert second.prompt["step"] == "collect_details"
 
 
 async def test_on_inbound_with_message_object(harness):
     dispatcher = harness.platform.dispatcher
-    # Duck-typed communication Message (channel, identity, text, attachments).
     message = SimpleNamespace(
         channel=WA, identity=IDENTITY, text="hi", attachments=[], message_id="m1"
     )
@@ -34,18 +33,31 @@ async def test_on_inbound_with_message_object(harness):
     assert result.prompt["step"] == "campaign"
 
 
-async def test_resume_external_webhook(harness):
+async def test_resume_external_status_update(harness):
     dispatcher = harness.platform.dispatcher
     runtime = harness.platform.runtime
 
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     await dispatcher.inbound(WA, IDENTITY, text="YES")
+    await dispatcher.inbound(WA, IDENTITY, text="Aisha Karim")
     await dispatcher.inbound(WA, IDENTITY, attachments=[{"filename": "CR.pdf"}])
-    await dispatcher.inbound(WA, IDENTITY, attachments=[{"filename": "Audited.pdf"}])
-
-    # External pre-qualification decision arrives via webhook.
-    result = await dispatcher.resume_external(
-        WA, IDENTITY, {"type": "prequalification", "qualified": True}
+    # Eligibility form payload (no attachments / text — pure dict).
+    await dispatcher.resume_external(
+        WA, IDENTITY, {"annual_revenue_qar": 1000}
     )
-    assert result.prompt["step"] == "documents"
-    assert result.values["prequalified"] is True
+    await dispatcher.inbound(WA, IDENTITY, attachments=[{"filename": "Audited.pdf"}])
+    await dispatcher.resume_external(WA, IDENTITY, {"name": "ACME"})
+    await dispatcher.resume_external(
+        WA, IDENTITY, {"shareholders": [{"name": "A", "percentage": 100}]}
+    )
+    await dispatcher.inbound(
+        WA,
+        IDENTITY,
+        attachments=[{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}],
+    )
+
+    # Webhook-driven status update advances the journey out of journey_wait.
+    harness.identity.journey_status = "PRE_QUALIFIED"
+    result = await dispatcher.resume_external(WA, IDENTITY, {"type": "status_update"})
+
+    assert result.prompt["step"] == "payment"

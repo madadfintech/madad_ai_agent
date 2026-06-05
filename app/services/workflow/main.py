@@ -3,8 +3,9 @@
 Drives the onboarding workflow:
 * ``POST /workflow/campaign/start`` — start onboarding (campaign entry / Step 0)
 * ``POST /workflow/inbound``        — feed an inbound channel message (start/resume)
-* ``POST /workflow/webhooks/{kind}``— resume on an external decision (pre-qual,
-  score, payment, offers, offer_selection)
+* ``POST /workflow/madad/status/{event}`` — resume on a backend status callback
+  (``payment``, ``status_update``). Phase 4 expands this to the eight canonical
+  webhook events.
 * ``GET  /workflow/status``         — current run status for a channel-identity
 """
 
@@ -61,19 +62,11 @@ class InboundRequest(BaseModel):
     attachments: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class OfferAcceptanceRequest(BaseModel):
-    """Offer acceptance from Madad's platform (the user selected an offer after
-    being routed to madadfintech.com)."""
-
-    channel: Channel
-    identity: str
-    offer_id: str | None = None
-
-
 class MadadStatusRequest(BaseModel):
     """A backend status update pushed by Madad's core (NOT Tess/external).
 
-    Carries the async financing decisions the agent is waiting on.
+    Carries the async events the agent is waiting on: monetization-payment
+    completion and journey-status transitions polled from ``madad_auth_me``.
     """
 
     channel: Channel
@@ -81,9 +74,11 @@ class MadadStatusRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-# Async decisions Madad's backend reports (Tess payment is confirmed by Madad,
-# never received here directly).
-_MADAD_STATUS_EVENTS = {"prequalification", "score", "offers", "payment"}
+# Phase 2 graph resume sources. ``payment`` resolves payment_await once the
+# monetization fee clears; ``status_update`` wakes journey_wait_await /
+# lender_wait_await so the next poll picks up the new journey_status. Phase 4
+# expands this to the eight canonical webhook event types.
+_MADAD_STATUS_EVENTS = {"payment", "status_update"}
 
 
 class RunStatusDTO(BaseModel):
@@ -124,20 +119,6 @@ async def inbound(req: InboundRequest, platform: Platform) -> RunStatusDTO:
     result = await platform.dispatcher.inbound(
         req.channel, req.identity, text=req.text, attachments=req.attachments
     )
-    return RunStatusDTO.from_result(result)
-
-
-@app.post(
-    "/workflow/webhooks/offer-acceptance",
-    response_model=RunStatusDTO,
-    dependencies=[Depends(verify_webhook_signature)],
-)
-async def offer_acceptance(req: OfferAcceptanceRequest, platform: Platform) -> RunStatusDTO:
-    """THE webhook receiver — scoped to offer-acceptance events from Madad's
-    platform after the user is routed back from the lender-offer selection."""
-
-    payload = {"type": "offer_selection", "offer_id": req.offer_id}
-    result = await platform.dispatcher.resume_external(req.channel, req.identity, payload)
     return RunStatusDTO.from_result(result)
 
 

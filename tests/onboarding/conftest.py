@@ -8,9 +8,8 @@ from dataclasses import dataclass
 import pytest
 
 from app.services.workflow import (
-    InMemoryDocumentIntake,
-    InMemoryMadadClient,
-    InMemoryPaymentClient,
+    InMemoryKycClient,
+    InMemoryMadadIdentityClient,
     OnboardingPlatform,
     RecordingMessenger,
     RecordingReminders,
@@ -18,37 +17,47 @@ from app.services.workflow import (
 )
 
 REQUIRED_DOCS = ["trade_license", "tax_card"]
-DOC_KEYWORDS = {"trade": "trade_license", "tax": "tax_card", "audited": "audited_report"}
 
 
 @dataclass
 class Harness:
     platform: OnboardingPlatform
     messenger: RecordingMessenger
-    documents: InMemoryDocumentIntake
-    madad: InMemoryMadadClient
-    payments: InMemoryPaymentClient
+    identity: InMemoryMadadIdentityClient
+    kyc: InMemoryKycClient
     reminders: RecordingReminders
 
 
 @pytest.fixture
 def make_harness() -> Callable[..., Harness]:
-    def _make(*, eligible: bool = True, required: list[str] | None = None) -> Harness:
+    def _make(
+        *,
+        known_phones: dict[str, str] | None = None,
+        known_emails: dict[str, str] | None = None,
+        blocked_domains: dict[str, str] | None = None,
+        journey_status: str = "ELIGIBLE",
+        required_docs: list[str] | None = None,
+        eligibility_result: dict[str, object] | None = None,
+    ) -> Harness:
         messenger = RecordingMessenger()
-        documents = InMemoryDocumentIntake(
-            required=required or REQUIRED_DOCS, type_by_keyword=DOC_KEYWORDS
+        identity = InMemoryMadadIdentityClient(
+            known_phones=known_phones,
+            known_emails=known_emails,
+            blocked_domains=blocked_domains,
+            journey_status=journey_status,
         )
-        madad = InMemoryMadadClient(eligible=eligible)
-        payments = InMemoryPaymentClient()
+        kyc = InMemoryKycClient(
+            required_documents=required_docs or REQUIRED_DOCS,
+            eligibility_result=eligibility_result,
+        )
         reminders = RecordingReminders()
         platform = build_onboarding_platform(
             messenger=messenger,
-            documents=documents,
-            madad=madad,
-            payments=payments,
+            identity=identity,
+            kyc=kyc,
             reminders=reminders,
         )
-        return Harness(platform, messenger, documents, madad, payments, reminders)
+        return Harness(platform, messenger, identity, kyc, reminders)
 
     return _make
 

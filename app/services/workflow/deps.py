@@ -5,9 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 
+from app.core.config import settings as default_settings
+from app.services.communication.deps import get_communication_service
+from app.services.nudge.deps import get_nudge_service
+from app.shared.mcp import get_mcp_client
 from app.shared.workflow import WorkflowRuntime, build_runtime
 
+from .adapters import CommunicationMessenger, NudgeReminders
 from .dispatcher import ALL_BACKEND_EVENTS, OnboardingDispatcher
+from .mcp_identity import McpMadadIdentityClient
+from .mcp_kyc import McpKycClient
+from .mcp_payments import McpMonetizationPaymentAdapter
 from .onboarding import OnboardingWorkflow
 from .ports import (
     InMemoryKycClient,
@@ -71,11 +79,20 @@ def build_onboarding_platform(
 def get_onboarding_platform() -> OnboardingPlatform:
     """Process-singleton platform for the FastAPI app.
 
-    Defaults to in-memory adapters for the onboarding business ports
-    (MadadIdentityClient, KycClient). The MCP-backed replacements ship via
-    ``McpMadadIdentityClient`` (Phase 1) and ``McpKycClient`` (Phase 2);
-    operators wire them through ``build_onboarding_platform(...)`` once
-    ``settings.mcp.enabled`` flips on in staging / production.
+    When ``settings.mcp.enabled`` is on, the agent's business ports are
+    wired to the MCP-backed adapters (McpMadadIdentityClient, McpKycClient,
+    McpMonetizationPaymentAdapter) — every workflow node calls the real
+    Madad cluster. When MCP is off (dev / tests), the in-memory fakes serve
+    as the defaults — the workflow runs end-to-end without any network.
     """
 
+    if default_settings.mcp.enabled:
+        mcp = get_mcp_client()
+        return build_onboarding_platform(
+            messenger=CommunicationMessenger(get_communication_service()),
+            identity=McpMadadIdentityClient(mcp),
+            kyc=McpKycClient(mcp),
+            payments=McpMonetizationPaymentAdapter(mcp),
+            reminders=NudgeReminders(get_nudge_service()),
+        )
     return build_onboarding_platform()

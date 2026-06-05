@@ -210,8 +210,8 @@ def run(base_url: str, identity: str, channel: str) -> int:
 
     buyer_data = {
         "name": "ACME Trading LLC",
-        "country": "QA",
         "buyer_type": "DOMESTIC",
+        "buyer_sector": "trade",
     }
     ok, out, ms = _step(
         client, "6.buyers", "/workflow/inbound",

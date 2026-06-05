@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import sys
 import time
 from typing import Any
@@ -141,7 +142,10 @@ def _make_auth_headers() -> dict[str, str]:
 
 def run(base_url: str, identity: str, channel: str) -> int:
     client = httpx.Client(base_url=base_url, headers=_make_auth_headers())
-    print(f"=== driving demo flow: identity={identity} channel={channel} ===\n")
+    # Per-invocation event-id nonce so back-to-back demo runs don't get
+    # deduped by the webhook chokepoint (which retains seen ids for 24h).
+    run_nonce = secrets.token_hex(6)  # noqa: F841 — referenced via f-strings below
+    print(f"=== driving demo flow: identity={identity} channel={channel} nonce={run_nonce} ===\n")
 
     started: list[dict[str, Any]] = []
 
@@ -245,7 +249,7 @@ def run(base_url: str, identity: str, channel: str) -> int:
     ok, out, ms = _step(
         client, "9.status_update→payment",
         "/workflow/madad/events/eligibility.updated",
-        {**inbound, "event_id": "demo-evt-1", "payload": {}},
+        {**inbound, "event_id": f"demo-evt-{run_nonce}-1", "payload": {}},
     )
     report("9.status_update→payment", ok, out, ms)
 
@@ -253,7 +257,7 @@ def run(base_url: str, identity: str, channel: str) -> int:
     ok, out, ms = _step(
         client, "10.payment.completed",
         "/workflow/madad/events/payment.completed",
-        {**inbound, "event_id": "demo-evt-2", "payload": {"paid": True}},
+        {**inbound, "event_id": f"demo-evt-{run_nonce}-2", "payload": {"paid": True}},
     )
     report("10.payment.completed", ok, out, ms)
 
@@ -261,7 +265,7 @@ def run(base_url: str, identity: str, channel: str) -> int:
     ok, out, ms = _step(
         client, "11.final→handoff",
         "/workflow/madad/events/offers.available",
-        {**inbound, "event_id": "demo-evt-3", "payload": {}},
+        {**inbound, "event_id": f"demo-evt-{run_nonce}-3", "payload": {}},
     )
     report("11.final→handoff", ok, out, ms)
 

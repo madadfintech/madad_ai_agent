@@ -67,10 +67,24 @@ class McpMonetizationPaymentAdapter:
         # at the top — into the {"products": [...]} dict shape the workflow
         # expects.
         if isinstance(out, list):
-            return {"products": out}
-        if isinstance(out, dict) and isinstance(out.get("body"), list):
-            return {"products": out["body"]}
-        return out
+            products = out
+        elif isinstance(out, dict) and isinstance(out.get("body"), list):
+            products = out["body"]
+        elif isinstance(out, dict) and isinstance(out.get("products"), list):
+            products = out["products"]
+        else:
+            return out
+        # UAT product records carry the unique id under ``id``; the workflow
+        # references ``product_id``. Alias so callers don't need to know.
+        normalized: list[dict[str, Any]] = []
+        for p in products:
+            if not isinstance(p, dict):
+                continue
+            record = dict(p)
+            if "product_id" not in record and "id" in record:
+                record["product_id"] = record["id"]
+            normalized.append(record)
+        return {"products": normalized}
 
     async def create_monetization_payment(
         self,

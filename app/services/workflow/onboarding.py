@@ -981,6 +981,12 @@ class OnboardingWorkflow(WorkflowDefinition):
             "payment_link":   state.payment_link or "",
             "provider_ref":   state.payment_provider_ref or "",
         }
+        ctx.logger.info(
+            "payment_send_link.variables",
+            has_payment_link=bool(state.payment_link),
+            has_provider_ref=bool(state.payment_provider_ref),
+            payment_id=state.payment_id,
+        )
         await self._send(ctx, state, "onboarding.payment.request", variables)
         await self._reminders.schedule(
             "payment_pending",

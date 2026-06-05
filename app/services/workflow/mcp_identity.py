@@ -116,9 +116,17 @@ class McpMadadIdentityClient:
         return await self._tools.call_tool(Tools.AUTH_COMPLETE_ONBOARDING, payload)
 
     async def me(self, *, access_token: str) -> dict[str, Any]:
-        return await self._tools.call_tool(
+        response = await self._tools.call_tool(
             Tools.AUTH_ME, {"access_token": access_token}
         )
+        # UAT returns user fields at the TOP level (no {user: {...}} wrapper).
+        # Re-shape so callers can read journey_status uniformly across the
+        # in-memory fake (which returns the nested shape) and production.
+        if isinstance(response, dict) and "user" not in response and (
+            "journeyStatus" in response or "journey_status" in response
+        ):
+            return {"user": response}
+        return response
 
     async def refresh(self, *, refresh_token: str) -> AuthTokens:
         response = await self._tools.call_tool(

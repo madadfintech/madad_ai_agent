@@ -46,10 +46,20 @@ class McpMonetizationPaymentAdapter:
     async def list_monetization_products(
         self, *, access_token: str
     ) -> dict[str, Any]:
-        return await self._tools.call_tool(
+        out = await self._tools.call_tool(
             Tools.PAYMENTS_LIST_MONETIZATION_PRODUCTS,
             {"access_token": access_token},
         )
+        # UAT returns the product set as the body of a ``{status_code, body}``
+        # envelope where body is a BARE LIST (the universal unwrapper only
+        # peels dict bodies). Normalize both shapes — and also a bare list
+        # at the top — into the {"products": [...]} dict shape the workflow
+        # expects.
+        if isinstance(out, list):
+            return {"products": out}
+        if isinstance(out, dict) and isinstance(out.get("body"), list):
+            return {"products": out["body"]}
+        return out
 
     async def create_monetization_payment(
         self,

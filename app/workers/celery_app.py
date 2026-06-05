@@ -17,6 +17,7 @@ from app.core.config import settings as default_settings
 TASK_NUDGE_RUN_DUE = "madad.nudge.run_due"
 TASK_WORKFLOW_RECOVER = "madad.workflow.recover"
 TASK_WORKFLOW_TIMEOUT_SWEEP = "madad.workflow.timeout_sweep"
+TASK_STATUS_POLLER = "madad.workflow.status_poller"
 
 
 def build_celery_app(settings: Settings | None = None) -> Celery:
@@ -52,6 +53,10 @@ def build_celery_app(settings: Settings | None = None) -> Celery:
             "workflow-timeout-sweep": {
                 "task": TASK_WORKFLOW_TIMEOUT_SWEEP,
                 "schedule": celery.workflow_timeout_sweep_seconds,
+            },
+            "workflow-status-poller": {
+                "task": TASK_STATUS_POLLER,
+                "schedule": celery.status_poller_seconds,
             },
         },
     )

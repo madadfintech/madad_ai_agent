@@ -70,6 +70,12 @@ class CelerySettings(BaseModel):
     nudge_run_due_seconds: float = 60.0
     workflow_recover_seconds: float = 300.0
     workflow_timeout_sweep_seconds: float = 300.0
+    # Beat-tick interval for the journey-status polling worker. Every tick
+    # scans all WAITING runs and decides per-run whether a poll is due via
+    # the cadence-by-status logic in :mod:`app.workers.status_poller`. A 60s
+    # tick balances responsiveness against load (per-run cadence is 5 min
+    # or longer, so 60s is "fast enough to catch the next due window").
+    status_poller_seconds: float = 60.0
 
 
 class EventBusSettings(BaseModel):

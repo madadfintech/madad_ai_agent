@@ -78,8 +78,19 @@ from app.shared.workflow import (
 from app.shared.workflow.enums import Channel
 from app.shared.workflow.state import HistoryEntry
 
-from .ports import KycClient, MadadIdentityClient, Messenger, Reminders
+from .ports import (
+    KycClient,
+    MadadIdentityClient,
+    Messenger,
+    MonetizationPaymentClient,
+    Reminders,
+)
 from .state import JourneyStatus, OnboardingState, is_yes, reply_attachments, reply_text
+
+# QAR 6,000 is the current monetization onboarding fee (Madad ops M-5 may
+# vary it by segment later — the workflow falls back to whatever the
+# products tool reports; this is the safety default if no products land).
+ONBOARDING_FEE_QAR = 6000
 
 TEMPLATE_KEYS = [
     "onboarding.campaign.intro",
@@ -132,11 +143,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         messenger: Messenger,
         identity: MadadIdentityClient,
         kyc: KycClient,
+        payments: MonetizationPaymentClient,
         reminders: Reminders,
     ) -> None:
         self._msg = messenger
         self._identity = identity
         self._kyc = kyc
+        self._pay = payments
         self._reminders = reminders
 
     # -- graph wiring ---------------------------------------------------------
@@ -181,7 +194,10 @@ class OnboardingWorkflow(WorkflowDefinition):
             "status_poll_on_demand": self._status_poll_on_demand,
             "journey_wait_await": self._journey_wait_await,
             "not_qualified": self._not_qualified,
-            "payment_send": self._payment_send,
+            "business_details_fetch": self._business_details_fetch,
+            "products_list_fetch": self._products_list_fetch,
+            "payment_create": self._payment_create,
+            "payment_send_link": self._payment_send_link,
             "payment_await": self._payment_await,
             # Step 8: lender + offers + terminals
             "lender_status_poll": self._lender_status_poll,
@@ -259,7 +275,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "status_poll_on_demand",
             self._route_journey_status,
             {
-                "payment": "payment_send",
+                "payment": "business_details_fetch",
                 "ineligible": "not_eligible",
                 "unqualified": "not_qualified",
                 "offers": "offers_fetch",
@@ -269,7 +285,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         )
         graph.add_edge("journey_wait_await", "status_poll_on_demand")
 
-        graph.add_edge("payment_send", "payment_await")
+        # Payment chain: business details → product lookup → create (with
+        # idempotency_key) → send link (with idempotency_key) → await.
+        graph.add_edge("business_details_fetch", "products_list_fetch")
+        graph.add_edge("products_list_fetch", "payment_create")
+        graph.add_edge("payment_create", "payment_send_link")
+        graph.add_edge("payment_send_link", "payment_await")
         graph.add_conditional_edges(
             "payment_await",
             self._route_payment,
@@ -694,12 +715,72 @@ class OnboardingWorkflow(WorkflowDefinition):
         await self._send(ctx, state, "onboarding.not_qualified")
         return self._step("not_qualified", ctx, outcome="not_qualified")
 
-    async def _payment_send(
+    async def _business_details_fetch(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        # Phase 3 wires the real five-tool monetization chain (with idempotency
-        # keys). For Phase 2 the request is a stub message; the await blocks
-        # until a payment.completed event resumes the run.
+        if not state.access_token:
+            return self._step("business_details_fetch", ctx)
+        result = await self._pay.get_business_details(access_token=state.access_token)
+        business_id = (
+            result.get("business_details_id") if isinstance(result, dict) else None
+        )
+        return self._step(
+            "business_details_fetch", ctx, business_details_id=business_id
+        )
+
+    async def _products_list_fetch(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        if not state.access_token:
+            return self._step("products_list_fetch", ctx)
+        result = await self._pay.list_monetization_products(
+            access_token=state.access_token
+        )
+        products = (
+            list(result.get("products", [])) if isinstance(result, dict) else []
+        )
+        product = products[0] if products else {}
+        return self._step(
+            "products_list_fetch",
+            ctx,
+            payment_product_id=product.get("product_id"),
+        )
+
+    async def _payment_create(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        if not (
+            state.access_token
+            and state.business_details_id
+            and state.payment_product_id
+        ):
+            return self._step("payment_create", ctx)
+        key = f"{ctx.run_id}:create_monetization_payment"
+        result = await self._pay.create_monetization_payment(
+            access_token=state.access_token,
+            business_details_id=state.business_details_id,
+            product_id=state.payment_product_id,
+            amount_qar=ONBOARDING_FEE_QAR,
+            idempotency_key=key,
+        )
+        payment_id = result.get("payment_id") if isinstance(result, dict) else None
+        payment_status = result.get("status") if isinstance(result, dict) else None
+        return self._step(
+            "payment_create",
+            ctx,
+            payment_id=payment_id,
+            payment_status=payment_status,
+            idempotency_keys={
+                **state.idempotency_keys,
+                "create_monetization_payment": key,
+            },
+        )
+
+    async def _payment_send_link(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        # Send our explanatory message; the MCP send-link tool then delivers
+        # the actual link via the Madad payments backend on the same channel.
         await self._send(ctx, state, "onboarding.payment.request")
         await self._reminders.schedule(
             "payment_pending",
@@ -707,7 +788,26 @@ class OnboardingWorkflow(WorkflowDefinition):
             identity=ctx.identity,
             target_ref=state.madad_user_id or ctx.session_id,
         )
-        return self._step("payment_send", ctx)
+        if not (state.access_token and state.payment_id):
+            return self._step("payment_send_link", ctx)
+        key = f"{ctx.run_id}:send_monetization_payment_link"
+        result = await self._pay.send_monetization_payment_link(
+            access_token=state.access_token,
+            payment_id=state.payment_id,
+            channel=_channel(ctx),
+            identity=ctx.identity,
+            idempotency_key=key,
+        )
+        payment_link = result.get("payment_link") if isinstance(result, dict) else None
+        return self._step(
+            "payment_send_link",
+            ctx,
+            payment_link=payment_link,
+            idempotency_keys={
+                **state.idempotency_keys,
+                "send_monetization_payment_link": key,
+            },
+        )
 
     async def _payment_await(
         self, state: OnboardingState, ctx: WorkflowContext

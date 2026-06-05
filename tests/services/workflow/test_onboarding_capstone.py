@@ -26,6 +26,7 @@ from typing import Any
 from app.services.workflow import (
     McpKycClient,
     McpMadadIdentityClient,
+    McpMonetizationPaymentAdapter,
     RecordingMessenger,
     RecordingReminders,
     build_onboarding_platform,
@@ -123,6 +124,25 @@ def _build_journey_handlers() -> dict[str, Any]:
                 for i, sh in enumerate(p["shareholders"])
             ]
         },
+        # Phase 3 payment block.
+        Tools.KYC_GET_BUSINESS_DETAILS: lambda _p: {
+            "business_details_id": "biz-1",
+            "name": "Test SME",
+        },
+        Tools.PAYMENTS_LIST_MONETIZATION_PRODUCTS: lambda _p: {
+            "products": [
+                {"product_id": "prod-monetization", "name": "Onboarding Fee", "amount_qar": 6000}
+            ]
+        },
+        Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT: lambda p: {
+            "payment_id": "pay-1",
+            "status": "CREATED",
+            "idempotency_key": p["idempotency_key"],
+        },
+        Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK: lambda _p: {
+            "payment_id": "pay-1",
+            "payment_link": "https://pay.madad.example/pay-1",
+        },
     }
 
 
@@ -135,6 +155,7 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
         messenger=RecordingMessenger(),
         identity=McpMadadIdentityClient(mcp),
         kyc=McpKycClient(mcp),
+        payments=McpMonetizationPaymentAdapter(mcp),
         reminders=RecordingReminders(),
     )
     runtime = platform.runtime
@@ -205,10 +226,24 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
         Tools.KYC_GET_ADMIN_REQUESTED_DOCUMENTS,  # re-check missing
         Tools.AUTH_ME,                            # status_poll_on_demand (ELIGIBLE)
         Tools.AUTH_ME,                            # status_poll_on_demand (PRE_QUALIFIED)
+        # Payment block (Phase 3 wires).
+        Tools.KYC_GET_BUSINESS_DETAILS,
+        Tools.PAYMENTS_LIST_MONETIZATION_PRODUCTS,
+        Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT,
+        Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK,
         Tools.AUTH_ME,                            # lender_status_poll (still PRE_QUALIFIED)
         Tools.AUTH_ME,                            # lender_status_poll (ACCEPTED)
         Tools.AUTH_ME,                            # offers_fetch
     ]
+
+    # The idempotency keys we sent on the two payment writes are recorded in
+    # state so the polling worker / audit can correlate retries.
+    assert final.values["idempotency_keys"]["create_monetization_payment"].endswith(
+        ":create_monetization_payment"
+    )
+    assert final.values["idempotency_keys"][
+        "send_monetization_payment_link"
+    ].endswith(":send_monetization_payment_link")
 
 
 async def test_payloads_match_adapter_translation_at_the_seam() -> None:
@@ -223,6 +258,7 @@ async def test_payloads_match_adapter_translation_at_the_seam() -> None:
         messenger=RecordingMessenger(),
         identity=McpMadadIdentityClient(mcp),
         kyc=McpKycClient(mcp),
+        payments=McpMonetizationPaymentAdapter(mcp),
         reminders=RecordingReminders(),
     )
     runtime = platform.runtime

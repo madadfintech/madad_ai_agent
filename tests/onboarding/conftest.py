@@ -10,6 +10,7 @@ import pytest
 from app.services.workflow import (
     InMemoryKycClient,
     InMemoryMadadIdentityClient,
+    InMemoryMonetizationPaymentClient,
     OnboardingPlatform,
     RecordingMessenger,
     RecordingReminders,
@@ -25,6 +26,7 @@ class Harness:
     messenger: RecordingMessenger
     identity: InMemoryMadadIdentityClient
     kyc: InMemoryKycClient
+    payments: InMemoryMonetizationPaymentClient
     reminders: RecordingReminders
 
 
@@ -38,6 +40,8 @@ def make_harness() -> Callable[..., Harness]:
         journey_status: str = "ELIGIBLE",
         required_docs: list[str] | None = None,
         eligibility_result: dict[str, object] | None = None,
+        business_details: dict[str, object] | None = None,
+        products: list[dict[str, object]] | None = None,
     ) -> Harness:
         messenger = RecordingMessenger()
         identity = InMemoryMadadIdentityClient(
@@ -50,14 +54,19 @@ def make_harness() -> Callable[..., Harness]:
             required_documents=required_docs or REQUIRED_DOCS,
             eligibility_result=eligibility_result,
         )
+        payments = InMemoryMonetizationPaymentClient(
+            business_details=business_details,
+            products=products,
+        )
         reminders = RecordingReminders()
         platform = build_onboarding_platform(
             messenger=messenger,
             identity=identity,
             kyc=kyc,
+            payments=payments,
             reminders=reminders,
         )
-        return Harness(platform, messenger, identity, kyc, reminders)
+        return Harness(platform, messenger, identity, kyc, payments, reminders)
 
     return _make
 

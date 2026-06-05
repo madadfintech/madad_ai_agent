@@ -12,9 +12,11 @@ from .onboarding import OnboardingWorkflow
 from .ports import (
     InMemoryKycClient,
     InMemoryMadadIdentityClient,
+    InMemoryMonetizationPaymentClient,
     KycClient,
     MadadIdentityClient,
     Messenger,
+    MonetizationPaymentClient,
     RecordingMessenger,
     RecordingReminders,
     Reminders,
@@ -41,6 +43,7 @@ def build_onboarding_platform(
     messenger: Messenger | None = None,
     identity: MadadIdentityClient | None = None,
     kyc: KycClient | None = None,
+    payments: MonetizationPaymentClient | None = None,
     reminders: Reminders | None = None,
     runtime: WorkflowRuntime | None = None,
 ) -> OnboardingPlatform:
@@ -49,6 +52,7 @@ def build_onboarding_platform(
         messenger=messenger or RecordingMessenger(),
         identity=identity or InMemoryMadadIdentityClient(),
         kyc=kyc or InMemoryKycClient(required_documents=DEFAULT_REQUIRED_DOCS),
+        payments=payments or InMemoryMonetizationPaymentClient(),
         reminders=reminders or RecordingReminders(),
     )
     runtime.register(workflow)

@@ -72,4 +72,12 @@ def get_communication_service() -> CommunicationService:
         from .gateway import McpCommunicationGateway
 
         kwargs["gateway"] = McpCommunicationGateway(get_mcp_client())
+    # When CMS is the canonical template store (persistence==postgres OR
+    # mcp.enabled both imply we want operator-editable copy), wire the
+    # CmsTemplateProvider so renderer reads the seeded templates.
+    if settings.persistence.backend == "postgres" or settings.mcp.enabled:
+        from app.services.cms.deps import get_cms_service
+        from app.services.cms.templating_bridge import CmsTemplateProvider
+
+        kwargs["template_provider"] = CmsTemplateProvider(get_cms_service())
     return build_communication_service(**kwargs)

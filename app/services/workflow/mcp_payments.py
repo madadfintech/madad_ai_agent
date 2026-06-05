@@ -39,9 +39,20 @@ class McpMonetizationPaymentAdapter:
         self._tools = tool_caller
 
     async def get_business_details(self, *, access_token: str) -> dict[str, Any]:
-        return await self._tools.call_tool(
+        response = await self._tools.call_tool(
             Tools.KYC_GET_BUSINESS_DETAILS, {"access_token": access_token}
         )
+        # UAT returns ``{success, businessDetails: {id, userId, legalEntityName,
+        # crNumber, ...}}``. Workflow expects ``business_details_id`` at the
+        # top level; unwrap the businessDetails sub-dict and alias ``id`` so
+        # the caller doesn't need to know the actual response shape.
+        details = response.get("businessDetails")
+        if isinstance(details, dict):
+            unwrapped: dict[str, Any] = dict(details)
+            if "business_details_id" not in unwrapped and "id" in unwrapped:
+                unwrapped["business_details_id"] = unwrapped["id"]
+            return unwrapped
+        return response
 
     async def list_monetization_products(
         self, *, access_token: str

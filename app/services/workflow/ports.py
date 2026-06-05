@@ -337,6 +337,166 @@ class InMemoryMadadIdentityClient:
         self._revoked_tokens.add(access_token)
 
 
+# -- KycClient: the new port the Phase 2 graph uses for KYC tools -------------
+
+
+@runtime_checkable
+class KycClient(Protocol):
+    """KYC-side Madad operations the onboarding graph drives.
+
+    Implementations: ``InMemoryKycClient`` (tests) and ``McpKycClient``
+    (production — wraps ``madad_kyc_*`` MCP tools). The Phase 2 onboarding
+    reshape replaces ``MadadClient.check_eligibility`` / ``request_score`` /
+    ``submit_to_lenders`` / ``activate_credit_line`` (none of which exist in
+    the real catalog) with these calls into the actual KYC backend.
+
+    All calls take ``access_token`` per-call rather than holding it as instance
+    state — different workflow runs may have different tokens, and the workflow
+    state is the source of truth.
+    """
+
+    async def upload_commercial_registration(
+        self, *, access_token: str, content_base64: str, filename: str
+    ) -> dict[str, Any]: ...
+
+    async def update_eligibility(
+        self, *, access_token: str, data: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def upload_audited_financial_report(
+        self, *, access_token: str, content_base64: str, filename: str
+    ) -> dict[str, Any]: ...
+
+    async def get_admin_requested_documents(
+        self, *, access_token: str
+    ) -> dict[str, Any]: ...
+
+    async def upload_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        document_type: str,
+    ) -> dict[str, Any]: ...
+
+    async def add_buyer(
+        self, *, access_token: str, data: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def add_shareholders(
+        self, *, access_token: str, shareholders: list[dict[str, Any]]
+    ) -> dict[str, Any]: ...
+
+
+class InMemoryKycClient:
+    """Configurable fake implementing :class:`KycClient`.
+
+    Tests seed ``required_documents`` to drive the documents-loop missing check.
+    Every call is captured in ``calls`` for introspection; uploaded documents
+    accumulate in ``uploaded_documents`` (keyed by document_type) so the
+    documents-loop converges as a real flow would.
+    """
+
+    def __init__(
+        self,
+        *,
+        required_documents: list[str] | None = None,
+        eligibility_result: dict[str, Any] | None = None,
+    ) -> None:
+        self._required_documents: list[str] = list(required_documents or [])
+        self._eligibility_result: dict[str, Any] = dict(
+            eligibility_result or {"status": "submitted"}
+        )
+        self.uploaded_documents: dict[str, dict[str, Any]] = {}
+        self.cr_document: dict[str, Any] | None = None
+        self.financial_report: dict[str, Any] | None = None
+        self.buyers: list[dict[str, Any]] = []
+        self.shareholders: list[dict[str, Any]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def _record(self, name: str, **kwargs: Any) -> None:
+        self.calls.append((name, kwargs))
+
+    async def upload_commercial_registration(
+        self, *, access_token: str, content_base64: str, filename: str
+    ) -> dict[str, Any]:
+        self._record(
+            "upload_commercial_registration",
+            access_token=access_token,
+            filename=filename,
+        )
+        self.cr_document = {"filename": filename, "content_base64": content_base64}
+        return {"document_id": new_id("cr"), "filename": filename}
+
+    async def update_eligibility(
+        self, *, access_token: str, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._record("update_eligibility", access_token=access_token, data=data)
+        return self._eligibility_result
+
+    async def upload_audited_financial_report(
+        self, *, access_token: str, content_base64: str, filename: str
+    ) -> dict[str, Any]:
+        self._record(
+            "upload_audited_financial_report",
+            access_token=access_token,
+            filename=filename,
+        )
+        self.financial_report = {"filename": filename, "content_base64": content_base64}
+        return {"document_id": new_id("fr"), "filename": filename}
+
+    async def get_admin_requested_documents(
+        self, *, access_token: str
+    ) -> dict[str, Any]:
+        self._record("get_admin_requested_documents", access_token=access_token)
+        missing = [
+            code for code in self._required_documents if code not in self.uploaded_documents
+        ]
+        return {"required": list(self._required_documents), "missing": missing}
+
+    async def upload_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        document_type: str,
+    ) -> dict[str, Any]:
+        self._record(
+            "upload_document_base64",
+            access_token=access_token,
+            filename=filename,
+            document_type=document_type,
+        )
+        self.uploaded_documents[document_type] = {
+            "filename": filename,
+            "content_base64": content_base64,
+        }
+        return {"document_id": new_id("doc"), "document_type": document_type}
+
+    async def add_buyer(
+        self, *, access_token: str, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._record("add_buyer", access_token=access_token, data=data)
+        record = {"buyer_id": new_id("buyer"), **data}
+        self.buyers.append(record)
+        return record
+
+    async def add_shareholders(
+        self, *, access_token: str, shareholders: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        self._record(
+            "add_shareholders", access_token=access_token, shareholders=shareholders
+        )
+        added: list[dict[str, Any]] = []
+        for sh in shareholders:
+            record = {"shareholder_id": new_id("sh"), **sh}
+            self.shareholders.append(record)
+            added.append(record)
+        return {"shareholders": added}
+
+
 class MadadClient(ABC):
     """[DEPRECATED] Original RPC-decisions port. Tools listed here don't exist
     in the real catalog — kept only so the pre-Phase-2 onboarding tests build.

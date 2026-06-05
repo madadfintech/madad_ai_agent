@@ -780,13 +780,17 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _journey_wait_await(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        # Suspend until a status_update / webhook resume arrives. The resume
-        # payload's ``last_status_source`` (set by the dispatcher on backend
-        # webhook arrivals — see translate_backend_event) is carried into
-        # state so the polling worker can suppress its next cycle.
+        # Suspend until a status_update / webhook resume arrives. The
+        # dispatcher (translate_backend_event) maps well-known events to an
+        # implied journey_status; capture it so the next poll routes
+        # immediately rather than waiting for the backend to catch up.
         payload = await_input({"waiting_for": "journey_status", "step": "journey_wait"})
         source = _extract_status_source(payload)
-        return self._step("journey_wait_await", ctx, last_status_source=source)
+        fields: dict[str, Any] = {"last_status_source": source}
+        forced = _extract_journey_status(payload)
+        if forced is not None:
+            fields["journey_status"] = forced
+        return self._step("journey_wait_await", ctx, **fields)
 
     async def _not_qualified(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -928,7 +932,11 @@ class OnboardingWorkflow(WorkflowDefinition):
     ) -> dict[str, Any]:
         payload = await_input({"waiting_for": "journey_status", "step": "lender_wait"})
         source = _extract_status_source(payload)
-        return self._step("lender_wait_await", ctx, last_status_source=source)
+        fields: dict[str, Any] = {"last_status_source": source}
+        forced = _extract_journey_status(payload)
+        if forced is not None:
+            fields["journey_status"] = forced
+        return self._step("lender_wait_await", ctx, **fields)
 
     async def _offers_fetch(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -1024,6 +1032,15 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _poll_journey_status(
         self, state: OnboardingState
     ) -> JourneyStatus | None:
+        # If a recent webhook supplied a journey_status (last_status_source
+        # is "webhook" and state.journey_status is already set), trust it
+        # — the operator's event IS the truth in staging, and re-polling
+        # auth_me would just overwrite with a stale backend snapshot.
+        if (
+            state.last_status_source == "webhook"
+            and state.journey_status is not None
+        ):
+            return state.journey_status
         if not state.access_token:
             return state.journey_status
         info = await self._identity.me(access_token=state.access_token)
@@ -1095,3 +1112,22 @@ def _extract_status_source(payload: Any) -> str:
         if isinstance(source, str):
             return source
     return "poll"
+
+
+def _extract_journey_status(payload: Any) -> JourneyStatus | None:
+    """Pull ``journey_status`` off a resume payload and coerce to enum.
+
+    The dispatcher's :data:`translate_backend_event` adds a status hint
+    for well-known event types (eligibility.updated → PRE_QUALIFIED,
+    offers.available → ACCEPTED, etc.). Returns ``None`` if the payload
+    doesn't carry a recognisable status."""
+
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("journey_status")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return JourneyStatus(raw)
+    except ValueError:
+        return None

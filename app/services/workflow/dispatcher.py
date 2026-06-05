@@ -59,22 +59,41 @@ PHASE1B_BACKEND_EVENTS: frozenset[str] = frozenset(
 ALL_BACKEND_EVENTS: frozenset[str] = PHASE1A_BACKEND_EVENTS | PHASE1B_BACKEND_EVENTS
 
 
+# Map well-known event types to the journey_status they imply. The workflow
+# uses this hint to advance immediately without an extra auth_me round-trip
+# — useful in staging where the operator-issued event is the truth, and
+# essential for demos where the test account's backend state doesn't change
+# between webhook posts.
+EVENT_TO_JOURNEY_STATUS: dict[str, str] = {
+    "eligibility.updated": "PRE_QUALIFIED",
+    "documents.completed": "PRE_QUALIFIED",
+    "prequalification.completed": "PRE_QUALIFIED",
+    "madad_score.ready": "QUALIFIED",
+    "offers.available": "ACCEPTED",
+    "offer.accepted": "OFFER_ACCEPTED",
+    "credit_line.activated": "ACTIVATED",
+}
+
+
 def translate_backend_event(
     event_type: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
     """Translate a backend event into the workflow's resume payload shape.
 
     ``payment.completed`` resumes ``payment_await`` with ``paid=True`` so
-    ``_route_payment`` advances to ``lender_status_poll``. Everything else
-    resumes ``journey_wait_await`` / ``lender_wait_await``, which discard
-    the payload and re-poll ``auth_me`` for the canonical journey status.
-    ``last_status_source="webhook"`` rides along so the polling worker can
-    suppress its next cycle for this run.
+    ``_route_payment`` advances to ``lender_status_poll``. Status-update
+    events resume ``journey_wait_await`` / ``lender_wait_await``;
+    well-known events also carry the implied ``journey_status`` so the
+    workflow can advance without a separate auth_me round-trip.
+    ``last_status_source="webhook"`` rides along so the polling worker
+    can suppress its next cycle for this run.
     """
 
     base: dict[str, Any] = {"last_status_source": "webhook"}
     if event_type == "payment.completed":
         return {"type": "payment", "paid": True, **base, **payload}
+    if event_type in EVENT_TO_JOURNEY_STATUS:
+        base["journey_status"] = EVENT_TO_JOURNEY_STATUS[event_type]
     return {"type": "status_update", "event": event_type, **base, **payload}
 
 

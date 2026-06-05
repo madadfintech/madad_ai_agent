@@ -194,6 +194,11 @@ async def test_poller_respects_webhook_suppression_window() -> None:
 
     Anchors the comparisons against the actual last_polled_at the workflow
     recorded (wall clock) rather than a synthetic NOW so we don't drift.
+
+    Uses ``transaction.disbursed`` (a Phase 1.b event without a
+    journey_status hint in EVENT_TO_JOURNEY_STATUS) so the resume doesn't
+    advance the run past journey_wait_await — the test is about cadence,
+    not about routing.
     """
 
     platform = _build_platform(journey_status="ELIGIBLE")
@@ -201,7 +206,7 @@ async def test_poller_respects_webhook_suppression_window() -> None:
     await _drive_to_journey_wait(platform, identity)
 
     await platform.dispatcher.on_backend_event(
-        event_type="eligibility.updated",
+        event_type="transaction.disbursed",
         event_id="evt-poller-1",
         channel=WA,
         identity=identity,

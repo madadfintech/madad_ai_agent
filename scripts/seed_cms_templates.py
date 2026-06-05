@@ -42,7 +42,12 @@ _TEMPLATE_BODIES = {
         "Please contact your administrator or use a personal email."
     ),
     "onboarding.collect_details.request": (
-        "Great! Please share your first name and last name (e.g. \"Aisha Karim\")."
+        "Welcome to MADAD! To create your account please share: "
+        "1) Your first + last name "
+        "2) Your business's legal entity name "
+        "3) Your CR (Commercial Registration) number "
+        "4) Is your business based in Qatar? "
+        "5) Your role at the business (FOUNDER / DIRECTOR / SHAREHOLDER / ...)"
     ),
     "onboarding.consent.request": (
         "We need your consent + Commercial Registration document. Reply with "
@@ -87,8 +92,10 @@ _TEMPLATE_BODIES = {
         "partners this time. Please reach out to our team."
     ),
     "onboarding.payment.request": (
-        "Your onboarding fee of QAR 6,000 is ready. We're sending you a "
-        "secure payment link — please complete it to finalize your account."
+        "Your onboarding fee of QAR {amount} is ready. Please complete payment "
+        "via the secure link below:\n\n"
+        "{payment_link}\n\n"
+        "Reference: {provider_ref}"
     ),
     "onboarding.offers.preview": (
         "Great news — you have {count} financing offer(s) ready to review!"

@@ -37,10 +37,33 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     platform = get_onboarding_platform()
     await platform.runtime.setup()  # e.g. provision the Postgres checkpointer
     connect_forwarders(get_event_bus(), workflow=platform.runtime.events)
+    # Cold-start warmup: when MCP is on, the first request to Cloud Run
+    # takes 2-4 seconds for the instance to boot. Fire one cheap MCP call
+    # here so the first real user-driven turn already sees a warm cluster.
+    await _warmup_mcp()
     try:
         yield
     finally:
         await platform.runtime.aclose()
+
+
+async def _warmup_mcp() -> None:
+    """Best-effort cold-start warmup. Fires AUTH_CHECK_CONTACT (cheap,
+    auth-free, no side effects) to wake the Cloud Run instance so the
+    first user request is sub-second instead of 2-3 seconds. Silently
+    no-ops when MCP is disabled or the call fails."""
+
+    from app.core.config import settings as _s
+
+    if not _s.mcp.enabled:
+        return
+    try:
+        from app.shared.mcp import Tools, get_mcp_client
+
+        mcp = get_mcp_client()
+        await mcp.call_tool(Tools.AUTH_CHECK_CONTACT, {"email": "warmup@example.invalid"})
+    except Exception:  # noqa: BLE001 — warmup is best-effort
+        return
 
 
 app = create_service_app(

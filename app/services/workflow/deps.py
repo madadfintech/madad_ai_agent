@@ -29,7 +29,7 @@ from .ports import (
     RecordingReminders,
     Reminders,
 )
-from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
+from .webhook_dedupe import InMemoryWebhookDedupe, RedisWebhookDedupe, WebhookDedupe
 
 
 @dataclass
@@ -88,11 +88,23 @@ def get_onboarding_platform() -> OnboardingPlatform:
 
     if default_settings.mcp.enabled:
         mcp = get_mcp_client()
+        # Use Redis-backed webhook dedupe when a Redis URL is configured —
+        # otherwise restarts lose the 24h seen-event-id window and Madad's
+        # backend retries could re-drive runs.
+        dedupe: WebhookDedupe = (
+            RedisWebhookDedupe(
+                url=default_settings.redis.url,
+                key_prefix=default_settings.redis.key_prefix,
+            )
+            if default_settings.redis.url
+            else InMemoryWebhookDedupe()
+        )
         return build_onboarding_platform(
             messenger=CommunicationMessenger(get_communication_service()),
             identity=McpMadadIdentityClient(mcp),
             kyc=McpKycClient(mcp),
             payments=McpMonetizationPaymentAdapter(mcp),
             reminders=NudgeReminders(get_nudge_service()),
+            dedupe=dedupe,
         )
     return build_onboarding_platform()

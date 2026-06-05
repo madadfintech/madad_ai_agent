@@ -86,7 +86,9 @@ def _build_journey_handlers() -> dict[str, Any]:
         return body
 
     def _update_eligibility(_p: dict[str, Any]) -> dict[str, Any]:
-        return {"eligible": True, "status": "submitted"}
+        # Real cluster returns {success, journeyStatus} on the update —
+        # workflow derives eligibility from journeyStatus != IN_ELIGIBLE.
+        return {"success": True, "journeyStatus": "ELIGIBLE"}
 
     def _admin_requested(_p: dict[str, Any]) -> dict[str, Any]:
         uploaded: set[str] = state.setdefault("uploaded", set())
@@ -129,10 +131,25 @@ def _build_journey_handlers() -> dict[str, Any]:
                 for i, sh in enumerate(p["shareholders"])
             ]
         },
-        # Phase 3 payment block.
+        # Phase 3 payment block. KYC_GET_BUSINESS_DETAILS now serves two
+        # callers — _eligibility_update reads it back for state-sync, and
+        # _business_details_fetch reads it for the payment chain. Wrap the
+        # real response shape (businessDetails sub-dict) so the adapter's
+        # unwrap-and-alias path is exercised here too.
         Tools.KYC_GET_BUSINESS_DETAILS: lambda _p: {
-            "business_details_id": "biz-1",
-            "name": "Test SME",
+            "success": True,
+            "businessDetails": {
+                "id": "biz-1",
+                "name": "Test SME",
+                "legalEntityName": "Test SME LLC",
+                "businessAge": "UNDER_2_YEARS",
+                "crValidity": "UNDER_1_MONTH",
+                "companyType": "LLC",
+                "sector": "services",
+                "turnover": "1000000",
+                "employees": "10",
+                "isQatarBased": True,
+            },
         },
         Tools.PAYMENTS_LIST_MONETIZATION_PRODUCTS: lambda _p: {
             "products": [
@@ -143,9 +160,13 @@ def _build_journey_handlers() -> dict[str, Any]:
                 }
             ]
         },
+        # CREATE returns paymentLink + providerOrderNumber per the real
+        # cluster shape; payment_send_link is now a side-channel.
         Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT: lambda p: {
             "payment_id": "pay-1",
             "status": "CREATED",
+            "paymentLink": "https://pay.madad.example/pay-1",
+            "providerOrderNumber": "MADAD-ONBOARDING-pay-1",
             "idempotency_key": p["idempotency_key"],
         },
         Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK: lambda _p: {
@@ -231,6 +252,7 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
         Tools.MCP_CREATE_CHANNEL_SESSION,        # second bridge (post-promotion)
         Tools.KYC_UPLOAD_DOCUMENT_BASE64,         # CR (routed via generic tool)
         Tools.KYC_UPDATE_ELIGIBILITY,
+        Tools.KYC_GET_BUSINESS_DETAILS,           # state-sync after eligibility
         Tools.KYC_UPLOAD_DOCUMENT_BASE64,         # audited report (routed via generic tool)
         Tools.KYC_GET_ADMIN_REQUESTED_DOCUMENTS,  # documents_list_fetch
         Tools.KYC_ADD_BUYER,
@@ -240,10 +262,10 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
         Tools.KYC_GET_ADMIN_REQUESTED_DOCUMENTS,  # re-check missing
         Tools.AUTH_ME,                            # status_poll_on_demand (ELIGIBLE)
         Tools.AUTH_ME,                            # status_poll_on_demand (PRE_QUALIFIED)
-        Tools.KYC_GET_BUSINESS_DETAILS,
+        Tools.KYC_GET_BUSINESS_DETAILS,           # business_details_fetch (payment chain)
         Tools.PAYMENTS_LIST_MONETIZATION_PRODUCTS,
         Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT,
-        Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK,
+        Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK,  # side-channel; failure absorbed
         Tools.AUTH_ME,                            # lender_status_poll (still PRE_QUALIFIED)
         Tools.AUTH_ME,                            # lender_status_poll (ACCEPTED)
         Tools.AUTH_ME,                            # offers_fetch
@@ -320,13 +342,24 @@ async def test_payloads_match_adapter_translation_at_the_seam() -> None:
     assert cr["metadata"]["access_token"] == "AT-real-1"
     assert cr["metadata"]["document_type"] == "COMMERCIAL_REGISTRATION"
 
-    # Eligibility form data is merged with access_token (no envelope keys).
-    await resume({"annual_revenue_qar": 5_000_000, "sector": "trade", "type": "form"})
-    eligibility = mcp.calls[-1][1]
+    # Eligibility form: workflow merges DEFAULT_ELIGIBILITY_FORM (the seven
+    # canonical UAT fields) under any operator-supplied override values and
+    # strips envelope keys before sending. We override `sector` and prove
+    # the envelope `type` field doesn't reach the wire while the default
+    # `is_qatar_based` is sent unchanged.
+    await resume({"sector": "services", "type": "form"})
+    # mcp.calls last entry is now KYC_GET_BUSINESS_DETAILS (state-sync read
+    # after the eligibility update). Find the update call directly.
+    eligibility = next(
+        payload for name, payload in mcp.calls
+        if name == "madad_kyc_update_eligibility"
+    )
     assert eligibility["access_token"] == "AT-real-1"
-    assert eligibility["annual_revenue_qar"] == 5_000_000
-    assert eligibility["sector"] == "trade"
-    assert "type" not in eligibility  # envelope key stripped before sending
+    assert eligibility["sector"] == "services"               # operator override
+    assert eligibility["is_qatar_based"] is True             # from defaults
+    assert eligibility["business_age"] == "UNDER_2_YEARS"    # from defaults
+    assert eligibility["company_type"] == "LLC"              # from defaults
+    assert "type" not in eligibility                         # envelope stripped
 
     # journey_status flows through the camelCase response unwrapping.
     backend_state["journey_status"] = "PRE_QUALIFIED"

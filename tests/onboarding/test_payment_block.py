@@ -43,8 +43,12 @@ async def test_payment_chain_runs_in_order(harness):
     await _drive_to_payment_block(harness)
 
     names = [name for name, _ in harness.payments.calls]
+    # First get_business_details happens during _eligibility_update (state
+    # syncs the backend's normalized eligibility values back into state);
+    # the second + rest are the payment chain proper.
     assert names == [
-        "get_business_details",
+        "get_business_details",                # from eligibility_update state-sync
+        "get_business_details",                # from business_details_fetch node
         "list_monetization_products",
         "create_monetization_payment",
         "send_monetization_payment_link",

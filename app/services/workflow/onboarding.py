@@ -119,14 +119,17 @@ TEMPLATE_KEYS = [
 # without an interactive form. Override per-run via the inbound `data`
 # payload on the eligibility-intake await.
 DEFAULT_ELIGIBILITY_FORM: dict[str, Any] = {
+    # All seven values are the actual backend ENUMS the cluster persists,
+    # NOT the free-form ints/strings we used to send. Sending the enum
+    # directly avoids the silent backend re-mapping we observed in the
+    # first verification (e.g. business_age="5" → "UNDER_2_YEARS").
     "is_qatar_based": True,
-    # UAT KYC_UPDATE_ELIGIBILITY expects business_age / turnover / employees
-    # as STRINGS (string_type validators). Keep these as str even when the
-    # demo runner sends ints — the workflow will coerce.
-    "business_age": "5",
-    "cr_validity": "VALID",
+    "business_age": "UNDER_2_YEARS",     # | OVER_2_YEARS_UNDER_5 | OVER_5_YEARS
+    "cr_validity": "UNDER_1_MONTH",      # | OVER_3_MONTHS
     "company_type": "LLC",
     "sector": "trade",
+    # turnover / employees stay as strings (cluster's pydantic validator
+    # rejects ints) but are free-form numeric strings.
     "turnover": "1000000",
     "employees": "10",
 }
@@ -435,24 +438,62 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "reply", "step": "collect_details"})
-        first, last = self._parse_name(reply)
+        # The intake supports two shapes:
+        #  (a) free-text reply parsed as "First Last" — backward compat;
+        #  (b) structured payload with all nine AUTH_COMPLETE_ONBOARDING
+        #      fields (the demo runner + web/admin UIs send this).
+        data = reply if isinstance(reply, dict) else {}
+        first = str(data.get("first_name") or "")
+        last = str(data.get("last_name") or "")
+        if not first or not last:
+            f2, l2 = self._parse_name(reply)
+            first = first or f2
+            last = last or l2
         return self._step(
             "collect_onboarding_details_await",
             ctx,
             onboarding_first_name=first,
             onboarding_last_name=last,
+            onboarding_legal_entity_name=data.get("legal_entity_name") or None,
+            onboarding_cr_number=data.get("cr_number") or None,
+            onboarding_is_qatar_based=(
+                bool(data["is_qatar_based"]) if "is_qatar_based" in data else None
+            ),
+            onboarding_role=data.get("role") or None,
+            onboarding_email_override=data.get("email") or None,
+            onboarding_phone_override=data.get("phone") or None,
         )
 
     async def _complete_onboarding_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        await self._identity.complete_onboarding(
-            first_name=state.onboarding_first_name or "",
-            last_name=state.onboarding_last_name or "",
-            onboarding_token=state.onboarding_token or "",
-            phone_number=ctx.identity if ctx.channel is Channel.WHATSAPP else None,
-            email=ctx.identity if ctx.channel is Channel.EMAIL else None,
+        email = (
+            state.onboarding_email_override
+            or (ctx.identity if ctx.channel is Channel.EMAIL else None)
         )
+        phone = (
+            state.onboarding_phone_override
+            or (ctx.identity if ctx.channel is Channel.WHATSAPP else None)
+        )
+        try:
+            await self._identity.complete_onboarding(
+                first_name=state.onboarding_first_name or "",
+                last_name=state.onboarding_last_name or "",
+                onboarding_token=state.onboarding_token or "",
+                email=email,
+                phone_number=phone,
+                legal_entity_name=state.onboarding_legal_entity_name,
+                cr_number=state.onboarding_cr_number,
+                is_qatar_based=state.onboarding_is_qatar_based,
+                role=state.onboarding_role,
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade in staging
+            ctx.logger.warning(
+                "complete_onboarding.failed",
+                error=str(exc)[:200],
+                note="staging-tolerant: continuing — second session call will "
+                     "establish identity for the existing user case",
+            )
         return self._step("complete_onboarding_send", ctx)
 
     async def _channel_session_second(
@@ -501,10 +542,11 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _cr_upload_base64(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        if state.access_token and state.cr_ref:
+        token, refresh, expires = await self._live_token(state, ctx)
+        if token and state.cr_ref:
             try:
                 await self._kyc.upload_commercial_registration(
-                    access_token=state.access_token,
+                    access_token=token,
                     content_base64=state.cr_content_base64 or "",
                     filename=state.cr_ref,
                 )
@@ -513,7 +555,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                     "cr_upload.failed", error=str(exc)[:200],
                     note="staging-tolerant: continuing without CR uploaded",
                 )
-        return self._step("cr_upload_base64", ctx)
+        return self._step(
+            "cr_upload_base64", ctx,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
 
     # -- Step 3: eligibility intake ------------------------------------------
 
@@ -546,24 +591,57 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         eligible = True
-        if state.access_token:
+        normalized: dict[str, Any] = {}
+        token, refresh, expires = await self._live_token(state, ctx)
+        if token:
             # Merge operator-supplied form data on top of demo defaults so
             # the seven required UAT fields are always present. The operator
             # only needs to override the fields they want to change.
             payload = {**DEFAULT_ELIGIBILITY_FORM, **state.eligibility_form_data}
             try:
                 result = await self._kyc.update_eligibility(
-                    access_token=state.access_token, data=payload
+                    access_token=token, data=payload
                 )
                 if isinstance(result, dict):
-                    eligible = bool(result.get("eligible", True))
+                    # The real cluster returns ``journeyStatus`` (not
+                    # ``eligible``) on success — derive eligibility from
+                    # the canonical 16 statuses. Fall back to the legacy
+                    # ``eligible`` field for InMemoryKycClient + any older
+                    # response shapes.
+                    new_status = result.get("journeyStatus")
+                    if isinstance(new_status, str):
+                        eligible = new_status != "IN_ELIGIBLE"
+                    elif "eligible" in result:
+                        eligible = bool(result["eligible"])
+                # Read the backend's normalized values back into state so the
+                # rest of the workflow uses canonical enums instead of the
+                # raw form values we sent.
+                bd = await self._pay.get_business_details(access_token=token)
+                if isinstance(bd, dict):
+                    normalized = {
+                        "business_age": bd.get("businessAge"),
+                        "cr_validity": bd.get("crValidity"),
+                        "company_type": bd.get("companyType"),
+                        "sector": bd.get("sector"),
+                        "turnover": bd.get("turnover"),
+                        "employees": bd.get("employees"),
+                        "is_qatar_based": bd.get("isQatarBased"),
+                    }
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
                     "eligibility.update_failed",
                     error=str(exc)[:200],
                     note="staging-tolerant: continuing with eligible=True",
                 )
-        return self._step("eligibility_update", ctx, eligible=eligible)
+        merged_form = {**state.eligibility_form_data, **{
+            k: v for k, v in normalized.items() if v is not None
+        }}
+        return self._step(
+            "eligibility_update", ctx,
+            eligible=eligible,
+            eligibility_form_data=merged_form,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
 
     async def _not_eligible(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -682,9 +760,19 @@ class OnboardingWorkflow(WorkflowDefinition):
                     access_token=state.access_token, shareholders=items
                 )
             except Exception as exc:  # noqa: BLE001 — degrade in staging
+                # Diagnostic logging — the cluster rejects all probed
+                # shapes with 400s and we can't reverse-engineer the schema
+                # from our side. Log enough for Ishan to debug from the
+                # backend logs when he sees this in the audit trail.
                 ctx.logger.warning(
-                    "add_shareholders.failed", error=str(exc)[:200],
-                    note="staging-tolerant: continuing without shareholders added",
+                    "add_shareholders.failed",
+                    error=str(exc)[:300],
+                    attempted_payload_keys=[
+                        sorted(item.keys()) for item in items[:3]
+                    ],
+                    attempted_count=len(items),
+                    note="cluster rejects current shareholder shape — "
+                         "needs Ishan-provided schema. Workflow continues.",
                 )
         return self._step("shareholders_collect_await", ctx, shareholders=items)
 
@@ -763,7 +851,12 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _status_poll_on_demand(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        status = await self._poll_journey_status(state)
+        # Long real-world wait may have elapsed; refresh token if stale.
+        token, refresh, expires = await self._live_token(state, ctx)
+        live_state = state if token == state.access_token else state.model_copy(
+            update={"access_token": token}
+        )
+        status = await self._poll_journey_status(live_state)
         # Preserve the source set by the upstream await (webhook vs poll
         # trigger). Default to "poll" if nothing set it — this node is by
         # definition an active poll, and the first entry (from
@@ -775,6 +868,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             journey_status=status,
             last_status_source=source,
             last_polled_at=ctx.clock.now(),
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
         )
 
     async def _journey_wait_await(
@@ -848,11 +942,25 @@ class OnboardingWorkflow(WorkflowDefinition):
         )
         payment_id = result.get("payment_id") if isinstance(result, dict) else None
         payment_status = result.get("status") if isinstance(result, dict) else None
+        # The CREATE response carries the real Tess checkout URL on the
+        # ``paymentLink`` field. Capture it now so payment_send_link can
+        # deliver it directly via our messenger — independent of the
+        # backend's notification provider (which 502s in UAT).
+        payment_link = (
+            result.get("paymentLink") or result.get("payment_link")
+            if isinstance(result, dict)
+            else None
+        )
+        provider_ref = (
+            result.get("providerOrderNumber") if isinstance(result, dict) else None
+        )
         return self._step(
             "payment_create",
             ctx,
             payment_id=payment_id,
             payment_status=payment_status,
+            payment_link=payment_link,
+            payment_provider_ref=provider_ref,
             idempotency_keys={
                 **state.idempotency_keys,
                 "create_monetization_payment": key,
@@ -862,44 +970,51 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _payment_send_link(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        # Send our explanatory message; the MCP send-link tool then delivers
-        # the actual link via the Madad payments backend on the same channel.
-        await self._send(ctx, state, "onboarding.payment.request")
+        # The payment link is ALREADY on state from payment_create — Madad's
+        # CREATE response returns the Tess checkout URL on ``paymentLink``.
+        # We send it via our messenger directly; we DO NOT depend on the
+        # backend's send-monetization-payment-link tool (it routes through
+        # an upstream notification provider that has been flaky in UAT and
+        # adds no value over our own send).
+        variables = {
+            "amount":         f"{ONBOARDING_FEE_QAR:,}",
+            "payment_link":   state.payment_link or "",
+            "provider_ref":   state.payment_provider_ref or "",
+        }
+        await self._send(ctx, state, "onboarding.payment.request", variables)
         await self._reminders.schedule(
             "payment_pending",
             channel=_channel(ctx),
             identity=ctx.identity,
             target_ref=state.madad_user_id or ctx.session_id,
         )
-        if not (state.access_token and state.payment_id):
-            return self._step("payment_send_link", ctx)
-        key = f"{ctx.run_id}:send_monetization_payment_link"
-        payment_link: str | None = None
-        try:
-            result = await self._pay.send_monetization_payment_link(
-                access_token=state.access_token,
-                payment_id=state.payment_id,
-                channel=_channel(ctx),
-                identity=ctx.identity,
-                idempotency_key=key,
-            )
-            if isinstance(result, dict):
-                payment_link = result.get("payment_link") or result.get("paymentLink")
-        except Exception as exc:  # noqa: BLE001 — UAT upstream notification 502
-            ctx.logger.warning(
-                "payment_send_link.failed",
-                error=str(exc)[:200],
-                note="staging-tolerant: continuing — link delivery is upstream",
-            )
-        return self._step(
-            "payment_send_link",
-            ctx,
-            payment_link=payment_link,
-            idempotency_keys={
-                **state.idempotency_keys,
-                "send_monetization_payment_link": key,
-            },
-        )
+        # ALSO fire the backend's notification trigger as a side-channel —
+        # if it succeeds the SME gets a Madad-branded copy of the link too,
+        # if it fails (502 in current UAT) we already sent our own.
+        if state.access_token and state.payment_id:
+            key = f"{ctx.run_id}:send_monetization_payment_link"
+            try:
+                await self._pay.send_monetization_payment_link(
+                    access_token=state.access_token,
+                    payment_id=state.payment_id,
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    idempotency_key=key,
+                )
+                return self._step(
+                    "payment_send_link", ctx,
+                    idempotency_keys={
+                        **state.idempotency_keys,
+                        "send_monetization_payment_link": key,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "payment_send_link.notification_failed",
+                    error=str(exc)[:200],
+                    note="primary link already sent via messenger — continuing",
+                )
+        return self._step("payment_send_link", ctx)
 
     async def _payment_await(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -917,7 +1032,11 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _lender_status_poll(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        status = await self._poll_journey_status(state)
+        token, refresh, expires = await self._live_token(state, ctx)
+        live_state = state if token == state.access_token else state.model_copy(
+            update={"access_token": token}
+        )
+        status = await self._poll_journey_status(live_state)
         source = state.last_status_source or "poll"
         return self._step(
             "lender_status_poll",
@@ -925,6 +1044,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             journey_status=status,
             last_status_source=source,
             last_polled_at=ctx.clock.now(),
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
         )
 
     async def _lender_wait_await(
@@ -1028,6 +1148,50 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "wait"
 
     # -- helpers --------------------------------------------------------------
+
+    async def _live_token(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> tuple[str | None, str | None, int | None]:
+        """Return a non-expired ``(access_token, refresh_token, expires_at)``.
+
+        Production journeys span days; the Madad access_token only lives 900s.
+        Whenever the existing token is within 60s of expiry (or already
+        past), re-open the channel session to mint a fresh one. The new
+        tuple is returned for the node to write back into state via its
+        return dict so subsequent turns inherit the live credentials.
+
+        On refresh failure the stale tuple is returned and the downstream
+        MCP call will 401 — which our tolerant wrappers absorb. Better to
+        keep moving than crash the run.
+        """
+
+        token = state.access_token
+        refresh = state.refresh_token
+        expires = state.token_expires_at
+        if not token:
+            return None, refresh, expires
+        now_ts = ctx.clock.now().timestamp()
+        if expires is None or expires - now_ts > 60:
+            return token, refresh, expires
+        try:
+            session = await self._identity.open_session(
+                channel=_channel(ctx),
+                identifier=ctx.identity,
+                create_onboarding_token=False,
+            )
+            ctx.logger.info(
+                "token.refreshed",
+                old_expires_at=expires,
+                new_expires_at=session.token_expires_at,
+            )
+            return (
+                session.access_token or token,
+                session.refresh_token or refresh,
+                session.token_expires_at or expires,
+            )
+        except Exception as exc:  # noqa: BLE001
+            ctx.logger.warning("token.refresh_failed", error=str(exc)[:200])
+            return token, refresh, expires
 
     async def _poll_journey_status(
         self, state: OnboardingState

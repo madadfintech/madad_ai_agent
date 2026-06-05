@@ -590,6 +590,10 @@ class InMemoryMonetizationPaymentClient:
             "amount_qar": amount_qar,
             "status": "CREATED",
             "idempotency_key": idempotency_key,
+            # Mirror the real cluster: paymentLink + providerOrderNumber are
+            # returned ON CREATE so callers don't need to call send_link.
+            "paymentLink": f"https://pay.madad.example/{payment_id}",
+            "providerOrderNumber": f"MADAD-ONBOARDING-{payment_id}",
         }
         self.payments[payment_id] = record
         self._by_idempotency_key[idempotency_key] = payment_id

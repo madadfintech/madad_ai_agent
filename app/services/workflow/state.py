@@ -84,8 +84,17 @@ class OnboardingState(WorkflowState):
     last_status_source: StatusSource | None = None
 
     # Step 1: new-lead onboarding-details capture (precedes complete_onboarding).
+    # ALL 9 fields the cluster's AUTH_COMPLETE_ONBOARDING tool requires for a
+    # fresh signup; email/phone are normally derived from the channel identity
+    # but can be overridden via the intake form.
     onboarding_first_name: str | None = None
     onboarding_last_name: str | None = None
+    onboarding_legal_entity_name: str | None = None
+    onboarding_cr_number: str | None = None
+    onboarding_is_qatar_based: bool | None = None
+    onboarding_role: str | None = None
+    onboarding_email_override: str | None = None
+    onboarding_phone_override: str | None = None
 
     # Step 1–2: campaign + consent + CR.
     entry_reply: str = ""
@@ -116,6 +125,7 @@ class OnboardingState(WorkflowState):
     payment_product_id: str | None = None
     payment_id: str | None = None
     payment_link: str | None = None
+    payment_provider_ref: str | None = None  # Tess providerOrderNumber
     payment_status: str | None = None  # backend payment record status
 
     # -- Idempotency keys (deterministic, per-run; backend dedupes payments) -

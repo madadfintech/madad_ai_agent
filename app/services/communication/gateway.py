@@ -88,16 +88,7 @@ class McpCommunicationGateway(CommunicationGateway):
                 f"No MCP tool mapped for channel {message.channel}",
                 details={"channel": str(message.channel)},
             )
-        payload = {
-            "to": message.identity,
-            "text": message.text,
-            "in_reply_to": message.in_reply_to,
-            "attachments": [
-                {"filename": a.filename, "provider_ref": a.provider_ref}
-                for a in message.attachments
-            ],
-            "correlation_id": message.correlation_id,
-        }
+        payload = _build_outbound_payload(message.channel, message)
         try:
             response = await self._tools.call_tool(tool, payload)
         except Exception as exc:  # noqa: BLE001 - normalize transport errors
@@ -107,3 +98,18 @@ class McpCommunicationGateway(CommunicationGateway):
             provider_message_id=response.get("provider_message_id"),
             raw=response,
         )
+
+
+def _build_outbound_payload(channel: Channel, message: Message) -> dict[str, Any]:
+    """Per-tool payload shaping. The UAT WhatsApp tool requires ``to`` +
+    ``body``; the email-OTP tool requires ``email``. Other channels'
+    payload shapes are added as new tools land."""
+
+    if channel is Channel.WHATSAPP:
+        return {"to": message.identity, "body": message.text or ""}
+    if channel is Channel.EMAIL:
+        # The current EMAIL mapping is to EXT_SEND_EMAIL_OTP — a
+        # send-an-OTP tool, NOT arbitrary-email-content. The body is
+        # discarded by the backend; only the recipient address is used.
+        return {"email": message.identity}
+    return {"to": message.identity, "body": message.text or ""}

@@ -38,7 +38,8 @@ async def test_whatsapp_routes_to_whatsapp_text_tool():
 
     assert caller.calls[0][0] == Tools.EXT_SEND_WHATSAPP_TEXT
     assert caller.calls[0][1]["to"] == "+97455500001"
-    assert caller.calls[0][1]["text"] == "hello"
+    # UAT EXT_SEND_WHATSAPP_TEXT expects `body`, not `text`.
+    assert caller.calls[0][1]["body"] == "hello"
     assert result.accepted is True
     assert result.provider_message_id == "wa1"
 

@@ -82,9 +82,10 @@ class MCPClient(ABC):
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                return await asyncio.wait_for(
+                raw = await asyncio.wait_for(
                     self._invoke(name, payload), timeout=self._settings.timeout_seconds
                 )
+                return _unwrap_madad_envelope(raw)
             except Exception as exc:  # noqa: BLE001 - normalise + (optionally) retry
                 last_error = exc
                 self._log.warning(
@@ -269,3 +270,28 @@ class HttpMCPClient(MCPClient):
     async def aclose(self) -> None:
         await self._stack.aclose()
         self._client = None
+
+
+def _unwrap_madad_envelope(resp: Any) -> dict[str, Any]:
+    """Strip Madad's ``{status_code, body, set_cookie_present?}`` envelope.
+
+    Every Madad MCP tool wraps its REST-style payload in this shape, e.g.::
+
+        {"status_code": 200,
+         "body": {"exists": true, "field": "email", ...},
+         "set_cookie_present": false}
+
+    The agent's adapters work in terms of the inner body. This helper
+    returns the body when the envelope is present and the response as-is
+    otherwise — so :class:`InMemoryMCPClient` handlers (which return flat
+    test shapes) keep working untouched.
+    """
+
+    if (
+        isinstance(resp, dict)
+        and "status_code" in resp
+        and isinstance(resp.get("body"), dict)
+    ):
+        body: dict[str, Any] = resp["body"]
+        return body
+    return resp if isinstance(resp, dict) else {}

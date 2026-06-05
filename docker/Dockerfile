@@ -23,6 +23,8 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY app ./app
 COPY migrations ./migrations
 COPY alembic.ini ./alembic.ini
+# Ops scripts — staging smoke test runner et al.
+COPY scripts ./scripts
 
 # Run as an unprivileged user.
 RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app

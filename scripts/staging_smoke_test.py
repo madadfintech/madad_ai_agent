@@ -204,8 +204,8 @@ async def step_ext_send_whatsapp(phone: str) -> StepResult:
             mcp.call_tool,
             Tools.EXT_SEND_WHATSAPP_TEXT,
             {
-                "phone": phone,
-                "text": "[smoke-test] MCP staging cutover ping — please ignore.",
+                "to": phone,
+                "body": "[smoke-test] MCP staging cutover ping — please ignore.",
             },
         )
         return StepResult(
@@ -221,7 +221,35 @@ async def step_ext_send_whatsapp(phone: str) -> StepResult:
         )
 
 
-async def run(identity_phone: str, *, skip_whatsapp: bool = False) -> int:
+async def step_email_otp_send(email: str) -> StepResult:
+    """Send an OTP to the operator test mailbox. The UAT cluster always
+    returns 123456 as the OTP, so this verifies the EXT seam end-to-end
+    without needing a real inbox check."""
+
+    try:
+        mcp = get_mcp_client()
+        out, ms = await _time(
+            mcp.call_tool, Tools.EXT_SEND_EMAIL_OTP, {"email": email}
+        )
+        success = bool(out.get("success", False)) if isinstance(out, dict) else False
+        return StepResult(
+            "ext_send_email_otp",
+            Tools.EXT_SEND_EMAIL_OTP,
+            success, ms,
+            f"message={out.get('message')!r}" if isinstance(out, dict) else "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return StepResult(
+            "ext_send_email_otp", Tools.EXT_SEND_EMAIL_OTP, False, 0.0, repr(exc)
+        )
+
+
+async def run(
+    identity_phone: str,
+    *,
+    skip_whatsapp: bool = False,
+    email: str = "tech.external1@madadfintech.com",
+) -> int:
     settings_res = await step_settings_load()
     print(json.dumps(asdict(settings_res)))
     if not settings_res.ok:
@@ -234,9 +262,14 @@ async def run(identity_phone: str, *, skip_whatsapp: bool = False) -> int:
 
     results = [settings_res]
 
+    # Auth-free seams first (always exercised).
     cc = await step_check_contact(identity_client, identity_phone)
     print(json.dumps(asdict(cc)))
     results.append(cc)
+
+    otp_send = await step_email_otp_send(email)
+    print(json.dumps(asdict(otp_send)))
+    results.append(otp_send)
 
     sess_res, access_token = await step_open_session(
         identity_client, Channel.WHATSAPP, identity_phone
@@ -244,22 +277,41 @@ async def run(identity_phone: str, *, skip_whatsapp: bool = False) -> int:
     print(json.dumps(asdict(sess_res)))
     results.append(sess_res)
 
-    me = await step_auth_me(identity_client, access_token)
-    print(json.dumps(asdict(me)))
-    results.append(me)
-
-    kyc_up = await step_kyc_upload_document(kyc, access_token)
-    print(json.dumps(asdict(kyc_up)))
-    results.append(kyc_up)
-
-    pl = await step_payments_list_products(payments, access_token)
-    print(json.dumps(asdict(pl)))
-    results.append(pl)
-
     if not skip_whatsapp:
         wa = await step_ext_send_whatsapp(identity_phone)
         print(json.dumps(asdict(wa)))
         results.append(wa)
+
+    # Auth-protected seams — only run when MCP_CREATE_CHANNEL_SESSION returns
+    # a real access_token. In current UAT this is blocked on Ishan I-1 (the
+    # channel-session backend returns sessionType but no token yet); the
+    # OTP path returns the token in a Set-Cookie header the MCP layer
+    # doesn't expose. Until either lands, mark these as skipped.
+    if access_token is None:
+        print(
+            json.dumps(
+                {
+                    "name": "auth_protected_tools",
+                    "tool": None,
+                    "skipped": True,
+                    "reason": "no access_token from channel-session (Ishan I-1) "
+                    "and OTP verify returns token in Set-Cookie (not body); "
+                    "AUTH_ME / KYC_* / PAYMENTS_* await Ishan auth fix",
+                }
+            )
+        )
+    else:
+        me = await step_auth_me(identity_client, access_token)
+        print(json.dumps(asdict(me)))
+        results.append(me)
+
+        kyc_up = await step_kyc_upload_document(kyc, access_token)
+        print(json.dumps(asdict(kyc_up)))
+        results.append(kyc_up)
+
+        pl = await step_payments_list_products(payments, access_token)
+        print(json.dumps(asdict(pl)))
+        results.append(pl)
 
     # Summary.
     failures = [r for r in results if not r.ok]
@@ -270,6 +322,7 @@ async def run(identity_phone: str, *, skip_whatsapp: bool = False) -> int:
         "failed": len(failures),
         "failed_steps": [r.name for r in failures],
         "total_latency_ms": round(sum(r.latency_ms for r in results), 1),
+        "auth_protected_skipped": access_token is None,
     }
     print(json.dumps(summary))
 
@@ -289,8 +342,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip the EXT_SEND_WHATSAPP_TEXT step (use when the test account "
         "shouldn't receive a real message yet).",
     )
+    parser.add_argument(
+        "--email",
+        default="tech.external1@madadfintech.com",
+        help="Email used for the EXT_SEND_EMAIL_OTP step. Defaults to the "
+        "Madad test mailbox; the UAT cluster always returns 123456 as the OTP.",
+    )
     args = parser.parse_args(argv)
-    return asyncio.run(run(args.identity, skip_whatsapp=args.skip_whatsapp))
+    return asyncio.run(
+        run(args.identity, skip_whatsapp=args.skip_whatsapp, email=args.email)
+    )
 
 
 if __name__ == "__main__":

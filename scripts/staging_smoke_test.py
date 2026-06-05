@@ -80,15 +80,29 @@ async def step_settings_load() -> StepResult:
     )
 
 
-async def step_check_contact(identity: McpMadadIdentityClient, phone: str) -> StepResult:
+def _detect_channel(identity_value: str) -> Channel:
+    """Smoke runner accepts either a phone (+E.164) or an email; pick the
+    channel from the format so existing-user lookups land on the right
+    backend index."""
+
+    return Channel.EMAIL if "@" in identity_value else Channel.WHATSAPP
+
+
+async def step_check_contact(
+    identity: McpMadadIdentityClient, identity_value: str
+) -> StepResult:
     try:
-        out, ms = await _time(identity.check_contact, phone=phone)
+        channel = _detect_channel(identity_value)
+        if channel is Channel.EMAIL:
+            out, ms = await _time(identity.check_contact, email=identity_value)
+        else:
+            out, ms = await _time(identity.check_contact, phone=identity_value)
         return StepResult(
             "check_contact",
             Tools.AUTH_CHECK_CONTACT,
             True,
             ms,
-            f"exists={out.exists} domain_exists={out.domain_exists}",
+            f"exists={out.exists} field={out.field} domain_exists={out.domain_exists}",
         )
     except Exception as exc:  # noqa: BLE001
         return StepResult(
@@ -249,6 +263,7 @@ async def run(
     *,
     skip_whatsapp: bool = False,
     email: str = "tech.external1@madadfintech.com",
+    whatsapp_recipient: str | None = None,
 ) -> int:
     settings_res = await step_settings_load()
     print(json.dumps(asdict(settings_res)))
@@ -272,13 +287,19 @@ async def run(
     results.append(otp_send)
 
     sess_res, access_token = await step_open_session(
-        identity_client, Channel.WHATSAPP, identity_phone
+        identity_client, _detect_channel(identity_phone), identity_phone
     )
     print(json.dumps(asdict(sess_res)))
     results.append(sess_res)
 
-    if not skip_whatsapp:
-        wa = await step_ext_send_whatsapp(identity_phone)
+    # WhatsApp recipient defaults to the identity when it's already a phone;
+    # when the identity is an email (existing-user lookup mode), skip
+    # WhatsApp unless an explicit --whatsapp-recipient is given.
+    wa_to = whatsapp_recipient or (
+        identity_phone if _detect_channel(identity_phone) is Channel.WHATSAPP else None
+    )
+    if not skip_whatsapp and wa_to:
+        wa = await step_ext_send_whatsapp(wa_to)
         print(json.dumps(asdict(wa)))
         results.append(wa)
 
@@ -348,9 +369,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Email used for the EXT_SEND_EMAIL_OTP step. Defaults to the "
         "Madad test mailbox; the UAT cluster always returns 123456 as the OTP.",
     )
+    parser.add_argument(
+        "--whatsapp-recipient",
+        default=None,
+        help="WhatsApp E.164 number for the smoke message. Defaults to the "
+        "--identity value when that's a phone; required when --identity is "
+        "an email.",
+    )
     args = parser.parse_args(argv)
     return asyncio.run(
-        run(args.identity, skip_whatsapp=args.skip_whatsapp, email=args.email)
+        run(
+            args.identity,
+            skip_whatsapp=args.skip_whatsapp,
+            email=args.email,
+            whatsapp_recipient=args.whatsapp_recipient,
+        )
     )
 
 

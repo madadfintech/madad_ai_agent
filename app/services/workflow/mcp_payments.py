@@ -83,7 +83,7 @@ class McpMonetizationPaymentAdapter:
     ) -> dict[str, Any]:
         # UAT names the amount field ``payable_amount`` (not the workflow's
         # internal ``amount_qar``).
-        return await self._tools.call_tool(
+        response = await self._tools.call_tool(
             Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT,
             {
                 "access_token": access_token,
@@ -93,6 +93,17 @@ class McpMonetizationPaymentAdapter:
                 "payable_amount": amount_qar,
             },
         )
+        # UAT returns the payment record with the id under the field name
+        # ``id`` (not ``payment_id``). Alias so the workflow's _payment_create
+        # node can chain through to send_link without learning the response
+        # shape. ``status`` similarly comes back under ``internalStatus``
+        # for new payments.
+        if isinstance(response, dict):
+            if "payment_id" not in response and "id" in response:
+                response["payment_id"] = response["id"]
+            if "status" not in response and "internalStatus" in response:
+                response["status"] = response["internalStatus"]
+        return response
 
     async def send_monetization_payment_link(
         self,

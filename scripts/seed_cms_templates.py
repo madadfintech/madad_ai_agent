@@ -38,7 +38,7 @@ _TEMPLATE_BODIES = {
         "Thanks for your time. Reply START anytime to begin onboarding."
     ),
     "onboarding.domain_blocked": (
-        "It looks like {domain} is already registered with another team. "
+        "It looks like {{ domain }} is already registered with another team. "
         "Please contact your administrator or use a personal email."
     ),
     "onboarding.collect_details.request": (
@@ -77,11 +77,11 @@ _TEMPLATE_BODIES = {
         "Please share your shareholders' details (name, percentage)."
     ),
     "onboarding.documents.checklist": (
-        "We need the following documents to proceed: {documents}. "
+        "We need the following documents to proceed: {{ documents }}. "
         "Please reply with them as attachments."
     ),
     "onboarding.documents.missing": (
-        "We're still missing: {documents}. Please reply with the remaining "
+        "We're still missing: {{ documents }}. Please reply with the remaining "
         "documents."
     ),
     "onboarding.documents.complete": (
@@ -92,13 +92,13 @@ _TEMPLATE_BODIES = {
         "partners this time. Please reach out to our team."
     ),
     "onboarding.payment.request": (
-        "Your onboarding fee of QAR {amount} is ready. Please complete payment "
-        "via the secure link below:\n\n"
-        "{payment_link}\n\n"
-        "Reference: {provider_ref}"
+        "Your onboarding fee of QAR {{ amount }} is ready. Please complete "
+        "payment via the secure link below:\n\n"
+        "{{ payment_link }}\n\n"
+        "Reference: {{ provider_ref }}"
     ),
     "onboarding.offers.preview": (
-        "Great news — you have {count} financing offer(s) ready to review!"
+        "Great news — you have {{ count }} financing offer(s) ready to review!"
     ),
     "onboarding.offer.handoff": (
         "Please visit madadfintech.com to review and accept your offer. "

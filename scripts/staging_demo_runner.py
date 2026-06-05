@@ -48,12 +48,36 @@ import time
 from typing import Any
 
 import httpx
+import jwt as pyjwt
+
+from app.core.config import settings
+
+
+def _hmac_sign(raw: bytes) -> str | None:
+    sec = settings.security
+    if not sec.webhook_secret:
+        return None
+    import hashlib
+    import hmac
+
+    return hmac.new(sec.webhook_secret.encode(), raw, hashlib.sha256).hexdigest()
 
 
 def _post(
     client: httpx.Client, path: str, body: dict[str, Any]
 ) -> dict[str, Any]:
-    r = client.post(path, json=body, timeout=60.0)
+    headers: dict[str, str] = {}
+    # Webhook chokepoint requires HMAC over the raw body; other endpoints
+    # accept it harmlessly when not validated.
+    raw = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
+    sig = _hmac_sign(raw)
+    if sig and "/workflow/madad/events/" in path:
+        header_name = settings.security.webhook_signature_header
+        headers[header_name] = sig
+        headers["Content-Type"] = "application/json"
+        r = client.post(path, content=raw, headers=headers, timeout=60.0)
+    else:
+        r = client.post(path, json=body, timeout=60.0)
     r.raise_for_status()
     data: dict[str, Any] = r.json()
     return data
@@ -93,8 +117,30 @@ def _step(
     return ok, out, ms
 
 
+def _make_auth_headers() -> dict[str, str]:
+    """Mint a service-JWT signed with the configured SECURITY__JWT_SECRET so
+    the demo runner can call the API-auth-gated workflow endpoints
+    (/workflow/campaign/start, /workflow/inbound, /workflow/status).
+    Webhook event endpoints use HMAC signature instead — handled in _step."""
+
+    sec = settings.security
+    if not sec.jwt_secret:
+        return {}
+    claims: dict[str, Any] = {
+        "sub": "staging-demo-runner",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 600,
+    }
+    if sec.jwt_issuer:
+        claims["iss"] = sec.jwt_issuer
+    if sec.jwt_audience:
+        claims["aud"] = sec.jwt_audience
+    token = pyjwt.encode(claims, sec.jwt_secret, algorithm=sec.jwt_algorithm)
+    return {"Authorization": f"Bearer {token}"}
+
+
 def run(base_url: str, identity: str, channel: str) -> int:
-    client = httpx.Client(base_url=base_url)
+    client = httpx.Client(base_url=base_url, headers=_make_auth_headers())
     print(f"=== driving demo flow: identity={identity} channel={channel} ===\n")
 
     started: list[dict[str, Any]] = []

@@ -37,10 +37,13 @@ from typing import Any
 
 from app.shared.mcp import MCPToolCaller, Tools
 
-# Madad's KYC backend addresses documents to a specific OWNER entity. For
-# every onboarding-flow document the entity is the user's BUSINESS record;
-# admin-requested docs and CR/financial uploads all flow under this entity.
-DEFAULT_DOCUMENT_ENTITY_TYPE = "BUSINESS"
+# Madad's KYC backend addresses documents to a specific OWNER entity. Per
+# Ishan's enum (2026-06-05): for every onboarding-flow document the entity
+# is the user's BUSINESS_DETAILS record; admin-requested docs and
+# CR/financial uploads all flow under this entity. Other valid values:
+# USER, KYC, SHAREHOLDER, DIRECTOR, BUYER, INVOICE, OFFER, TICKET,
+# COMMUNICATION, BANK_DETAILS, AUTH_SIGNATORY, BENEFICIAL_OWNER.
+DEFAULT_DOCUMENT_ENTITY_TYPE = "BUSINESS_DETAILS"
 
 # Per-doc-type discriminators the backend expects on the generic base64
 # upload tool. The keys are the workflow's internal document_type names

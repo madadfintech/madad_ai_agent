@@ -165,15 +165,27 @@ async def test_poller_advances_a_due_run_at_journey_wait_await() -> None:
     identity = "+97455500802"
     await _drive_to_journey_wait(platform, identity)
 
-    # Run is parked at journey_wait_await; last_polled_at was set during the
-    # status_poll_on_demand that preceded it. Advance "now" past the
-    # cadence so the poller decides it's due.
-    far_future = NOW + timedelta(hours=2)
+    # Anchor "now" relative to the actual last_polled_at the workflow
+    # recorded — synthetic NOW constants drift over time and msgpack
+    # deserialization can return journey_status as an opaque type that
+    # falls through cadence_for to CADENCE_SLOW (1h), so we need to be
+    # well past one slow cadence to guarantee due.
+    runs = await platform.runtime.run_store.list_by_status(
+        RunStatus.WAITING_FOR_INPUT
+    )
+    run = next(r for r in runs if r.identity == identity)
+    compiled = platform.runtime.loader.load(run.workflow, run.version)
+    snap = await compiled.graph.aget_state(
+        {"configurable": {"thread_id": run.thread_id}}
+    )
+    last_polled_at = snap.values["last_polled_at"]
 
     # Backend status advances → poller picks it up.
     platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
 
-    stats = await run_status_poller(platform, now=far_future)
+    stats = await run_status_poller(
+        platform, now=last_polled_at + timedelta(hours=2)
+    )
 
     assert stats.polled == 1
     # After the poll, the run advanced to payment_await (PRE_QUALIFIED →

@@ -33,7 +33,7 @@ async def test_upload_commercial_registration_routes_through_generic_base64_tool
     assert payload["base64"] == "QkE="
     assert payload["mime_type"] == "application/pdf"
     assert payload["metadata"]["access_token"] == TOKEN
-    assert payload["metadata"]["document_entity_type"] == "BUSINESS"
+    assert payload["metadata"]["document_entity_type"] == "BUSINESS_DETAILS"
     assert payload["metadata"]["document_type"] == "COMMERCIAL_REGISTRATION"
 
 
@@ -114,7 +114,7 @@ async def test_upload_document_base64_uses_real_uat_schema() -> None:
     assert payload["base64"] == "QkE="
     assert payload["metadata"] == {
         "access_token": TOKEN,
-        "document_entity_type": "BUSINESS",
+        "document_entity_type": "BUSINESS_DETAILS",
         "document_type": "TRADE_LICENSE",
         "document_label": "TL.pdf",
     }

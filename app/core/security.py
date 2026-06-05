@@ -24,8 +24,11 @@ from app.core.exceptions import AppError
 
 # Probe endpoints that must stay reachable without auth.
 _PUBLIC_PATHS = ("/health", "/ready", "/metrics")
-# Webhook/callback paths use HMAC signatures, not the API JWT.
-_WEBHOOK_MARKERS = ("/webhooks/", "/madad/status/")
+# Webhook/callback paths use HMAC signatures, not the API JWT. Keep
+# ``/madad/status/`` for backward compat with any legacy Phase 2 callers;
+# the Phase 4 chokepoint lives under ``/madad/events/`` and is the path
+# Madad's backend actually posts to.
+_WEBHOOK_MARKERS = ("/webhooks/", "/madad/status/", "/madad/events/")
 
 
 class UnauthorizedError(AppError):

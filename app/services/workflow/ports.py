@@ -448,6 +448,196 @@ class InMemoryKycClient:
         return {"shareholders": added}
 
 
+# -- MonetizationPaymentClient: QAR 6,000 onboarding-fee flow (Phase 3) ------
+
+
+@runtime_checkable
+class MonetizationPaymentClient(Protocol):
+    """Five-tool monetization fee flow for the QAR 6,000 onboarding payment.
+
+    Implementations: ``InMemoryMonetizationPaymentClient`` (tests) and
+    ``McpMonetizationPaymentAdapter`` (production — wraps
+    ``madad_kyc_get_business_details`` plus the five ``madad_payments_*``
+    monetization tools).
+
+    Per Ishan's 2026-05-31 backend update, ``create_monetization_payment`` and
+    ``send_monetization_payment_link`` accept ``idempotency_key`` as a TOOL
+    PARAMETER (not an HTTP header) — the backend dedupes on it. The Phase 1
+    provider already adds these two tools to the default ``idempotent_tools``
+    set, so the MCP client retries them transparently on transient transport
+    errors with the same key.
+    """
+
+    async def get_business_details(self, *, access_token: str) -> dict[str, Any]: ...
+
+    async def list_monetization_products(
+        self, *, access_token: str
+    ) -> dict[str, Any]: ...
+
+    async def create_monetization_payment(
+        self,
+        *,
+        access_token: str,
+        business_details_id: str,
+        product_id: str,
+        amount_qar: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]: ...
+
+    async def send_monetization_payment_link(
+        self,
+        *,
+        access_token: str,
+        payment_id: str,
+        channel: Channel,
+        identity: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]: ...
+
+    async def get_monetization_payment(
+        self, *, access_token: str, payment_id: str
+    ) -> dict[str, Any]: ...
+
+    async def sync_monetization_payment_status(
+        self, *, access_token: str, payment_id: str
+    ) -> dict[str, Any]: ...
+
+
+class InMemoryMonetizationPaymentClient:
+    """Configurable fake implementing :class:`MonetizationPaymentClient`.
+
+    Tests seed ``business_details`` and ``products``; the fake models the
+    real backend's idempotency-key dedupe — repeated ``create`` calls with
+    the same key return the same ``payment_id`` instead of creating a new
+    record. ``sync_status`` marks a payment paid; ``get`` reads the current
+    record. Every call is captured in ``calls`` for introspection.
+    """
+
+    def __init__(
+        self,
+        *,
+        business_details: dict[str, Any] | None = None,
+        products: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self._business_details: dict[str, Any] = dict(
+            business_details or {"business_details_id": "biz-1", "name": "Test SME"}
+        )
+        self._products: list[dict[str, Any]] = list(
+            products
+            or [
+                {
+                    "product_id": "prod-monetization",
+                    "name": "Onboarding Fee",
+                    "amount_qar": 6000,
+                }
+            ]
+        )
+        self.payments: dict[str, dict[str, Any]] = {}
+        self._by_idempotency_key: dict[str, str] = {}
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def _record(self, name: str, **kwargs: Any) -> None:
+        self.calls.append((name, kwargs))
+
+    async def get_business_details(self, *, access_token: str) -> dict[str, Any]:
+        self._record("get_business_details", access_token=access_token)
+        return dict(self._business_details)
+
+    async def list_monetization_products(
+        self, *, access_token: str
+    ) -> dict[str, Any]:
+        self._record("list_monetization_products", access_token=access_token)
+        return {"products": list(self._products)}
+
+    async def create_monetization_payment(
+        self,
+        *,
+        access_token: str,
+        business_details_id: str,
+        product_id: str,
+        amount_qar: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        self._record(
+            "create_monetization_payment",
+            access_token=access_token,
+            business_details_id=business_details_id,
+            product_id=product_id,
+            amount_qar=amount_qar,
+            idempotency_key=idempotency_key,
+        )
+        # Backend-side dedupe: same key → same payment record.
+        existing_id = self._by_idempotency_key.get(idempotency_key)
+        if existing_id is not None:
+            return dict(self.payments[existing_id])
+        payment_id = new_id("pay")
+        record = {
+            "payment_id": payment_id,
+            "business_details_id": business_details_id,
+            "product_id": product_id,
+            "amount_qar": amount_qar,
+            "status": "CREATED",
+            "idempotency_key": idempotency_key,
+        }
+        self.payments[payment_id] = record
+        self._by_idempotency_key[idempotency_key] = payment_id
+        return dict(record)
+
+    async def send_monetization_payment_link(
+        self,
+        *,
+        access_token: str,
+        payment_id: str,
+        channel: Channel,
+        identity: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        self._record(
+            "send_monetization_payment_link",
+            access_token=access_token,
+            payment_id=payment_id,
+            channel=channel,
+            identity=identity,
+            idempotency_key=idempotency_key,
+        )
+        record = self.payments.get(payment_id, {})
+        link = f"https://pay.madad.example/{payment_id}"
+        record["payment_link"] = link
+        record["link_sent_to"] = identity
+        return {"payment_id": payment_id, "payment_link": link, "channel": str(channel)}
+
+    async def get_monetization_payment(
+        self, *, access_token: str, payment_id: str
+    ) -> dict[str, Any]:
+        self._record(
+            "get_monetization_payment",
+            access_token=access_token,
+            payment_id=payment_id,
+        )
+        return dict(self.payments.get(payment_id, {"payment_id": payment_id}))
+
+    async def sync_monetization_payment_status(
+        self, *, access_token: str, payment_id: str
+    ) -> dict[str, Any]:
+        self._record(
+            "sync_monetization_payment_status",
+            access_token=access_token,
+            payment_id=payment_id,
+        )
+        record = self.payments.get(payment_id)
+        if record is not None:
+            record["status"] = "PAID"
+        return dict(record or {"payment_id": payment_id, "status": "UNKNOWN"})
+
+    def mark_paid(self, payment_id: str) -> None:
+        """Test helper: simulate the backend marking a payment paid (so the
+        next get/sync returns PAID without going through the sync tool)."""
+
+        record = self.payments.get(payment_id)
+        if record is not None:
+            record["status"] = "PAID"
+
+
 # -- Reminders (via Nudge service) -------------------------------------------
 
 

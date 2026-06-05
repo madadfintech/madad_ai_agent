@@ -36,7 +36,9 @@ class PostgresCheckpointerProvider(CheckpointerProvider):
 
         # ``from_conn_string`` yields an async context manager; enter it manually
         # so the saver lives for the whole process and close it in ``aclose``.
-        self._cm = AsyncPostgresSaver.from_conn_string(self._settings.dsn)
+        # The langgraph checkpointer uses psycopg directly, so feed it the plain
+        # libpq DSN (no SQLAlchemy +asyncpg dialect prefix).
+        self._cm = AsyncPostgresSaver.from_conn_string(self._settings.libpq_dsn)
         self._saver = await self._cm.__aenter__()
         await self._saver.setup()
 

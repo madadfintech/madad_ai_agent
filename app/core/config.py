@@ -38,6 +38,21 @@ class PostgresSettings(BaseModel):
     # ``max_overflow`` extra under load; recycle to avoid stale server-side conns.
     pool_size: int = 10
     max_overflow: int = 5
+
+    @property
+    def libpq_dsn(self) -> str:
+        """DSN in plain libpq form (``postgresql://...``) — for libraries that
+        speak psycopg directly rather than through SQLAlchemy (e.g. the
+        langgraph Postgres checkpointer, or Alembic with the sync driver).
+
+        Strips the SQLAlchemy ``+asyncpg`` / ``+psycopg`` dialect suffix that
+        psycopg can't parse.
+        """
+
+        for prefix in ("postgresql+asyncpg://", "postgresql+psycopg://"):
+            if self.dsn.startswith(prefix):
+                return "postgresql://" + self.dsn[len(prefix):]
+        return self.dsn
     pool_recycle_seconds: int = 1800
 
 

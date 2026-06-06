@@ -75,7 +75,12 @@ class McpKycClient:
         self._tools = tool_caller
 
     async def upload_commercial_registration(
-        self, *, access_token: str, content_base64: str, filename: str
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
     ) -> dict[str, Any]:
         # Route via the generic base64 tool with CR document_type — the
         # specialised CR tool takes file_path not base64, which we don't
@@ -85,6 +90,7 @@ class McpKycClient:
             content_base64=content_base64,
             filename=filename,
             document_type="commercial_registration",
+            mime_type=mime_type,
         )
 
     async def update_eligibility(
@@ -99,7 +105,12 @@ class McpKycClient:
         return await self._tools.call_tool(Tools.KYC_UPDATE_ELIGIBILITY, payload)
 
     async def upload_audited_financial_report(
-        self, *, access_token: str, content_base64: str, filename: str
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
     ) -> dict[str, Any]:
         # Same routing as CR — backend-specific tool wants file_path.
         return await self.upload_document_base64(
@@ -107,6 +118,7 @@ class McpKycClient:
             content_base64=content_base64,
             filename=filename,
             document_type="audited_report",
+            mime_type=mime_type,
         )
 
     async def get_admin_requested_documents(
@@ -123,12 +135,13 @@ class McpKycClient:
         content_base64: str,
         filename: str,
         document_type: str,
+        mime_type: str | None = None,
     ) -> dict[str, Any]:
         return await self._tools.call_tool(
             Tools.KYC_UPLOAD_DOCUMENT_BASE64,
             {
                 "file_name": filename,
-                "mime_type": _infer_mime_type(filename),
+                "mime_type": mime_type or _infer_mime_type(filename),
                 "base64": content_base64,
                 "metadata": {
                     "access_token": access_token,

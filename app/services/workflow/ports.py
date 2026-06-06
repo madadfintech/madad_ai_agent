@@ -319,7 +319,12 @@ class KycClient(Protocol):
     """
 
     async def upload_commercial_registration(
-        self, *, access_token: str, content_base64: str, filename: str
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def update_eligibility(
@@ -327,7 +332,12 @@ class KycClient(Protocol):
     ) -> dict[str, Any]: ...
 
     async def upload_audited_financial_report(
-        self, *, access_token: str, content_base64: str, filename: str
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def get_admin_requested_documents(
@@ -341,6 +351,7 @@ class KycClient(Protocol):
         content_base64: str,
         filename: str,
         document_type: str,
+        mime_type: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def add_buyer(
@@ -382,14 +393,22 @@ class InMemoryKycClient:
         self.calls.append((name, kwargs))
 
     async def upload_commercial_registration(
-        self, *, access_token: str, content_base64: str, filename: str
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
     ) -> dict[str, Any]:
         self._record(
             "upload_commercial_registration",
             access_token=access_token,
             filename=filename,
+            mime_type=mime_type,
         )
-        self.cr_document = {"filename": filename, "content_base64": content_base64}
+        self.cr_document = {
+            "filename": filename, "content_base64": content_base64, "mime_type": mime_type,
+        }
         return {"document_id": new_id("cr"), "filename": filename}
 
     async def update_eligibility(
@@ -399,14 +418,22 @@ class InMemoryKycClient:
         return self._eligibility_result
 
     async def upload_audited_financial_report(
-        self, *, access_token: str, content_base64: str, filename: str
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
     ) -> dict[str, Any]:
         self._record(
             "upload_audited_financial_report",
             access_token=access_token,
             filename=filename,
+            mime_type=mime_type,
         )
-        self.financial_report = {"filename": filename, "content_base64": content_base64}
+        self.financial_report = {
+            "filename": filename, "content_base64": content_base64, "mime_type": mime_type,
+        }
         return {"document_id": new_id("fr"), "filename": filename}
 
     async def get_admin_requested_documents(
@@ -425,16 +452,19 @@ class InMemoryKycClient:
         content_base64: str,
         filename: str,
         document_type: str,
+        mime_type: str | None = None,
     ) -> dict[str, Any]:
         self._record(
             "upload_document_base64",
             access_token=access_token,
             filename=filename,
             document_type=document_type,
+            mime_type=mime_type,
         )
         self.uploaded_documents[document_type] = {
             "filename": filename,
             "content_base64": content_base64,
+            "mime_type": mime_type,
         }
         return {"document_id": new_id("doc"), "document_type": document_type}
 

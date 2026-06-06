@@ -536,7 +536,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx,
             consent=True,
             cr_ref=first.get("filename"),
+            cr_filename=first.get("filename"),
             cr_content_base64=first.get("content_base64") or "",
+            cr_mime_type=first.get("mime_type"),
         )
 
     async def _cr_upload_base64(
@@ -549,6 +551,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                     access_token=token,
                     content_base64=state.cr_content_base64 or "",
                     filename=state.cr_ref,
+                    mime_type=state.cr_mime_type,
                 )
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
@@ -678,6 +681,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             financials_received=True,
             financials_content_base64=first.get("content_base64") or "",
             financials_filename=first.get("filename") or "",
+            financials_mime_type=first.get("mime_type"),
         )
 
     async def _financials_upload_base64(
@@ -689,6 +693,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                     access_token=state.access_token,
                     content_base64=state.financials_content_base64 or "",
                     filename=state.financials_filename or "audited_report.pdf",
+                    mime_type=state.financials_mime_type,
                 )
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
@@ -836,6 +841,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                         content_base64=att.get("content_base64") or "",
                         filename=att.get("filename") or "",
                         document_type=doc_type,
+                        mime_type=att.get("mime_type"),
                     )
                 except Exception as exc:  # noqa: BLE001 — degrade in staging
                     ctx.logger.warning(

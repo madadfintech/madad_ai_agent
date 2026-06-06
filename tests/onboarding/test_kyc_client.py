@@ -47,7 +47,9 @@ async def test_upload_commercial_registration_records_document() -> None:
     )
 
     assert result["filename"] == "CR.pdf"
-    assert client.cr_document == {"filename": "CR.pdf", "content_base64": "QkE="}
+    assert client.cr_document == {
+        "filename": "CR.pdf", "content_base64": "QkE=", "mime_type": None,
+    }
 
 
 async def test_upload_audited_financial_report_records_document() -> None:
@@ -60,7 +62,24 @@ async def test_upload_audited_financial_report_records_document() -> None:
     assert client.financial_report == {
         "filename": "Audited.pdf",
         "content_base64": "QkE=",
+        "mime_type": None,
     }
+
+
+async def test_upload_document_base64_forwards_client_supplied_mime_type() -> None:
+    """If the inbound attachment carried a mime_type (Madad bridge from Meta),
+    the client honors it and does not re-infer from filename."""
+    client = InMemoryKycClient()
+
+    await client.upload_document_base64(
+        access_token=TOKEN,
+        content_base64="QkE=",
+        filename="trade_license",  # no extension on purpose
+        document_type="trade_license",
+        mime_type="image/png",
+    )
+
+    assert client.uploaded_documents["trade_license"]["mime_type"] == "image/png"
 
 
 async def test_update_eligibility_returns_configured_payload() -> None:

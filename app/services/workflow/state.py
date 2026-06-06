@@ -100,7 +100,9 @@ class OnboardingState(WorkflowState):
     entry_reply: str = ""
     consent: bool = False
     cr_ref: str | None = None
+    cr_filename: str | None = None
     cr_content_base64: str | None = None
+    cr_mime_type: str | None = None
 
     # Step 3–4: eligibility + financials.
     eligibility_form_data: dict[str, Any] = Field(default_factory=dict)
@@ -108,6 +110,7 @@ class OnboardingState(WorkflowState):
     financials_received: bool = False
     financials_filename: str | None = None
     financials_content_base64: str | None = None
+    financials_mime_type: str | None = None
     application_ref: str | None = None  # Madad account ref (e.g. #7388266)
 
     # Step 5–6: dynamic checklist + counterparties.

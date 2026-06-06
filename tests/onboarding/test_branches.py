@@ -65,7 +65,7 @@ async def test_missing_documents_loops_until_complete(harness):
     await resume({"annual_revenue_qar": 1000})
     await resume({"attachments": [{"filename": "Audited.pdf"}]})
     await resume({"name": "Buyer 1"})
-    await resume({"shareholders": [{"name": "A", "percentage": 100}]})
+    await resume({"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]})
 
     # Upload only one of the two required documents — graph re-asks.
     partial = await resume({"attachments": [{"filename": "Trade_License.pdf"}]})
@@ -94,7 +94,7 @@ async def test_not_qualified_post_payment_via_lender_status(make_harness):
     await resume({"annual_revenue_qar": 1000})
     await resume({"attachments": [{"filename": "Audited.pdf"}]})
     await resume({"name": "Buyer 1"})
-    await resume({"shareholders": [{"name": "A", "percentage": 100}]})
+    await resume({"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]})
     await resume({"attachments": [{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}]})
 
     # Advance to payment then back to lender wait.
@@ -127,7 +127,7 @@ async def test_terminal_success_via_activated_status(harness):
     await resume({"annual_revenue_qar": 1000})
     await resume({"attachments": [{"filename": "Audited.pdf"}]})
     await resume({"name": "Buyer 1"})
-    await resume({"shareholders": [{"name": "A", "percentage": 100}]})
+    await resume({"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]})
     await resume({"attachments": [{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}]})
 
     # Backend jumps straight to ACTIVATED at the post-docs poll.

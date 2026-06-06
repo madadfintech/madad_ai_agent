@@ -207,7 +207,9 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": "QkE="}]})
     # Step 5–6: counterparties + documents.
     await resume({"name": "ACME LLC", "country": "QA"})
-    await resume({"shareholders": [{"name": "Aisha", "percentage": 100}]})
+    await resume(
+        {"shareholders": [{"name": "Aisha", "phoneNumber": "+97455500001"}]}
+    )
     docs_done = await resume(
         {
             "attachments": [

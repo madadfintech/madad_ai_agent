@@ -72,7 +72,7 @@ def test_full_flow_over_http() -> None:
     assert _inbound(data={"name": "ACME"}).json()["prompt"]["step"] == "shareholders"
     assert (
         _inbound(
-            data={"shareholders": [{"name": "A", "percentage": 100}]}
+            data={"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]}
         ).json()["prompt"]["step"]
         == "documents"
     )

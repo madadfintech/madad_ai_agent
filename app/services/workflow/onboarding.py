@@ -754,27 +754,49 @@ class OnboardingWorkflow(WorkflowDefinition):
         payload = reply if isinstance(reply, dict) else {}
         raw = payload.get("shareholders")
         items: list[dict[str, Any]] = list(raw) if isinstance(raw, list) else []
-        if items and state.access_token:
+        # Per Ishan's KYC_ADD_SHAREHOLDERS schema (2026-06-06): each
+        # shareholder requires ``name + phoneNumber``; the cluster also
+        # accepts ``firstName / lastName / middleName / email / address``
+        # as optional. Anything else (percentage / nationality / document
+        # fields) is rejected with HTTP 400 — those go through the
+        # separate shareholder-documents upload + KYC tools.
+        allowed = {
+            "name", "phoneNumber",
+            "firstName", "lastName", "middleName", "email", "address",
+        }
+        sanitized: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            record = {k: v for k, v in item.items() if k in allowed and v is not None}
+            if "name" not in record or "phoneNumber" not in record:
+                # Fall back to deriving name from firstName/lastName when the
+                # demo runner supplies them split.
+                if "firstName" in record and "lastName" in record and "name" not in record:
+                    record["name"] = f"{record['firstName']} {record['lastName']}".strip()
+                if "name" not in record or "phoneNumber" not in record:
+                    ctx.logger.warning(
+                        "add_shareholders.invalid_record",
+                        keys_supplied=sorted(item.keys()),
+                        note="missing required name / phoneNumber — dropped",
+                    )
+                    continue
+            sanitized.append(record)
+        if sanitized and state.access_token:
             try:
                 await self._kyc.add_shareholders(
-                    access_token=state.access_token, shareholders=items
+                    access_token=state.access_token, shareholders=sanitized
                 )
             except Exception as exc:  # noqa: BLE001 — degrade in staging
-                # Diagnostic logging — the cluster rejects all probed
-                # shapes with 400s and we can't reverse-engineer the schema
-                # from our side. Log enough for Ishan to debug from the
-                # backend logs when he sees this in the audit trail.
                 ctx.logger.warning(
                     "add_shareholders.failed",
                     error=str(exc)[:300],
-                    attempted_payload_keys=[
-                        sorted(item.keys()) for item in items[:3]
-                    ],
-                    attempted_count=len(items),
-                    note="cluster rejects current shareholder shape — "
-                         "needs Ishan-provided schema. Workflow continues.",
+                    attempted_count=len(sanitized),
+                    note="staging-tolerant: workflow continues",
                 )
-        return self._step("shareholders_collect_await", ctx, shareholders=items)
+        return self._step(
+            "shareholders_collect_await", ctx, shareholders=sanitized
+        )
 
     async def _documents_upload_loop_send(
         self, state: OnboardingState, ctx: WorkflowContext

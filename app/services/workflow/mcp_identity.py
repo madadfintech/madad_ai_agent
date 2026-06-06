@@ -23,12 +23,34 @@ materialising :class:`ChannelSession`, :class:`ContactCheckResult` and
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from app.shared.mcp import MCPToolCaller, Tools
 from app.shared.workflow.enums import Channel
 
 from .ports import AuthTokens, ChannelSession, ContactCheckResult
+
+
+def _parse_expires_at(value: Any, expires_in_seconds: Any = None) -> int | None:
+    """Coerce a session's expiry into a Unix epoch ``int``.
+
+    The cluster now returns ``tokenExpiresAt`` as an ISO-8601 string
+    (e.g. ``"2026-06-06T08:03:47.827005Z"``). Older responses only had
+    ``expiresInSeconds`` which we add to "now" on this side. Returns
+    ``None`` if neither shape is available."""
+
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return int(dt.timestamp())
+        except ValueError:
+            pass
+    if isinstance(expires_in_seconds, int) and expires_in_seconds > 0:
+        return int(datetime.now().timestamp()) + expires_in_seconds
+    return None
 
 
 def _channel_value(channel: Channel) -> str:
@@ -72,8 +94,11 @@ class McpMadadIdentityClient:
             access_token=response.get("accessToken"),
             onboarding_token=response.get("onboardingToken"),
             refresh_token=response.get("refreshToken"),
-            token_expires_at=response.get("tokenExpiresAt"),
-            user_or_lead_ref=response.get("userOrLeadRef"),
+            token_expires_at=_parse_expires_at(
+                response.get("tokenExpiresAt"),
+                response.get("expiresInSeconds"),
+            ),
+            user_or_lead_ref=response.get("userOrLeadRef") or response.get("userId"),
             raw=response,
         )
 

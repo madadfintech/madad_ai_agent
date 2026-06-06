@@ -51,7 +51,7 @@ async def _drive_to_completion(harness):
 
     # Shareholders → documents upload prompt.
     after_sh = await resume(
-        {"shareholders": [{"name": "Aisha", "percentage": 100}]}
+        {"shareholders": [{"name": "Aisha", "phoneNumber": "+97455500001"}]}
     )
     assert after_sh.prompt == {"waiting_for": "upload", "step": "documents"}
 

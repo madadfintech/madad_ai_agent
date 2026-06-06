@@ -48,7 +48,7 @@ async def test_resume_external_status_update(harness):
     await dispatcher.inbound(WA, IDENTITY, attachments=[{"filename": "Audited.pdf"}])
     await dispatcher.resume_external(WA, IDENTITY, {"name": "ACME"})
     await dispatcher.resume_external(
-        WA, IDENTITY, {"shareholders": [{"name": "A", "percentage": 100}]}
+        WA, IDENTITY, {"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]}
     )
     await dispatcher.inbound(
         WA,

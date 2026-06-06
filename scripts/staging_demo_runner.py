@@ -224,9 +224,20 @@ def run(base_url: str, identity: str, channel: str) -> int:
     )
     report("6.buyers", ok, out, ms)
 
+    shareholders_data = {
+        "shareholders": [
+            {
+                "name": "Developer Shareholder",
+                "phoneNumber": "+97455500001",
+                "firstName": "Developer",
+                "lastName": "Shareholder",
+                "email": "developer.shareholder@example.com",
+            }
+        ]
+    }
     ok, out, ms = _step(
         client, "7.shareholders", "/workflow/inbound",
-        {**inbound, "data": {"shareholders": [{"name": "Developer", "percentage": 100}]}},
+        {**inbound, "data": shareholders_data},
         expected_prompt_step="documents",
     )
     report("7.shareholders", ok, out, ms)

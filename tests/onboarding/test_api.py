@@ -143,3 +143,49 @@ def test_duplicate_event_id_is_deduped() -> None:
     second = event()
     assert second.status_code == 200
     assert second.json() == {"deduped": True}
+
+
+def test_inbound_duplicate_message_id_is_deduped() -> None:
+    """Inbound bridges (Meta-WhatsApp / SendGrid) may re-deliver the same
+    payload on transient bridge-side errors. When the bridge supplies a
+    ``message_id`` (or the ``X-Madad-Message-Id`` header), the dispatcher
+    dedupes — the duplicate POST gets 200 ``{"deduped": true}`` and does
+    not re-play through the workflow."""
+
+    identity = "+97455509888"
+    body = {
+        "channel": "whatsapp",
+        "identity": identity,
+        "text": "hi",
+        "message_id": "wamid.dedup-test-1",
+    }
+
+    first = client.post("/workflow/inbound", json=body)
+    assert first.status_code == 200
+    assert first.json().get("deduped") is not True  # first call ran the workflow
+
+    second = client.post("/workflow/inbound", json=body)
+    assert second.status_code == 200
+    assert second.json() == {"deduped": True}
+
+
+def test_inbound_message_id_from_header_takes_precedence() -> None:
+    """Bridges can supply the message_id via the X-Madad-Message-Id header
+    instead of the body; the header wins when both are present."""
+
+    identity = "+97455509999"
+    first = client.post(
+        "/workflow/inbound",
+        json={"channel": "whatsapp", "identity": identity, "text": "hi"},
+        headers={"X-Madad-Message-Id": "wamid.header-test-1"},
+    )
+    assert first.status_code == 200
+    assert first.json().get("deduped") is not True
+
+    second = client.post(
+        "/workflow/inbound",
+        json={"channel": "whatsapp", "identity": identity, "text": "anything"},
+        headers={"X-Madad-Message-Id": "wamid.header-test-1"},
+    )
+    assert second.status_code == 200
+    assert second.json() == {"deduped": True}

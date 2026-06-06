@@ -92,6 +92,13 @@ class InboundRequest(BaseModel):
     # rather than free text or attachments. The dispatcher merges this into
     # the resume payload as top-level keys.
     data: dict[str, Any] = Field(default_factory=dict)
+    # Source bridge's unique identifier for the inbound message (Meta wamid,
+    # SendGrid Message-ID, etc.). When supplied, the dispatcher dedupes the
+    # call so a retried webhook from the bridge does not re-play the same
+    # user reply through the workflow. Optional — bridges that prefer to
+    # supply it as the ``X-Madad-Message-Id`` header may also do so; the
+    # header wins when both are present.
+    message_id: str | None = None
 
 
 class BackendEventRequest(BaseModel):
@@ -142,15 +149,32 @@ async def start_campaign(req: CampaignStartRequest, platform: Platform) -> RunSt
     return RunStatusDTO.from_result(result)
 
 
-@app.post("/workflow/inbound", response_model=RunStatusDTO)
-async def inbound(req: InboundRequest, platform: Platform) -> RunStatusDTO:
+@app.post("/workflow/inbound", response_model=None)
+async def inbound(
+    req: InboundRequest,
+    platform: Platform,
+    x_madad_message_id: Annotated[str | None, Header()] = None,
+) -> RunStatusDTO | JSONResponse:
+    """Normalized inbound message chokepoint.
+
+    The source bridge (Madad's Meta-WhatsApp / SendGrid inbound adapters)
+    posts here with the channel-identity tuple plus any text/attachments
+    the user sent. When a ``message_id`` is supplied (header wins over body
+    field), the call is deduped — duplicate posts return 200 with
+    ``{"deduped": true}`` so the source bridge does not keep retrying.
+    """
+
+    message_id = x_madad_message_id or req.message_id
     result = await platform.dispatcher.inbound(
         req.channel,
         req.identity,
         text=req.text,
         attachments=req.attachments,
         data=req.data or None,
+        message_id=message_id,
     )
+    if result is None:
+        return JSONResponse(status_code=200, content={"deduped": True})
     return RunStatusDTO.from_result(result)
 
 

@@ -119,24 +119,27 @@ class OnboardingDispatcher:
     def allowed_event_types(self) -> frozenset[str]:
         return self._allowed
 
-    async def on_inbound(self, message: Any) -> ExecutionResult:
+    async def on_inbound(self, message: Any) -> ExecutionResult | None:
         """Start or resume the workflow for an inbound channel message.
 
         ``message`` is a communication ``Message`` (duck-typed: channel,
-        identity, text, attachments).
+        identity, text, attachments). Returns None when a non-None
+        ``message_id`` is rejected by the dedupe layer (caller responds 200
+        so the source bridge does not retry).
         """
 
         channel = message.channel
         identity = message.identity
+        message_id = getattr(message, "message_id", None)
         payload = {
             "text": message.text,
             "attachments": [
                 {"filename": a.filename, "provider_ref": a.provider_ref}
                 for a in getattr(message, "attachments", [])
             ],
-            "message_id": getattr(message, "message_id", None),
+            "message_id": message_id,
         }
-        return await self._dispatch(channel, identity, payload)
+        return await self._dispatch(channel, identity, payload, message_id=message_id)
 
     async def inbound(
         self,
@@ -146,19 +149,27 @@ class OnboardingDispatcher:
         text: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         data: dict[str, Any] | None = None,
-    ) -> ExecutionResult:
+        message_id: str | None = None,
+    ) -> ExecutionResult | None:
         """Start/resume from a normalized inbound message (API/testing entry).
 
         ``data`` carries an arbitrary structured payload (eligibility form,
         buyer / shareholder capture); its keys are merged into the resume
         payload at the top level so the workflow's form-await nodes see
         them directly.
+
+        ``message_id`` is the source bridge's unique id for the inbound
+        message (Meta's ``wamid``, SendGrid's ``Message-ID``, etc.). When
+        supplied, the call is deduplicated through the shared dedupe layer
+        with the prefix ``inbound:`` so the same Meta payload re-delivered
+        on a network retry is not re-played through the workflow. Returns
+        None on duplicate.
         """
 
         payload: dict[str, Any] = {"text": text, "attachments": attachments or []}
         if data:
             payload.update(data)
-        return await self._dispatch(channel, identity, payload)
+        return await self._dispatch(channel, identity, payload, message_id=message_id)
 
     async def resume_external(
         self, channel: Channel, identity: str, payload: dict[str, Any]
@@ -192,8 +203,15 @@ class OnboardingDispatcher:
         return await self.resume_external(channel, identity, resume_payload)
 
     async def _dispatch(
-        self, channel: Channel, identity: str, payload: dict[str, Any]
-    ) -> ExecutionResult:
+        self,
+        channel: Channel,
+        identity: str,
+        payload: dict[str, Any],
+        *,
+        message_id: str | None = None,
+    ) -> ExecutionResult | None:
+        if message_id is not None and not await self._dedupe.claim(f"inbound:{message_id}"):
+            return None
         session = await self._runtime.sessions.get(channel, identity)
         if session is not None and session.active_run_id:
             run = await self._runtime.run_store.get_or_none(session.active_run_id)

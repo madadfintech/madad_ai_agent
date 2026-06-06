@@ -153,6 +153,25 @@ def _infer_doc_type(filename: str) -> str | None:
     return None
 
 
+def _is_conflict_error(exc: BaseException) -> bool:
+    """True if any link in the exception's cause chain reports HTTP 409.
+
+    The MCP client wraps backend HTTP failures as ``MCPError("MCP tool
+    failed after N attempt(s)")`` with the underlying ``ToolError`` set as
+    ``__cause__``; the upstream status code is embedded in that cause's
+    message string (e.g. ``Madad API returned HTTP 409``).
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        message = str(cur)
+        if "HTTP 409" in message or "status_code\":409" in message:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 class OnboardingWorkflow(WorkflowDefinition):
     name = "onboarding"
     version = 1
@@ -739,10 +758,16 @@ class OnboardingWorkflow(WorkflowDefinition):
             try:
                 await self._kyc.add_buyer(access_token=state.access_token, data=data)
             except Exception as exc:  # noqa: BLE001 — degrade in staging
-                ctx.logger.warning(
-                    "add_buyer.failed", error=str(exc)[:200],
-                    note="staging-tolerant: continuing without buyer added",
-                )
+                if _is_conflict_error(exc):
+                    ctx.logger.info(
+                        "add_buyer.already_exists",
+                        note="backend 409: buyer already registered for this SME",
+                    )
+                else:
+                    ctx.logger.warning(
+                        "add_buyer.failed", error=str(exc)[:200],
+                        note="staging-tolerant: continuing without buyer added",
+                    )
         buyers = [*state.buyers, data] if data else list(state.buyers)
         return self._step("buyers_collect_await", ctx, buyers=buyers)
 

@@ -50,6 +50,9 @@ from typing import Any
 import httpx
 import jwt as pyjwt
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 BACKEND_IDENTITY = "tech.external1@madadfintech.com"
 BACKEND_CHANNEL = "email"
 
@@ -130,8 +133,18 @@ class McpClient:
         content = result.get("content") or []
         for item in content:
             if item.get("type") == "text":
-                parsed: dict[str, Any] = json.loads(item["text"])
-                return parsed
+                parsed = json.loads(item["text"])
+                # Unwrap Madad's universal {status_code, body} envelope.
+                if isinstance(parsed, dict) and "body" in parsed:
+                    body = parsed["body"]
+                    if isinstance(body, list):
+                        return {"items": body}
+                    if isinstance(body, dict):
+                        return body
+                if isinstance(parsed, list):
+                    return {"items": parsed}
+                if isinstance(parsed, dict):
+                    return parsed
         assert isinstance(result, dict)
         return result
 
@@ -413,30 +426,48 @@ def main() -> int:
         wa_narration=NARRATIONS["9_elig_webhook"],
     )
     all_ok &= ok
-    if isinstance(data, dict):
-        st = data.get("state") or {}
-        captured_payment_id = st.get("payment_id") or st.get("payment_provider_ref")
+    del data, captured_payment_id
 
-    # === SIDE CHANNEL: send the payment link to the USER's actual email ===
-    if captured_payment_id:
-        print(f"    → also sending payment link to {args.your_email} via MCP send_link …")
-        try:
-            session = mcp.call(
-                "madad_create_channel_session",
-                {"channel": "EMAIL", "identifier": BACKEND_IDENTITY},
-            )
-            mcp.call(
-                "madad_payments_send_monetization_payment_link",
-                {
-                    "access_token": session["accessToken"],
-                    "idempotency_key": f"live-demo-user-email-{nonce}",
-                    "payment_id": captured_payment_id,
-                    "recipient_email": args.your_email,
-                },
-            )
-            print(f"    ✅ Madad-branded payment email queued to {args.your_email}")
-        except Exception as e:
-            print(f"    ⚠ side-channel email failed: {repr(e)[:200]}")
+    # === SIDE CHANNEL: mint a fresh payment via MCP and send the link to the
+    # USER's actual email address (the workflow's send_link goes to the
+    # backend test SME's mailbox, not the demo viewer's). ===
+    print(f"    → minting side-channel payment + sending link to {args.your_email} via MCP …")
+    try:
+        session = mcp.call(
+            "madad_mcp_create_channel_session",
+            {"channel": "EMAIL", "identifier": BACKEND_IDENTITY},
+        )
+        token = session["accessToken"]
+        bd = mcp.call("madad_kyc_get_business_details", {"access_token": token})
+        bd_id = (bd.get("businessDetails") or {}).get("id") or bd.get("id")
+        products = mcp.call(
+            "madad_payments_list_monetization_products", {"access_token": token}
+        )
+        prod_list = products.get("items") or products.get("products") or []
+        onb = next(p for p in prod_list if p.get("code") == "onboarding")
+        cp = mcp.call(
+            "madad_payments_create_monetization_payment",
+            {
+                "access_token": token,
+                "idempotency_key": f"live-demo-create-{nonce}",
+                "business_details_id": bd_id,
+                "product_id": onb["id"],
+                "payable_amount": 6000,
+            },
+        )
+        new_payment_id = cp.get("id") or cp.get("payment_id")
+        mcp.call(
+            "madad_payments_send_monetization_payment_link",
+            {
+                "access_token": token,
+                "idempotency_key": f"live-demo-user-email-{nonce}",
+                "payment_id": new_payment_id,
+                "recipient_email": args.your_email,
+            },
+        )
+        print(f"    ✅ Madad-branded payment email queued to {args.your_email}")
+    except Exception as e:
+        print(f"    ⚠ side-channel email failed: {repr(e)[:200]}")
 
     ok, _ = _step(
         client, "10. webhook payment.completed", "/workflow/madad/events/payment.completed",

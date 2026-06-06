@@ -32,7 +32,16 @@ Usage::
         --financials-file real_docs/audited.pdf \\
         --kyc-dir         real_docs/kyc/
 
-Only stdlib + httpx + pyjwt required."""
+Only stdlib + httpx + pyjwt required.
+
+⚠️  WhatsApp delivery caveat: the agent uses ``madad_external_send_whatsapp_text``
+which is a free-form text send. Meta WhatsApp Business policy only delivers
+free-form text within a 24-hour conversation window — i.e. the recipient
+must have sent the business a message in the last 24h. Meta accepts the API
+call and returns a wamid either way, so a 201 response does NOT prove
+delivery. Before running the demo, message Madad's WhatsApp Business number
+once from --your-phone to open the window; otherwise the narrations will be
+silently dropped at Meta even though the API call succeeded."""
 
 from __future__ import annotations
 

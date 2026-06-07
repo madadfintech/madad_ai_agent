@@ -306,9 +306,7 @@ def _parse_shareholder_text(text: str, fallback_phone: str | None) -> list[dict[
 
 
 DEFAULT_WHATSAPP_REQUIRED_DOCS = [
-    # Business documents
-    "trade_license",
-    "tax_card",
+    # Business documents (Trade License + Tax Card are NOT collected by Madad)
     "national_address_certificate",
     "article_of_association",
     "establishment_card",
@@ -552,22 +550,11 @@ class OnboardingWorkflow(WorkflowDefinition):
             {"uploaded": "financials_upload_base64", "missing": "financials_await"},
         )
         graph.add_edge("financials_upload_base64", "documents_list_fetch")
-        graph.add_edge("documents_list_fetch", "buyers_collect_send")
-        graph.add_edge("buyers_collect_send", "buyers_collect_await")
-        graph.add_conditional_edges(
-            "buyers_collect_await",
-            self._route_buyer,
-            {"received": "shareholders_collect_send", "missing": "buyers_collect_await"},
-        )
-        graph.add_edge("shareholders_collect_send", "shareholders_collect_await")
-        graph.add_conditional_edges(
-            "shareholders_collect_await",
-            self._route_shareholders,
-            {
-                "received": "documents_upload_loop_send",
-                "missing": "shareholders_collect_await",
-            },
-        )
+        # Buyer + shareholder ASK steps are intentionally skipped — they are not
+        # in the spec PDF (shareholders come from the CR; buyers are collected
+        # later at invoice submission). Go straight from financials/pre-qualified
+        # to the document checklist.
+        graph.add_edge("documents_list_fetch", "documents_upload_loop_send")
         graph.add_edge("documents_upload_loop_send", "documents_upload_loop_await")
         graph.add_conditional_edges(
             "documents_upload_loop_await",

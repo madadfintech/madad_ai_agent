@@ -67,8 +67,11 @@ between turns.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
+
+import httpx
 
 from app.shared.workflow import (
     GraphBuilder,
@@ -213,6 +216,75 @@ def _is_casual_message(value: Any) -> bool:
 def _is_short_negative(value: Any) -> bool:
     text = reply_text(value).lower().strip()
     return is_no(value) or text in {"nope", "not now", "skip", "later"}
+
+
+# -- Smart (LLM) off-script replies ---------------------------------------
+# When the SME asks something off-script ("why do you need my CR?", "is this
+# safe?", "I already sent everything") we answer it in context with a small
+# OpenAI model instead of robotically re-prompting. Falls back to a canned line
+# whenever the key is unset or the call fails, so the flow never breaks.
+
+_SMART_SYSTEM_PROMPT = (
+    "You are Madad's friendly WhatsApp onboarding assistant. Madad is a "
+    "regulated business-finance company in Qatar that helps SMEs unlock cash "
+    "tied up in unpaid invoices owed by enterprise or government buyers. You are "
+    "chatting with a business owner during their onboarding. Read their message "
+    "and answer it directly, warmly and briefly — 1 to 3 short WhatsApp-style "
+    "sentences, an emoji is fine. Never invent rates, terms, approvals or "
+    "timelines. If they ask why a document or detail is needed, explain simply "
+    "that it is to verify the business and assess financing eligibility. For "
+    "account-specific status you don't know, reassure them the team is reviewing "
+    "and it will update soon. End by gently nudging them toward the current step. "
+    "Do NOT include any phone number."
+)
+
+
+async def _llm_answer(user_text: str, step_hint: str) -> str | None:
+    """Return a contextual LLM reply, or ``None`` if unavailable/failed.
+
+    Reads OpenAI config from the environment (same key the MCP cluster uses).
+    Any error (no key, network, bad response) yields ``None`` so the caller can
+    fall back to a canned line — the onboarding flow must never break on this.
+    """
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    text = (user_text or "").strip()
+    if not api_key or not text:
+        return None
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    base_url = (
+        os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+    )
+    try:
+        timeout = float(os.getenv("OPENAI_TIMEOUT", "15") or "15")
+    except ValueError:
+        timeout = 15.0
+    payload = {
+        "model": model,
+        "temperature": 0.4,
+        "max_tokens": 220,
+        "messages": [
+            {"role": "system", "content": _SMART_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": f"The current onboarding step expects: {step_hint}",
+            },
+            {"role": "user", "content": text[:1500]},
+        ],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        answer = (data["choices"][0]["message"]["content"] or "").strip()
+        return answer or None
+    except Exception:  # noqa: BLE001 — never break the flow on an LLM hiccup
+        return None
 
 
 def _valid_upload_attachments(value: Any) -> list[dict[str, Any]]:
@@ -1395,44 +1467,34 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "documents"})
-        help_template = _off_script_template(reply)
-        if help_template is not None:
-            await self._send(
-                ctx,
-                state,
-                "onboarding.help.contextual",
-                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+        # A backend webhook / status event (e.g. admin pre-qualified the user)
+        # can land on this step if they haven't uploaded yet. Do NOT re-send the
+        # document checklist — treat the document phase as satisfied and let the
+        # flow advance to the status/payment branch, carrying the status hint.
+        forced_status = _extract_journey_status(reply)
+        if forced_status is not None:
+            await self._reminders.suppress(
+                target_ref=state.madad_user_id or ctx.session_id
             )
             return self._step(
                 "documents_upload_loop_await",
                 ctx,
                 missing_documents=list(state.missing_documents),
-                documents_received=False,
-            )
-        if _is_status_query(reply) or _is_portal_query(reply):
-            await self._send(
-                ctx,
-                state,
-                "onboarding.help.contextual",
-                {
-                    "answer": "Your application is still in progress. We still need the remaining documents before submitting it for review.",
-                    "next_step": _next_step_hint(state),
-                },
-            )
-            return self._step(
-                "documents_upload_loop_await",
-                ctx,
-                missing_documents=list(state.missing_documents),
-                documents_received=False,
+                documents_received=True,
+                journey_status=forced_status,
+                last_status_source=_extract_status_source(reply),
             )
         attachments = _valid_upload_attachments(reply)
         if not attachments:
-            await self._send(
-                ctx,
-                state,
-                "onboarding.upload.required",
-                {"document": _format_documents(state.missing_documents)},
+            # No file — it's a question, a "no", or chit-chat. Answer it in
+            # context (the agent must actually understand, not robotically nag
+            # "text alone is not enough"), then stay parked for the upload.
+            fallback = (
+                "No problem 🙂 Whenever you have them, just send any of the "
+                "documents here as a PDF or photo and our team will take it "
+                "from there."
             )
+            await self._smart_contextual(ctx, state, reply, fallback)
             return self._step(
                 "documents_upload_loop_await",
                 ctx,
@@ -2052,6 +2114,33 @@ class OnboardingWorkflow(WorkflowDefinition):
         if parts:
             return parts[0], ""
         return "", ""
+
+    async def _smart_contextual(
+        self,
+        ctx: WorkflowContext,
+        state: OnboardingState,
+        reply: Any,
+        fallback_answer: str,
+    ) -> None:
+        """Answer an off-script message in context and re-state the current
+        step gently. Uses the OpenAI model when available (so the agent
+        actually understands questions like "why is CR needed?"), otherwise a
+        canned line — never the robotic "text alone is not enough" nag."""
+
+        hint = _next_step_hint(state)
+        answer = await _llm_answer(reply_text(reply), hint)
+        if answer:
+            # The model already nudges toward the next step, so don't repeat it.
+            next_step = ""
+        else:
+            answer = fallback_answer
+            next_step = hint
+        await self._send(
+            ctx,
+            state,
+            "onboarding.help.contextual",
+            {"answer": answer, "next_step": next_step},
+        )
 
     async def _send(
         self,

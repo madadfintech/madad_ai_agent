@@ -110,6 +110,13 @@ _TEMPLATE_BODIES = {
         "Please share your last Audited Financial Statement.\n\n"
         "For any query call us on 72773652."
     ),
+    "onboarding.financials.acknowledged": (
+        "Perfect! 🙌\n\n"
+        "You will receive your pre-qualification result within 24 hours.\n\n"
+        "Meanwhile, your account has been created on Madad with reference "
+        "number {{ application_ref }}. You can log in at madadfintech.com "
+        "and track your status anytime."
+    ),
     "onboarding.buyers.request": (
         "Please share your main buyer's details (name, country, contact)."
     ),
@@ -118,7 +125,8 @@ _TEMPLATE_BODIES = {
     ),
     "onboarding.documents.checklist": (
         "🎉 Congratulations! Your business is pre-qualified for financing.\n\n"
-        "You can have cash in your account within 5 working days of completing your application!\n\n"
+        "You can have cash in your account within 5 working days "
+        "of completing your application!\n\n"
         "We now need the following documents to complete your application:\n"
         "{{ documents }}\n\n"
         "📤 Share the documents here as individual PDFs/photos or as a ZIP file."

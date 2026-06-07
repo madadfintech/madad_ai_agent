@@ -81,6 +81,12 @@ class ChannelSession(BaseModel):
     refresh_token: str | None = None
     token_expires_at: int | None = None  # unix epoch seconds when known
     user_or_lead_ref: str | None = None
+    # Per Ishan (2026-06-07): the channel-session response also carries
+    # ``referenceNumber`` (= ``User.uniqueId`` on the backend) which is the
+    # user-facing application reference (e.g. ``Y6NICTES``, 8-char uppercase
+    # alphanumeric — NOT the 7-digit format the PDF mock shows). Populates
+    # immediately on account creation.
+    reference_number: str | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
 

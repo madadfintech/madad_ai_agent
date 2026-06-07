@@ -105,6 +105,7 @@ TEMPLATE_KEYS = [
     "onboarding.eligibility.intake.request",
     "onboarding.not_eligible",
     "onboarding.financials.request",
+    "onboarding.financials.acknowledged",
     "onboarding.buyers.request",
     "onboarding.shareholders.request",
     "onboarding.documents.checklist",
@@ -325,6 +326,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "financials_send": self._financials_send,
             "financials_await": self._financials_await,
             "financials_upload_base64": self._financials_upload_base64,
+            "financials_acknowledged_send": self._financials_acknowledged_send,
             # Step 5–6: docs + counterparties
             "documents_list_fetch": self._documents_list_fetch,
             "buyers_collect_send": self._buyers_collect_send,
@@ -413,7 +415,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             self._route_financials_upload,
             {"uploaded": "financials_upload_base64", "missing": "financials_await"},
         )
-        graph.add_edge("financials_upload_base64", "documents_list_fetch")
+        graph.add_edge("financials_upload_base64", "financials_acknowledged_send")
+        graph.add_edge("financials_acknowledged_send", "documents_list_fetch")
         graph.add_edge("documents_list_fetch", "buyers_collect_send")
         graph.add_edge("buyers_collect_send", "buyers_collect_await")
         graph.add_conditional_edges(
@@ -570,6 +573,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             refresh_token=session.refresh_token,
             token_expires_at=session.token_expires_at,
             madad_user_id=session.user_or_lead_ref,
+            application_ref=session.reference_number or state.application_ref,
         )
 
     async def _collect_onboarding_details_send(
@@ -590,6 +594,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             session_type=session.session_type,
             onboarding_token=session.onboarding_token,
             madad_user_id=session.user_or_lead_ref,
+            application_ref=session.reference_number or state.application_ref,
         )
 
     async def _collect_onboarding_details_await(
@@ -671,6 +676,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             refresh_token=session.refresh_token,
             token_expires_at=session.token_expires_at,
             madad_user_id=session.user_or_lead_ref,
+            application_ref=session.reference_number or state.application_ref,
         )
 
     # -- Step 2: consent + CR upload -----------------------------------------
@@ -878,6 +884,22 @@ class OnboardingWorkflow(WorkflowDefinition):
                 )
         return self._step("financials_upload_base64", ctx)
 
+    async def _financials_acknowledged_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        # PDF Step 3 — after audited financial report is in, the agent
+        # acknowledges receipt, sets the "result within 24 hours" expectation,
+        # and surfaces the Madad reference number (per Ishan 2026-06-07:
+        # `User.uniqueId` returned as `referenceNumber` on the channel-session
+        # response; 8-char uppercase alphanumeric — populates immediately).
+        await self._send(
+            ctx,
+            state,
+            "onboarding.financials.acknowledged",
+            variables={"application_ref": state.application_ref or ""},
+        )
+        return self._step("financials_acknowledged_send", ctx)
+
     # -- Step 5-6: admin-requested documents + counterparties ----------------
 
     async def _documents_list_fetch(
@@ -910,7 +932,11 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._send(ctx, state, "onboarding.buyers.request")
             return self._step("buyers_collect_await", ctx, buyers=list(state.buyers))
         buyer = reply if isinstance(reply, dict) else {}
-        if isinstance(reply, dict) and not any(k in reply for k in {"name", "cr_number", "contact_person", "contact_number", "contact_email", "buyer_type", "buyer_sector"}):
+        _BUYER_DICT_KEYS = {
+            "name", "cr_number", "contact_person", "contact_number",
+            "contact_email", "buyer_type", "buyer_sector",
+        }
+        if isinstance(reply, dict) and not any(k in reply for k in _BUYER_DICT_KEYS):
             parsed = _parse_buyer_text(reply_text(reply))
             if parsed:
                 buyer = parsed

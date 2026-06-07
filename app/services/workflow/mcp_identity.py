@@ -140,6 +140,7 @@ class McpMadadIdentityClient:
                 response.get("expiresInSeconds"),
             ),
             user_or_lead_ref=response.get("userOrLeadRef") or response.get("userId"),
+            reference_number=response.get("referenceNumber"),
             raw=response,
         )
 

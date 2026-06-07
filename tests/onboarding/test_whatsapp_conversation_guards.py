@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from app.shared.workflow import Channel
 
-
 WA = Channel.WHATSAPP
 IDENTITY = "+97455500001"
 

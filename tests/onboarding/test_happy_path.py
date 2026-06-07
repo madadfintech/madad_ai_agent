@@ -116,6 +116,7 @@ async def test_messages_sent_once_in_order(harness):
         "onboarding.consent.request",
         "onboarding.eligibility.intake.request",
         "onboarding.financials.request",
+        "onboarding.financials.acknowledged",
         "onboarding.buyers.request",
         "onboarding.shareholders.request",
         "onboarding.documents.checklist",

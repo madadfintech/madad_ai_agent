@@ -62,6 +62,8 @@ class OutboundMessageRequest(BaseModel):
     locale: Locale | None = None
     in_reply_to: str | None = None
     correlation_id: str | None = None
+    # Channel-specific extras (e.g. an interactive CTA-URL button under "cta").
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _exactly_one_body(self) -> OutboundMessageRequest:

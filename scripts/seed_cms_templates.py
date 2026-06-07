@@ -128,10 +128,27 @@ _TEMPLATE_BODIES = {
     ),
     "onboarding.documents.checklist": (
         "🎉 Congratulations! Your business is pre-qualified for financing.\n\n"
-        "You can have cash in your account within 5 working days of completing your application!\n\n"
-        "We now need the following documents to complete your application:\n"
-        "{{ documents }}\n\n"
-        "📤 Share the documents here as individual PDFs/photos or as a ZIP file."
+        "You can have cash in your account within 5 working days of completing "
+        "your application!\n\n"
+        "We now need the following documents to complete your application:\n\n"
+        "📁 Business Documents\n"
+        "1. National Address Certificate\n"
+        "2. Article of Association\n"
+        "3. Establishment Card\n\n"
+        "🏦 Financial Documents\n"
+        "✅ Audited Report 2025 — already received\n"
+        "4. Audited Report 2023\n"
+        "5. Audited Report 2022\n"
+        "6. Qatar Credit Bureau Report\n"
+        "7. Payable Ageing Schedule\n"
+        "8. Receivable Ageing Schedule\n"
+        "9. Interim Financial Statement\n"
+        "10. Bank Statement (last 6 months)\n\n"
+        "👤 Shareholder Documents (per shareholder from CR)\n"
+        "11. QID   12. Passport   13. Proof of Address\n\n"
+        "📤 Share the documents here or login at madadfintech.com to complete "
+        "your application.\n\n"
+        "Please share your documents to move forward!"
     ),
     "onboarding.documents.missing": (
         "✅ Got it — {{ received }} of {{ total }} documents received! 🙌\n\n"
@@ -140,7 +157,7 @@ _TEMPLATE_BODIES = {
         "No rush — send them one at a time or all together."
     ),
     "onboarding.documents.complete": (
-        "🎊 Great — all documents received!\n\n"
+        "🎊 Great — documents received!\n\n"
         "We will share your assessment report within 24 hours. If all looks good, "
         "we will forward your application to our banking partners in Qatar.\n\n"
         "Meanwhile, enjoy your coffee ☕\n\n"
@@ -165,18 +182,35 @@ _TEMPLATE_BODIES = {
         "Unfortunately your application wasn't accepted by our lender "
         "partners this time. Please reach out to our team."
     ),
+    # Body shown ABOVE the "Pay QAR … →" CTA button (no raw link — the button
+    # carries it). Used for the interactive WhatsApp send.
+    "onboarding.payment.request.button": (
+        "Hello! 👋\n\n"
+        "Your application has been reviewed by our team. Here is your result:\n\n"
+        "📊 Madad Score: {{ score }}/100 · Strong\n\n"
+        "Based on this score, we believe you have high chances of getting approval "
+        "from our banking partners. 💪\n\n"
+        "Your application is ready to be forwarded.\n"
+        "To submit your application to the banks, a one-time onboarding and assessment "
+        "fee of QAR {{ amount }} is required.\n\n"
+        "To know more about our pricing, visit madadfintech.com/pricing.\n\n"
+        "Once payment is received, your application will be forwarded immediately."
+    ),
+    # Plain-text fallback (when interactive buttons are unavailable) — keeps the
+    # tappable link inline.
     "onboarding.payment.request": (
         "Hello! 👋\n\n"
-        "Your application has been reviewed by our team. Based on this score, "
-        "we believe you have high chances of getting approval from our banking partners. 💪\n\n"
+        "Your application has been reviewed by our team. Here is your result:\n\n"
+        "📊 Madad Score: {{ score }}/100 · Strong\n\n"
+        "Based on this score, we believe you have high chances of getting approval "
+        "from our banking partners. 💪\n\n"
         "Your application is ready to be forwarded.\n"
-        "To submit your application to the banks, a one-time onboarding and assessment fee "
-        "of QAR {{ amount }} is required.\n\n"
+        "To submit your application to the banks, a one-time onboarding and assessment "
+        "fee of QAR {{ amount }} is required.\n\n"
         "Pay QAR {{ amount }} →\n"
         "{{ payment_link }}\n\n"
         "To know more about our pricing, visit madadfintech.com/pricing.\n\n"
-        "Once payment is received, your application will be forwarded immediately.\n\n"
-        "Reference: {{ provider_ref }}"
+        "Once payment is received, your application will be forwarded immediately."
     ),
     "onboarding.offers.preview": (
         "🎉 Exciting news — your financing offers are ready!\n\n"

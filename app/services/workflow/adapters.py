@@ -45,6 +45,37 @@ class CommunicationMessenger(Messenger):
             )
         )
 
+    async def send_cta_url(
+        self,
+        *,
+        channel: Channel,
+        identity: str,
+        template_key: str,
+        button_text: str,
+        button_url: str,
+        variables: dict[str, Any] | None = None,
+        locale: str = "en",
+    ) -> bool:
+        from app.services.communication.models import MessageStatus
+        from app.shared.i18n import Locale
+
+        message = await self._comms.send(
+            OutboundMessageRequest(
+                channel=channel,
+                identity=identity,
+                template_key=template_key,
+                variables=variables or {},
+                locale=Locale(locale),
+                metadata={
+                    "cta": {"button_text": button_text, "button_url": button_url}
+                },
+            )
+        )
+        # Only report success if the interactive send actually went out — the
+        # caller falls back to a plain-text message otherwise (e.g. when the
+        # backend interactive endpoint / MCP tool is not yet live).
+        return getattr(message, "status", None) == MessageStatus.SENT
+
 
 class NudgeReminders(Reminders):
     """Schedules/suppresses reminder sequences through the Nudge service."""

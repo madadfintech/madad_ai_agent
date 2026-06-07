@@ -62,19 +62,31 @@ async def test_filename_only_upload_does_not_advance(make_harness):
 
 async def _drive_to_documents(harness, runtime):
     """Advance a fresh WhatsApp run to the documents step (parked awaiting
-    uploads), using the live graph (no buyer/shareholder steps)."""
+    uploads), using the live PDF flow: YES → CR → audited financials → account
+    created (PARK) → pre-qualification trigger → document checklist.
+
+    No form-filling and no eligibility questionnaire — both removed per the PDF.
+    The pre-qualification is released by an external trigger (Postman in the
+    demo), simulated here with a prequalification.completed resume payload.
+    """
 
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     await runtime.resume(WA, IDENTITY, message={"text": "YES"})
-    await runtime.resume(WA, IDENTITY, message={"first_name": "Aisha", "last_name": "Karim"})
+    # CR upload → financials request.
     await runtime.resume(
         WA, IDENTITY, message={"attachments": [{"filename": "CR.pdf", "content_base64": DOC}]}
     )
-    await runtime.resume(WA, IDENTITY, message={"sector": "trade"})
-    return await runtime.resume(
+    # Audited financials → account-created → PARK at the pre-qualification gate.
+    await runtime.resume(
         WA,
         IDENTITY,
         message={"attachments": [{"filename": "Audited.pdf", "content_base64": DOC}]},
+    )
+    # Postman pre-qualification trigger → document checklist.
+    return await runtime.resume(
+        WA,
+        IDENTITY,
+        message={"event": "prequalification.completed", "journey_status": "PRE_QUALIFIED"},
     )
 
 
@@ -124,17 +136,48 @@ async def test_single_document_upload_completes_lenient(harness):
     assert "onboarding.documents.complete" in templates
 
 
-async def test_negative_reply_does_not_submit_eligibility(make_harness):
-    harness = make_harness(known_phones={IDENTITY: "user_42"})
+async def test_cr_upload_asks_for_financials_not_questionnaire(harness):
+    """After the CR the agent asks for the audited financials directly — the
+    eligibility questionnaire is not part of the PDF flow."""
+
     runtime = harness.platform.runtime
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     await runtime.resume(WA, IDENTITY, message={"text": "YES"})
-    await runtime.resume(
+
+    result = await runtime.resume(
         WA, IDENTITY, message={"attachments": [{"filename": "CR.pdf", "content_base64": DOC}]}
     )
 
-    result = await runtime.resume(WA, IDENTITY, message={"text": "No"})
-
-    assert result.prompt == {"waiting_for": "eligibility_form", "step": "eligibility"}
+    assert result.prompt == {"waiting_for": "upload", "step": "financials"}
     templates = harness.messenger.templates()
-    assert "onboarding.financials.request" not in templates
+    assert "onboarding.financials.request" in templates
+    assert "onboarding.eligibility.intake.request" not in templates
+
+
+async def test_payment_gate_waits_for_trigger(harness):
+    """After the coffee message the run PARKS — payment only fires on the
+    external trigger (Postman in the demo), carrying the Madad score."""
+
+    runtime = harness.platform.runtime
+    await _drive_to_documents(harness, runtime)
+    await runtime.resume(
+        WA,
+        IDENTITY,
+        message={"attachments": [{"filename": "IMG-001.jpg", "content_base64": DOC}]},
+    )
+
+    # Parked after coffee — a chat message must NOT trigger payment.
+    result = await runtime.resume(WA, IDENTITY, message={"text": "when do I pay?"})
+    assert result.prompt == {"waiting_for": "payment_ready", "step": "payment_wait"}
+    assert "onboarding.payment.request" not in harness.messenger.templates()
+    assert "onboarding.payment.request.button" not in harness.messenger.templates()
+
+    # Postman payment trigger → payment step fires.
+    await runtime.resume(
+        WA, IDENTITY, message={"event": "madad_score.ready", "payload": {"madadScore": 78}}
+    )
+    templates = harness.messenger.templates()
+    assert (
+        "onboarding.payment.request.button" in templates
+        or "onboarding.payment.request" in templates
+    )

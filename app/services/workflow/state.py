@@ -119,6 +119,13 @@ class OnboardingState(WorkflowState):
     buyers: list[dict[str, Any]] = []
     shareholders: list[dict[str, Any]] = []
 
+    # Postman-triggered gates (demo): the pre-qualification result (after the
+    # audited report) and the payment step (after the coffee message) are each
+    # released by an external trigger rather than auto-advancing.
+    prequalified: bool = False
+    payment_ready: bool = False
+    madad_score: int | None = None
+
     # Step 7–8: payment + offers.
     paid: bool = False
     offers: list[dict[str, Any]] = []

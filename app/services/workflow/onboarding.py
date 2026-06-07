@@ -120,6 +120,7 @@ TEMPLATE_KEYS = [
     "onboarding.payment.awaiting",
     "onboarding.not_qualified",
     "onboarding.payment.request",
+    "onboarding.payment.request.button",
     "onboarding.offers.preview",
     "onboarding.offer.handoff",
     "onboarding.activated",
@@ -538,6 +539,10 @@ class OnboardingWorkflow(WorkflowDefinition):
             "documents_upload_loop_send": self._documents_upload_loop_send,
             "documents_upload_loop_await": self._documents_upload_loop_await,
             "documents_complete": self._documents_complete,
+            # Postman-triggered gates (demo): pre-qualification (after audit)
+            # and payment (after coffee) are released by an external trigger.
+            "prequalify_wait_await": self._prequalify_wait_await,
+            "payment_wait_await": self._payment_wait_await,
             # Step 7: status poll + payment
             "status_poll_on_demand": self._status_poll_on_demand,
             "journey_wait_await": self._journey_wait_await,
@@ -575,7 +580,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             self._route_check_contact,
             {
                 "existing": "channel_session_first",
-                "new": "collect_onboarding_details_send",
+                "new": "complete_onboarding_send",
                 "blocked": "domain_blocked",
             },
         )
@@ -586,9 +591,10 @@ class OnboardingWorkflow(WorkflowDefinition):
             self._route_channel_session,
             {"consent": "consent_send"},
         )
-        # New-lead path: collect details → complete onboarding → second session.
-        graph.add_edge("collect_onboarding_details_send", "collect_onboarding_details_await")
-        graph.add_edge("collect_onboarding_details_await", "complete_onboarding_send")
+        # New-lead path: the spec says NO form-filling — we never ask the SME to
+        # type their name/CR/role. The account is created up front with safe
+        # placeholders (complete_onboarding fills sensible defaults) and the real
+        # business details are extracted from the CR document they upload next.
         graph.add_edge("complete_onboarding_send", "channel_session_second")
         graph.add_conditional_edges(
             "channel_session_second",
@@ -602,18 +608,11 @@ class OnboardingWorkflow(WorkflowDefinition):
             self._route_consent_upload,
             {"uploaded": "cr_upload_base64", "missing": "consent_await"},
         )
-        graph.add_edge("cr_upload_base64", "eligibility_intake_send")
-        graph.add_edge("eligibility_intake_send", "eligibility_intake_await")
-        graph.add_conditional_edges(
-            "eligibility_intake_await",
-            self._route_eligibility_intake,
-            {"received": "eligibility_update", "missing": "eligibility_intake_await"},
-        )
-        graph.add_conditional_edges(
-            "eligibility_update",
-            self._route_eligibility_status,
-            {"eligible": "financials_send", "ineligible": "not_eligible"},
-        )
+        # Spec Step 2: straight after the CR we ask for the audited financials.
+        # The quick eligibility questionnaire is NOT in the PDF — we treat the
+        # business as eligible (Qatar registration is verified from the CR) and
+        # skip it entirely.
+        graph.add_edge("cr_upload_base64", "financials_send")
 
         graph.add_edge("financials_send", "financials_await")
         graph.add_conditional_edges(
@@ -621,11 +620,18 @@ class OnboardingWorkflow(WorkflowDefinition):
             self._route_financials_upload,
             {"uploaded": "financials_upload_base64", "missing": "financials_await"},
         )
-        graph.add_edge("financials_upload_base64", "documents_list_fetch")
+        # Spec Step 3 → pre-qualification: after the audited report + account-
+        # created message, PARK until the pre-qualification is triggered (via
+        # Postman in the demo). On trigger → the document checklist.
+        graph.add_edge("financials_upload_base64", "prequalify_wait_await")
+        graph.add_conditional_edges(
+            "prequalify_wait_await",
+            self._route_prequalify_wait,
+            {"go": "documents_list_fetch", "wait": "prequalify_wait_await"},
+        )
         # Buyer + shareholder ASK steps are intentionally skipped — they are not
         # in the spec PDF (shareholders come from the CR; buyers are collected
-        # later at invoice submission). Go straight from financials/pre-qualified
-        # to the document checklist.
+        # later at invoice submission). Go straight to the document checklist.
         graph.add_edge("documents_list_fetch", "documents_upload_loop_send")
         graph.add_edge("documents_upload_loop_send", "documents_upload_loop_await")
         graph.add_conditional_edges(
@@ -637,7 +643,15 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "await_again": "documents_upload_loop_await",
             },
         )
-        graph.add_edge("documents_complete", "status_poll_on_demand")
+        # Spec Step 5 → payment: after the coffee message, PARK until the payment
+        # step is triggered (via Postman in the demo). On trigger → Madad score +
+        # the "Pay QAR 6,000 →" button.
+        graph.add_edge("documents_complete", "payment_wait_await")
+        graph.add_conditional_edges(
+            "payment_wait_await",
+            self._route_payment_wait,
+            {"go": "business_details_fetch", "wait": "payment_wait_await"},
+        )
 
         graph.add_conditional_edges(
             "status_poll_on_demand",
@@ -1552,6 +1566,71 @@ class OnboardingWorkflow(WorkflowDefinition):
         await self._send(ctx, state, "onboarding.documents.complete")
         return self._step("documents_complete", ctx)
 
+    # -- Postman-triggered gates (pre-qualification + payment) ----------------
+
+    @staticmethod
+    def _is_prequalify_trigger(payload: Any) -> bool:
+        if _extract_journey_status(payload) is not None:
+            return True
+        if isinstance(payload, dict):
+            event = payload.get("event") or payload.get("event_type")
+            return event in {
+                "prequalification.completed",
+                "eligibility.updated",
+                "documents.completed",
+            }
+        return False
+
+    @staticmethod
+    def _is_payment_trigger(payload: Any) -> bool:
+        if isinstance(payload, dict):
+            event = payload.get("event") or payload.get("event_type")
+            if event in {"madad_score.ready", "payment.requested"}:
+                return True
+        status = _extract_journey_status(payload)
+        return status in {JourneyStatus.QUALIFIED, JourneyStatus.PRE_QUALIFIED}
+
+    async def _prequalify_wait_await(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        # PARK after the account-created message until the pre-qualification is
+        # triggered (Postman in the demo). Any user chat meanwhile is answered,
+        # not ignored — we never re-send or stall on it.
+        payload = await_input({"waiting_for": "prequalification", "step": "prequalify_wait"})
+        if self._is_prequalify_trigger(payload):
+            return self._step("prequalify_wait_await", ctx, prequalified=True)
+        await self._smart_contextual(
+            ctx,
+            state,
+            payload,
+            "Thanks! 🙌 Your pre-qualification result will be ready soon — I’ll "
+            "share your document checklist here the moment it’s confirmed.",
+        )
+        return self._step("prequalify_wait_await", ctx, prequalified=False)
+
+    async def _payment_wait_await(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        # PARK after the coffee message until the payment step is triggered
+        # (Postman in the demo). Capture the Madad score from the trigger payload.
+        payload = await_input({"waiting_for": "payment_ready", "step": "payment_wait"})
+        if self._is_payment_trigger(payload):
+            score = _extract_madad_score(payload)
+            return self._step(
+                "payment_wait_await",
+                ctx,
+                payment_ready=True,
+                **({"madad_score": score} if score is not None else {}),
+            )
+        await self._smart_contextual(
+            ctx,
+            state,
+            payload,
+            "You’re all set — our team is finalising your assessment. I’ll share "
+            "your Madad score and the next step here shortly. 🙂",
+        )
+        return self._step("payment_wait_await", ctx, payment_ready=False)
+
     # -- Step 7: status poll + payment ----------------------------------------
 
     async def _status_poll_on_demand(
@@ -1729,12 +1808,37 @@ class OnboardingWorkflow(WorkflowDefinition):
         # backend's send-monetization-payment-link tool (it routes through
         # an upstream notification provider that has been flaky in UAT and
         # adds no value over our own send).
+        amount = f"{ONBOARDING_FEE_QAR:,}"
+        score = state.madad_score if state.madad_score is not None else 78
         variables = {
-            "amount":         f"{ONBOARDING_FEE_QAR:,}",
+            "amount":         amount,
+            "score":          score,
             "payment_link":   state.payment_link or "",
             "provider_ref":   state.payment_provider_ref or "",
         }
-        await self._send(ctx, state, "onboarding.payment.request", variables)
+        # Spec Step 5: a tappable "Pay QAR 6,000 →" button (interactive CTA-URL)
+        # instead of a raw link. Falls back to the plain-text message (with the
+        # link inline) if the interactive path isn't available.
+        sent_as_button = False
+        if ctx.channel is Channel.WHATSAPP and state.payment_link:
+            try:
+                sent_as_button = await self._msg.send_cta_url(
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    template_key="onboarding.payment.request.button",
+                    button_text=f"Pay QAR {amount} →",
+                    button_url=state.payment_link,
+                    variables=variables,
+                    locale=state.locale,
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back to text
+                ctx.logger.warning(
+                    "payment_send_link.cta_failed",
+                    error=str(exc)[:200],
+                    note="falling back to plain-text payment message",
+                )
+        if not sent_as_button:
+            await self._send(ctx, state, "onboarding.payment.request", variables)
         await self._reminders.schedule(
             "payment_pending",
             channel=_channel(ctx),
@@ -1955,6 +2059,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         # Lenient: SMEs send many docs at once and won't upload every item, so as
         # soon as ANY document arrives we move on ("our team will review them").
         return "complete" if state.documents_received else "await_again"
+
+    def _route_prequalify_wait(self, state: OnboardingState) -> str:
+        return "go" if state.prequalified else "wait"
+
+    def _route_payment_wait(self, state: OnboardingState) -> str:
+        return "go" if state.payment_ready else "wait"
 
     def _route_payment(self, state: OnboardingState) -> str:
         return "paid" if state.paid else "unpaid"
@@ -2200,3 +2310,21 @@ def _extract_journey_status(payload: Any) -> JourneyStatus | None:
         return JourneyStatus(raw)
     except ValueError:
         return None
+
+
+def _extract_madad_score(payload: Any) -> int | None:
+    """Pull a Madad score off a trigger payload. The score may sit at the top
+    level or nested under ``payload`` (the backend webhook wraps it)."""
+
+    if not isinstance(payload, dict):
+        return None
+    candidates: list[Any] = [payload.get("madadScore"), payload.get("madad_score")]
+    inner = payload.get("payload")
+    if isinstance(inner, dict):
+        candidates += [inner.get("madadScore"), inner.get("madad_score")]
+    for value in candidates:
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    return None

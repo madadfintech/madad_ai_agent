@@ -129,10 +129,11 @@ _TEMPLATE_BODIES = {
         "📤 Share the documents here as individual PDFs/photos or as a ZIP file."
     ),
     "onboarding.documents.missing": (
-        "We've processed what you sent. ✅\n\n"
-        "⚠️ Still needed:\n"
+        "✅ Got it — thanks for sending that! 🙌 I've ticked it off your checklist.\n\n"
+        "Here's what's still needed:\n"
         "{{ documents }}\n\n"
-        "Please send the missing items and I'll update the checklist."
+        "No rush — send them one at a time or all together, and I'll keep the "
+        "checklist updated as they come in."
     ),
     "onboarding.documents.complete": (
         "🎊 Great — all documents received!\n\n"

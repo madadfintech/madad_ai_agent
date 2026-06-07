@@ -305,9 +305,22 @@ def _parse_shareholder_text(text: str, fallback_phone: str | None) -> list[dict[
 
 
 DEFAULT_WHATSAPP_REQUIRED_DOCS = [
+    # Business documents
     "trade_license",
     "tax_card",
+    "national_address_certificate",
+    "article_of_association",
+    "establishment_card",
+    # Financial documents (Audited Financial Statement already collected earlier)
+    "credit_bureau_report",
+    "payable_ageing",
+    "receivable_ageing",
+    "interim_statement",
     "bank_statement",
+    # Shareholder documents
+    "qid",
+    "passport",
+    "proof_of_address",
 ]
 
 DOCUMENT_LABELS = {

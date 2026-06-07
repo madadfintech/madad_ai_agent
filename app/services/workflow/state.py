@@ -12,7 +12,7 @@ from app.shared.workflow.state import WorkflowState
 
 from .ports import ChannelSession, ContactCheckResult, SessionType
 
-StatusSource = Literal["webhook", "poll"]
+StatusSource = Literal["webhook", "poll", "chat"]
 
 
 class JourneyStatus(StrEnum):

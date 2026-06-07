@@ -166,6 +166,15 @@ STATUS_KEYWORDS = (
     "application",
 )
 
+PORTAL_KEYWORDS = (
+    "portal",
+    "link",
+    "url",
+    "madad id",
+    "application id",
+    "reference",
+)
+
 CASUAL_KEYWORDS = (
     "hi",
     "hello",
@@ -190,9 +199,19 @@ def _is_status_query(value: Any) -> bool:
     return any(keyword in text for keyword in STATUS_KEYWORDS)
 
 
+def _is_portal_query(value: Any) -> bool:
+    text = reply_text(value).lower()
+    return any(keyword in text for keyword in PORTAL_KEYWORDS)
+
+
 def _is_casual_message(value: Any) -> bool:
     text = reply_text(value).lower().strip()
     return any(text == keyword or text.startswith(f"{keyword} ") for keyword in CASUAL_KEYWORDS)
+
+
+def _is_short_negative(value: Any) -> bool:
+    text = reply_text(value).lower().strip()
+    return is_no(value) or text in {"nope", "not now", "skip", "later"}
 
 
 def _valid_upload_attachments(value: Any) -> list[dict[str, Any]]:
@@ -225,6 +244,47 @@ def _parse_buyer_text(text: str) -> dict[str, Any]:
     return {
         "name": lines[0],
         **({"contact_email": contact_email} if contact_email else {}),
+    }
+
+
+def _parse_eligibility_text(text: str) -> dict[str, Any]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lowered = text.lower()
+    if len(lines) < 5 or lowered.strip() in {"yes", "no", "y", "n"}:
+        return {}
+
+    def first_number(value: str) -> str | None:
+        match = re.search(r"\d+(?:\.\d+)?", value)
+        return match.group(0) if match else None
+
+    business_age = DEFAULT_ELIGIBILITY_FORM["business_age"]
+    age_number = first_number(text)
+    if age_number is not None:
+        age = float(age_number)
+        if age >= 5:
+            business_age = "OVER_5_YEARS"
+        elif age > 2:
+            business_age = "OVER_2_YEARS_UNDER_5"
+
+    company_type = DEFAULT_ELIGIBILITY_FORM["company_type"]
+    if "sole" in lowered:
+        company_type = "SOLE"
+    elif "partner" in lowered:
+        company_type = "PARTNERSHIP"
+    elif "llc" in lowered:
+        company_type = "LLC"
+
+    turnover = first_number(lines[5]) if len(lines) > 5 else None
+    employees = first_number(lines[6]) if len(lines) > 6 else None
+
+    return {
+        "is_qatar_based": "qatar" in lowered or lowered.startswith("yes"),
+        "business_age": business_age,
+        "cr_validity": "UNDER_1_MONTH" if "valid" in lowered else "OVER_3_MONTHS",
+        "company_type": company_type,
+        "sector": lines[4] if len(lines) > 4 else DEFAULT_ELIGIBILITY_FORM["sector"],
+        "turnover": turnover or DEFAULT_ELIGIBILITY_FORM["turnover"],
+        "employees": employees or DEFAULT_ELIGIBILITY_FORM["employees"],
     }
 
 
@@ -455,7 +515,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         )
         graph.add_edge("cr_upload_base64", "eligibility_intake_send")
         graph.add_edge("eligibility_intake_send", "eligibility_intake_await")
-        graph.add_edge("eligibility_intake_await", "eligibility_update")
+        graph.add_conditional_edges(
+            "eligibility_intake_await",
+            self._route_eligibility_intake,
+            {"received": "eligibility_update", "missing": "eligibility_intake_await"},
+        )
         graph.add_conditional_edges(
             "eligibility_update",
             self._route_eligibility_status,
@@ -489,7 +553,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         graph.add_conditional_edges(
             "documents_upload_loop_await",
             self._route_documents,
-            {"complete": "documents_complete", "missing": "documents_upload_loop_send"},
+            {
+                "complete": "documents_complete",
+                "missing": "documents_upload_loop_send",
+                "await_again": "documents_upload_loop_await",
+            },
         )
         graph.add_edge("documents_complete", "status_poll_on_demand")
 
@@ -505,7 +573,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "wait": "journey_wait_await",
             },
         )
-        graph.add_edge("journey_wait_await", "status_poll_on_demand")
+        graph.add_conditional_edges(
+            "journey_wait_await",
+            self._route_status_resume,
+            {"poll": "status_poll_on_demand", "await_again": "journey_wait_await"},
+        )
 
         # Payment chain: business details → product lookup → create (with
         # idempotency_key) → send link (with idempotency_key) → await.
@@ -531,7 +603,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "wait": "lender_wait_await",
             },
         )
-        graph.add_edge("lender_wait_await", "lender_status_poll")
+        graph.add_conditional_edges(
+            "lender_wait_await",
+            self._route_status_resume,
+            {"poll": "lender_status_poll", "await_again": "lender_wait_await"},
+        )
 
         graph.add_edge("offers_fetch", "offer_view_send")
         graph.add_edge("offer_view_send", "offer_handoff_to_madad")
@@ -753,6 +829,26 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "onboarding.help.contextual",
                 {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
             )
+            return self._step("consent_await", ctx, consent=False)
+        if _is_status_query(reply) or _is_portal_query(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": "Your application is still in progress. We still need your CR before submitting it.",
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return self._step("consent_await", ctx, consent=False)
+        if _is_casual_message(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": "I’m here and ready to help.", "next_step": _next_step_hint(state)},
+            )
+            return self._step("consent_await", ctx, consent=False)
         attachments = _valid_upload_attachments(reply)
         if not attachments:
             await self._send(
@@ -813,10 +909,46 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "eligibility_form", "step": "eligibility"})
+        help_template = _off_script_template(reply)
+        if help_template is not None:
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
+            return self._step("eligibility_intake_await", ctx, eligibility_form_data={})
+        if _is_status_query(reply) or _is_portal_query(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": "Your application is still in progress. We have not submitted it yet.",
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return self._step("eligibility_intake_await", ctx, eligibility_form_data={})
+        if _is_casual_message(reply) or _is_short_negative(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": "No worries — I will not submit that as your eligibility details.",
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return self._step("eligibility_intake_await", ctx, eligibility_form_data={})
+
         form = reply if isinstance(reply, dict) else {}
         form_data = {
             k: v for k, v in form.items() if k not in {"type", "text", "attachments"}
         }
+        if not form_data:
+            form_data = _parse_eligibility_text(reply_text(reply))
+        if not form_data:
+            await self._send(ctx, state, "onboarding.eligibility.intake.request")
         await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
         return self._step(
             "eligibility_intake_await", ctx, eligibility_form_data=form_data
@@ -910,6 +1042,26 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "onboarding.help.contextual",
                 {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
             )
+            return self._step("financials_await", ctx, financials_received=False)
+        if _is_status_query(reply) or _is_portal_query(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": "Your application is still in progress. We still need your audited financial statement before submitting it.",
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return self._step("financials_await", ctx, financials_received=False)
+        if _is_casual_message(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": "I’m here and ready to help.", "next_step": _next_step_hint(state)},
+            )
+            return self._step("financials_await", ctx, financials_received=False)
         attachments = _valid_upload_attachments(reply)
         await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
         if not attachments:
@@ -982,10 +1134,31 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "onboarding.help.contextual",
                 {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
             )
-            await self._send(ctx, state, "onboarding.buyers.request")
+            return self._step("buyers_collect_await", ctx, buyers=list(state.buyers))
+        if _is_status_query(reply) or _is_portal_query(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": "Your application is still in progress. We still need your main buyer details before submitting it.",
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return self._step("buyers_collect_await", ctx, buyers=list(state.buyers))
+        if _is_casual_message(reply) or _is_short_negative(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": "No problem — I will not submit that as buyer details.",
+                    "next_step": _next_step_hint(state),
+                },
+            )
             return self._step("buyers_collect_await", ctx, buyers=list(state.buyers))
         buyer = reply if isinstance(reply, dict) else {}
-        if isinstance(reply, dict) and not any(k in reply for k in {"name", "cr_number", "contact_person", "contact_number", "contact_email", "buyer_type", "buyer_sector"}):
+        if not any(k in buyer for k in {"name", "cr_number", "contact_person", "contact_number", "contact_email", "buyer_type", "buyer_sector"}):
             parsed = _parse_buyer_text(reply_text(reply))
             if parsed:
                 buyer = parsed
@@ -1035,7 +1208,32 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "onboarding.help.contextual",
                 {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
             )
-            await self._send(ctx, state, "onboarding.shareholders.request")
+            return self._step(
+                "shareholders_collect_await", ctx, shareholders=list(state.shareholders)
+            )
+        if _is_status_query(reply) or _is_portal_query(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": "Your application is still in progress. We still need shareholder details before submitting it.",
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return self._step(
+                "shareholders_collect_await", ctx, shareholders=list(state.shareholders)
+            )
+        if _is_casual_message(reply) or _is_short_negative(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": "No problem — I will not submit that as shareholder details.",
+                    "next_step": _next_step_hint(state),
+                },
+            )
             return self._step(
                 "shareholders_collect_await", ctx, shareholders=list(state.shareholders)
             )
@@ -1128,6 +1326,28 @@ class OnboardingWorkflow(WorkflowDefinition):
                 state,
                 "onboarding.help.contextual",
                 {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
+            return self._step(
+                "documents_upload_loop_await",
+                ctx,
+                missing_documents=list(state.missing_documents),
+                documents_received=False,
+            )
+        if _is_status_query(reply) or _is_portal_query(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": "Your application is still in progress. We still need the remaining documents before submitting it for review.",
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return self._step(
+                "documents_upload_loop_await",
+                ctx,
+                missing_documents=list(state.missing_documents),
+                documents_received=False,
             )
         attachments = _valid_upload_attachments(reply)
         if not attachments:
@@ -1232,7 +1452,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
             )
             return self._step(
-                "journey_wait_await", ctx, last_status_source="poll"
+                "journey_wait_await", ctx, last_status_source="chat"
             )
         if _is_casual_message(payload):
             await self._send(
@@ -1242,12 +1462,33 @@ class OnboardingWorkflow(WorkflowDefinition):
                 {"answer": "I’m here and tracking your application.", "next_step": _next_step_hint(state)},
             )
             return self._step(
-                "journey_wait_await", ctx, last_status_source="poll"
+                "journey_wait_await", ctx, last_status_source="chat"
+            )
+        if _is_portal_query(payload):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": await self._safe_portal_answer(state),
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return self._step(
+                "journey_wait_await", ctx, last_status_source="chat"
             )
         if _is_status_query(payload):
-            await self._send(ctx, state, "onboarding.status.pending")
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": await self._safe_status_answer(state),
+                    "next_step": _next_step_hint(state),
+                },
+            )
             return self._step(
-                "journey_wait_await", ctx, last_status_source="poll"
+                "journey_wait_await", ctx, last_status_source="chat"
             )
         source = _extract_status_source(payload)
         fields: dict[str, Any] = {"last_status_source": source}
@@ -1442,7 +1683,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "onboarding.help.contextual",
                 {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
             )
-            return self._step("lender_wait_await", ctx, last_status_source="poll")
+            return self._step("lender_wait_await", ctx, last_status_source="chat")
         if _is_casual_message(payload):
             await self._send(
                 ctx,
@@ -1450,10 +1691,29 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "onboarding.help.contextual",
                 {"answer": "I’m here and tracking your lender review.", "next_step": _next_step_hint(state)},
             )
-            return self._step("lender_wait_await", ctx, last_status_source="poll")
+            return self._step("lender_wait_await", ctx, last_status_source="chat")
+        if _is_portal_query(payload):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": await self._safe_portal_answer(state),
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return self._step("lender_wait_await", ctx, last_status_source="chat")
         if _is_status_query(payload):
-            await self._send(ctx, state, "onboarding.status.pending")
-            return self._step("lender_wait_await", ctx, last_status_source="poll")
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": await self._safe_status_answer(state),
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return self._step("lender_wait_await", ctx, last_status_source="chat")
         source = _extract_status_source(payload)
         fields: dict[str, Any] = {"last_status_source": source}
         forced = _extract_journey_status(payload)
@@ -1537,6 +1797,9 @@ class OnboardingWorkflow(WorkflowDefinition):
     def _route_eligibility_status(self, state: OnboardingState) -> str:
         return "eligible" if state.eligible else "ineligible"
 
+    def _route_eligibility_intake(self, state: OnboardingState) -> str:
+        return "received" if state.eligibility_form_data else "missing"
+
     def _route_financials_upload(self, state: OnboardingState) -> str:
         return "uploaded" if state.financials_received else "missing"
 
@@ -1548,7 +1811,7 @@ class OnboardingWorkflow(WorkflowDefinition):
 
     def _route_documents(self, state: OnboardingState) -> str:
         if not state.documents_received:
-            return "missing"
+            return "await_again"
         return "missing" if state.missing_documents else "complete"
 
     def _route_payment(self, state: OnboardingState) -> str:
@@ -1568,6 +1831,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             return "activated"
         return "wait"
 
+    def _route_status_resume(self, state: OnboardingState) -> str:
+        return "await_again" if state.last_status_source == "chat" else "poll"
+
     # -- helpers --------------------------------------------------------------
 
     def _answer_for(self, template_key: str) -> str:
@@ -1584,6 +1850,39 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "business, collect required documents, and connect you with financing offers."
             )
         return "I can help with that."
+
+    async def _safe_status_answer(self, state: OnboardingState) -> str:
+        status = state.journey_status.value if state.journey_status else None
+        if state.access_token:
+            try:
+                info = await self._identity.me(access_token=state.access_token)
+                if isinstance(info, dict):
+                    status = (
+                        info.get("journeyStatus")
+                        or (info.get("user") or {}).get("journeyStatus")
+                        or status
+                    )
+            except Exception:
+                pass
+        if status:
+            return f"Your Madad application status is {status}. I’ll keep guiding you here as the next step becomes available."
+        return "Your Madad application is in progress. I’ll keep guiding you here as the next step becomes available."
+
+    async def _safe_portal_answer(self, state: OnboardingState) -> str:
+        unique_id = None
+        if state.access_token:
+            try:
+                info = await self._identity.me(access_token=state.access_token)
+                if isinstance(info, dict):
+                    user = info.get("user") if isinstance(info.get("user"), dict) else info
+                    unique_id = user.get("uniqueId") or user.get("unique_id")
+            except Exception:
+                pass
+        prefix = f"Your Madad ID is {unique_id}. " if unique_id else ""
+        return (
+            f"{prefix}For security, I can only share the SME-facing Madad portal: "
+            "madadfintech.com. I cannot share admin or lender portal links in this chat."
+        )
 
     async def _live_token(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -1649,6 +1948,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             user = info.get("user")
             if isinstance(user, dict):
                 raw_status = user.get("journeyStatus") or user.get("journey_status")
+            raw_status = raw_status or info.get("journeyStatus") or info.get("journey_status")
         if not isinstance(raw_status, str):
             return state.journey_status
         try:

@@ -204,7 +204,6 @@ _TEMPLATE_BODIES = {
         "Your application is ready to be forwarded.\n"
         "To submit your application to the banks, a one-time onboarding and assessment "
         "fee of QAR {{ amount }} is required.\n\n"
-        "To know more about our pricing, visit madadfintech.com/pricing.\n\n"
         "Once payment is received, your application will be forwarded immediately."
     ),
     # Plain-text fallback (when interactive buttons are unavailable) — keeps the
@@ -220,7 +219,6 @@ _TEMPLATE_BODIES = {
         "fee of QAR {{ amount }} is required.\n\n"
         "Pay QAR {{ amount }} →\n"
         "{{ payment_link }}\n\n"
-        "To know more about our pricing, visit madadfintech.com/pricing.\n\n"
         "Once payment is received, your application will be forwarded immediately."
     ),
     "onboarding.offers.preview": (

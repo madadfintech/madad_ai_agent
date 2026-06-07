@@ -121,6 +121,12 @@ _TEMPLATE_BODIES = {
     "onboarding.shareholders.request": (
         "Please share your shareholders' details (name, percentage)."
     ),
+    "onboarding.account.created": (
+        "Perfect! 🙌\n\n"
+        "You will receive your pre-qualification result within 24 hours.\n\n"
+        "Meanwhile, your account has been created on Madad with reference number "
+        "#{{ ref }}. You can login at madadfintech.com and track your status anytime."
+    ),
     "onboarding.documents.checklist": (
         "🎉 Congratulations! Your business is pre-qualified for financing.\n\n"
         "You can have cash in your account within 5 working days of completing your application!\n\n"

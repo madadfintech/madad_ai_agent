@@ -106,6 +106,7 @@ TEMPLATE_KEYS = [
     "onboarding.eligibility.intake.request",
     "onboarding.not_eligible",
     "onboarding.financials.request",
+    "onboarding.account.created",
     "onboarding.buyers.request",
     "onboarding.shareholders.request",
     "onboarding.documents.checklist",
@@ -1152,6 +1153,20 @@ class OnboardingWorkflow(WorkflowDefinition):
                     "financials_upload.failed", error=str(exc)[:200],
                     note="staging-tolerant: continuing without financials uploaded",
                 )
+        # Spec Step 3: right after the audited report, confirm the account is
+        # created and share the Madad reference number, before pre-qualification.
+        ref = ""
+        if state.access_token:
+            try:
+                info = await self._identity.me(access_token=state.access_token)
+                if isinstance(info, dict):
+                    user = info.get("user") if isinstance(info.get("user"), dict) else info
+                    ref = str(user.get("uniqueId") or user.get("unique_id") or "")
+            except Exception:  # noqa: BLE001
+                pass
+        if not ref:
+            ref = (re.sub(r"\D", "", ctx.identity or "")[-8:] or "MADAD")
+        await self._send(ctx, state, "onboarding.account.created", {"ref": ref})
         return self._step("financials_upload_base64", ctx)
 
     # -- Step 5-6: admin-requested documents + counterparties ----------------
@@ -1159,6 +1174,15 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _documents_list_fetch(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
+        # WhatsApp onboarding always shows the FULL Madad checklist. The backend's
+        # admin-requested list is only a subset (it omits docs the admin hasn't
+        # explicitly requested yet), which made the agent show just 3 items.
+        if ctx.channel is Channel.WHATSAPP:
+            return self._step(
+                "documents_list_fetch",
+                ctx,
+                missing_documents=list(DEFAULT_WHATSAPP_REQUIRED_DOCS),
+            )
         missing: list[str] = []
         if state.access_token:
             result = await self._kyc.get_admin_requested_documents(
@@ -1166,8 +1190,6 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             if isinstance(result, dict):
                 missing = list(result.get("missing", []))
-        if not missing and ctx.channel is Channel.WHATSAPP:
-            missing = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
         return self._step("documents_list_fetch", ctx, missing_documents=missing)
 
     async def _buyers_collect_send(
@@ -1868,9 +1890,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "received" if state.shareholders else "missing"
 
     def _route_documents(self, state: OnboardingState) -> str:
-        if not state.documents_received:
-            return "await_again"
-        return "missing" if state.missing_documents else "complete"
+        # Lenient: show the full checklist up front, but once the user has
+        # uploaded ANY document(s) we proceed to completion ("coffee"). Uploaded
+        # docs are counted; the rest can be requested later by the admin — we do
+        # not block the journey on every single item.
+        return "complete" if state.documents_received else "await_again"
 
     def _route_payment(self, state: OnboardingState) -> str:
         return "paid" if state.paid else "unpaid"

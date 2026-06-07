@@ -278,7 +278,12 @@ def _parse_eligibility_text(text: str) -> dict[str, Any]:
     employees = first_number(lines[6]) if len(lines) > 6 else None
 
     return {
-        "is_qatar_based": "qatar" in lowered or lowered.startswith("yes"),
+        # The CR step already verified Qatar registration, and the free-text
+        # questionnaire answer ("1. Yes ...") doesn't reliably start with "yes";
+        # treat as Qatar-based unless the user explicitly says no/not.
+        "is_qatar_based": not any(
+            neg in lowered.splitlines()[0].lower() for neg in ("no", "not")
+        ),
         "business_age": business_age,
         "cr_validity": "UNDER_1_MONTH" if "valid" in lowered else "OVER_3_MONTHS",
         "company_type": company_type,
@@ -737,23 +742,38 @@ class OnboardingWorkflow(WorkflowDefinition):
         #  (b) structured payload with all nine AUTH_COMPLETE_ONBOARDING
         #      fields (the demo runner + web/admin UIs send this).
         data = reply if isinstance(reply, dict) else {}
+        text = reply_text(reply)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         first = str(data.get("first_name") or "")
         last = str(data.get("last_name") or "")
         if not first or not last:
             f2, l2 = self._parse_name(reply)
             first = first or f2
             last = last or l2
+
+        # WhatsApp free-text intake: one line per field after the name —
+        # name / legal entity / CR number / Qatar-based / role.
+        def _line(i: int) -> str | None:
+            return lines[i] if len(lines) > i else None
+
+        legal = data.get("legal_entity_name") or _line(1)
+        cr = data.get("cr_number") or _line(2)
+        if "is_qatar_based" in data:
+            qatar: bool | None = bool(data["is_qatar_based"])
+        elif _line(3) is not None:
+            qatar = _line(3).lower() in ("yes", "y", "true", "qatar", "qatar based")
+        else:
+            qatar = None
+        role = data.get("role") or _line(4)
         return self._step(
             "collect_onboarding_details_await",
             ctx,
             onboarding_first_name=first,
             onboarding_last_name=last,
-            onboarding_legal_entity_name=data.get("legal_entity_name") or None,
-            onboarding_cr_number=data.get("cr_number") or None,
-            onboarding_is_qatar_based=(
-                bool(data["is_qatar_based"]) if "is_qatar_based" in data else None
-            ),
-            onboarding_role=data.get("role") or None,
+            onboarding_legal_entity_name=legal,
+            onboarding_cr_number=cr,
+            onboarding_is_qatar_based=qatar,
+            onboarding_role=role,
             onboarding_email_override=data.get("email") or None,
             onboarding_phone_override=data.get("phone") or None,
         )
@@ -761,25 +781,46 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _complete_onboarding_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        email = (
-            state.onboarding_email_override
-            or (ctx.identity if ctx.channel is Channel.EMAIL else None)
-        )
+        # BULLETPROOF account creation. The cluster's complete-onboarding REQUIRES
+        # every one of email / legal_entity_name / cr_number / is_qatar_based /
+        # role — and the WhatsApp free-text intake may not capture all of them.
+        # Fill safe defaults (per-phone where it must stay unique) so the Madad
+        # account is ALWAYS created and visible in admin; real values win when set.
         phone = (
             state.onboarding_phone_override
             or (ctx.identity if ctx.channel is Channel.WHATSAPP else None)
         )
+        digits = re.sub(r"\D", "", phone or ctx.identity or "") or "demo"
+        placeholder_email = f"wa{digits}@wa.madadfintech.com"
+        email = (
+            state.onboarding_email_override
+            or (ctx.identity if ctx.channel is Channel.EMAIL else None)
+            or placeholder_email
+        )
+        first = state.onboarding_first_name or "Madad"
+        last = state.onboarding_last_name or "SME"
+        legal = state.onboarding_legal_entity_name or f"Madad SME {digits[-6:]}"
+        cr = state.onboarding_cr_number or f"WA{digits}"
+        qatar = (
+            state.onboarding_is_qatar_based
+            if state.onboarding_is_qatar_based is not None
+            else True
+        )
+        # role must match an existing backend Role; default to the SME role.
+        role = (state.onboarding_role or "").strip().upper().replace(" ", "_")
+        if role not in {"TEAM_MEMBER", "AUTHORIZED_SIGNATORY", "SHAREHOLDER"}:
+            role = "TEAM_MEMBER"
         try:
             await self._identity.complete_onboarding(
-                first_name=state.onboarding_first_name or "",
-                last_name=state.onboarding_last_name or "",
+                first_name=first,
+                last_name=last,
                 onboarding_token=state.onboarding_token or "",
                 email=email,
                 phone_number=phone,
-                legal_entity_name=state.onboarding_legal_entity_name,
-                cr_number=state.onboarding_cr_number,
-                is_qatar_based=state.onboarding_is_qatar_based,
-                role=state.onboarding_role,
+                legal_entity_name=legal,
+                cr_number=cr,
+                is_qatar_based=qatar,
+                role=role,
             )
         except Exception as exc:  # noqa: BLE001 — degrade in staging
             ctx.logger.warning(

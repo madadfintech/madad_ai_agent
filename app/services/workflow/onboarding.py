@@ -748,9 +748,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         first = str(data.get("first_name") or "")
         last = str(data.get("last_name") or "")
         if not first or not last:
-            f2, l2 = self._parse_name(reply)
-            first = first or f2
-            last = last or l2
+            # Name is ONLY the first line — the rest of the multi-line answer is
+            # legal entity / CR / qatar / role and must NOT bleed into the name.
+            name_parts = lines[0].split() if lines else []
+            first = first or (name_parts[0] if name_parts else "")
+            last = last or (" ".join(name_parts[1:]) if len(name_parts) > 1 else "")
 
         # WhatsApp free-text intake: one line per field after the name —
         # name / legal entity / CR number / Qatar-based / role.
@@ -1367,8 +1369,19 @@ class OnboardingWorkflow(WorkflowDefinition):
             if already_asked
             else "onboarding.documents.checklist"
         )
+        # Progress meter: count uploaded vs the full required set so re-entries
+        # show "N of M received" instead of repeating the same "still needed" text.
+        total = len(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+        received = max(0, total - len(state.missing_documents))
         await self._send(
-            ctx, state, template_key, {"documents": _format_documents(state.missing_documents)}
+            ctx,
+            state,
+            template_key,
+            {
+                "documents": _format_documents(state.missing_documents),
+                "received": received,
+                "total": total,
+            },
         )
         await self._reminders.schedule(
             "incomplete_docs",
@@ -1877,11 +1890,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "received" if state.shareholders else "missing"
 
     def _route_documents(self, state: OnboardingState) -> str:
-        # Lenient: show the full checklist up front, but once the user has
-        # uploaded ANY document(s) we proceed to completion ("coffee"). Uploaded
-        # docs are counted; the rest can be requested later by the admin — we do
-        # not block the journey on every single item.
-        return "complete" if state.documents_received else "await_again"
+        if not state.documents_received:
+            return "await_again"
+        # Loop back (showing the N/M progress meter) until every required doc is
+        # in, then complete ("coffee").
+        return "complete" if not state.missing_documents else "missing"
 
     def _route_payment(self, state: OnboardingState) -> str:
         return "paid" if state.paid else "unpaid"

@@ -134,11 +134,10 @@ _TEMPLATE_BODIES = {
         "📤 Share the documents here as individual PDFs/photos or as a ZIP file."
     ),
     "onboarding.documents.missing": (
-        "✅ Got it — thanks for sending that! 🙌 I've ticked it off your checklist.\n\n"
-        "Here's what's still needed:\n"
+        "✅ Got it — {{ received }} of {{ total }} documents received! 🙌\n\n"
+        "⏳ Still needed:\n"
         "{{ documents }}\n\n"
-        "No rush — send them one at a time or all together, and I'll keep the "
-        "checklist updated as they come in."
+        "No rush — send them one at a time or all together."
     ),
     "onboarding.documents.complete": (
         "🎊 Great — all documents received!\n\n"
@@ -148,8 +147,9 @@ _TEMPLATE_BODIES = {
         "For any query call 72773652 or visit madadfintech.com"
     ),
     "onboarding.upload.required": (
-        "Please attach {{ document }} to continue. Text alone is not enough for this step.\n\n"
-        "For any query call 72773652."
+        "Whenever you're ready, please share {{ document }} as a PDF or photo here "
+        "and I'll take it from there. 🙂\n\n"
+        "Have a question? Just ask — happy to help. For any query call 72773652."
     ),
     "onboarding.status.pending": (
         "Hi! Your application is currently under review with Madad. 👍\n\n"

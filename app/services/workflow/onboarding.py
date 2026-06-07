@@ -98,6 +98,7 @@ TEMPLATE_KEYS = [
     "onboarding.campaign.awaiting_yes_no",
     "onboarding.help.what_is_madad",
     "onboarding.help.security",
+    "onboarding.help.contextual",
     "onboarding.declined",
     "onboarding.domain_blocked",
     "onboarding.collect_details.request",
@@ -165,6 +166,15 @@ STATUS_KEYWORDS = (
     "application",
 )
 
+CASUAL_KEYWORDS = (
+    "hi",
+    "hello",
+    "hey",
+    "thanks",
+    "thank you",
+    "um",
+)
+
 
 def _off_script_template(value: Any) -> str | None:
     text = reply_text(value).lower()
@@ -178,6 +188,28 @@ def _off_script_template(value: Any) -> str | None:
 def _is_status_query(value: Any) -> bool:
     text = reply_text(value).lower()
     return any(keyword in text for keyword in STATUS_KEYWORDS)
+
+
+def _is_casual_message(value: Any) -> bool:
+    text = reply_text(value).lower().strip()
+    return any(text == keyword or text.startswith(f"{keyword} ") for keyword in CASUAL_KEYWORDS)
+
+
+def _valid_upload_attachments(value: Any) -> list[dict[str, Any]]:
+    """Return only attachments with actual bytes for backend upload.
+
+    A provider/media id alone is not enough for this workflow because the KYC
+    MCP tool expects base64 file bytes. The Madad backend WhatsApp bridge
+    downloads Meta media and forwards ``content_base64``; if that field is
+    missing or empty, keep the user on the same upload step.
+    """
+
+    attachments = reply_attachments(value)
+    return [
+        attachment
+        for attachment in attachments
+        if str(attachment.get("content_base64") or "").strip()
+    ]
 
 
 def _extract_email(text: str) -> str | None:
@@ -255,6 +287,29 @@ def _format_documents(documents: list[str]) -> str:
         return "required documents"
     labels = [DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title()) for doc in documents]
     return "\n".join(f"{idx}. {label}" for idx, label in enumerate(labels, start=1))
+
+
+def _next_step_hint(state: OnboardingState) -> str:
+    step = state.history[-1].step if state.history else ""
+    if step in {"campaign_send", "campaign_await"}:
+        return "Please reply YES if you want to start, or NO to opt out."
+    if step in {"consent_send", "consent_await"}:
+        return "Right now I need your Commercial Registration (CR) as a PDF or photo."
+    if step in {"eligibility_intake_send", "eligibility_intake_await"}:
+        return "Right now I need the 7 quick business details: Qatar-based, business age, CR validity, company type, sector, turnover, and employees."
+    if step in {"financials_send", "financials_await"}:
+        return "Right now I need your latest Audited Financial Statement as a PDF or photo."
+    if step in {"buyers_collect_send", "buyers_collect_await"}:
+        return "Right now I need your main buyer details: name, country, and contact."
+    if step in {"shareholders_collect_send", "shareholders_collect_await"}:
+        return "Right now I need shareholder details: name and percentage."
+    if step in {"documents_upload_loop_send", "documents_upload_loop_await"}:
+        return f"Right now I need these documents:\n{_format_documents(state.missing_documents)}"
+    if step in {"payment_send_link", "payment_await"}:
+        return "Right now your payment link is ready. Once payment is complete, we will forward your application."
+    if step in {"documents_complete", "journey_wait_await", "lender_wait_await"}:
+        return "Your application is under review. I’ll notify you as soon as there is an update."
+    return "I’ll guide you step by step through the application."
 
 
 def _is_conflict_error(exc: BaseException) -> bool:
@@ -502,7 +557,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         reply = await_input({"waiting_for": "reply", "step": "campaign"})
         help_template = _off_script_template(reply)
         if help_template is not None:
-            await self._send(ctx, state, help_template)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
             await self._send(ctx, state, "onboarding.campaign.awaiting_yes_no")
             return self._step("campaign_await", ctx, entry_reply="ASK")
         if is_yes(reply):
@@ -687,8 +747,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         reply = await_input({"waiting_for": "upload", "step": "consent_cr"})
         help_template = _off_script_template(reply)
         if help_template is not None:
-            await self._send(ctx, state, help_template)
-        attachments = reply_attachments(reply)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
+        attachments = _valid_upload_attachments(reply)
         if not attachments:
             await self._send(
                 ctx,
@@ -839,8 +904,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         reply = await_input({"waiting_for": "upload", "step": "financials"})
         help_template = _off_script_template(reply)
         if help_template is not None:
-            await self._send(ctx, state, help_template)
-        attachments = reply_attachments(reply)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
+        attachments = _valid_upload_attachments(reply)
         await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
         if not attachments:
             await self._send(
@@ -906,7 +976,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         reply = await_input({"waiting_for": "buyers", "step": "buyers"})
         help_template = _off_script_template(reply)
         if help_template is not None:
-            await self._send(ctx, state, help_template)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
             await self._send(ctx, state, "onboarding.buyers.request")
             return self._step("buyers_collect_await", ctx, buyers=list(state.buyers))
         buyer = reply if isinstance(reply, dict) else {}
@@ -954,7 +1029,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         reply = await_input({"waiting_for": "shareholders", "step": "shareholders"})
         help_template = _off_script_template(reply)
         if help_template is not None:
-            await self._send(ctx, state, help_template)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
             await self._send(ctx, state, "onboarding.shareholders.request")
             return self._step(
                 "shareholders_collect_await", ctx, shareholders=list(state.shareholders)
@@ -1043,8 +1123,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         reply = await_input({"waiting_for": "upload", "step": "documents"})
         help_template = _off_script_template(reply)
         if help_template is not None:
-            await self._send(ctx, state, help_template)
-        attachments = reply_attachments(reply)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
+        attachments = _valid_upload_attachments(reply)
         if not attachments:
             await self._send(
                 ctx,
@@ -1096,7 +1181,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "documents_upload_loop_await",
             ctx,
             missing_documents=missing,
-            documents_received=True,
+            documents_received=bool(attachments),
         )
 
     async def _documents_complete(
@@ -1140,7 +1225,22 @@ class OnboardingWorkflow(WorkflowDefinition):
         payload = await_input({"waiting_for": "journey_status", "step": "journey_wait"})
         help_template = _off_script_template(payload)
         if help_template is not None:
-            await self._send(ctx, state, help_template)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
+            return self._step(
+                "journey_wait_await", ctx, last_status_source="poll"
+            )
+        if _is_casual_message(payload):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": "I’m here and tracking your application.", "next_step": _next_step_hint(state)},
+            )
             return self._step(
                 "journey_wait_await", ctx, last_status_source="poll"
             )
@@ -1292,7 +1392,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         result = await_input({"waiting_for": "payment", "step": "payment"})
         help_template = _off_script_template(result)
         if help_template is not None:
-            await self._send(ctx, state, help_template)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
             await self._send(ctx, state, "onboarding.payment.awaiting")
             return self._step("payment_await", ctx, paid=False)
         if _is_status_query(result):
@@ -1331,7 +1436,20 @@ class OnboardingWorkflow(WorkflowDefinition):
         payload = await_input({"waiting_for": "journey_status", "step": "lender_wait"})
         help_template = _off_script_template(payload)
         if help_template is not None:
-            await self._send(ctx, state, help_template)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": self._answer_for(help_template), "next_step": _next_step_hint(state)},
+            )
+            return self._step("lender_wait_await", ctx, last_status_source="poll")
+        if _is_casual_message(payload):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {"answer": "I’m here and tracking your lender review.", "next_step": _next_step_hint(state)},
+            )
             return self._step("lender_wait_await", ctx, last_status_source="poll")
         if _is_status_query(payload):
             await self._send(ctx, state, "onboarding.status.pending")
@@ -1451,6 +1569,21 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "wait"
 
     # -- helpers --------------------------------------------------------------
+
+    def _answer_for(self, template_key: str) -> str:
+        if template_key == "onboarding.help.security":
+            return (
+                "Yes, this is legitimate. Madad is a regulated business finance "
+                "company in Qatar. The consent only lets us use your business "
+                "information and documents to assess financing eligibility."
+            )
+        if template_key == "onboarding.help.what_is_madad":
+            return (
+                "Madad helps Qatar businesses unlock working capital from unpaid "
+                "invoices owed by enterprise or government clients. We assess your "
+                "business, collect required documents, and connect you with financing offers."
+            )
+        return "I can help with that."
 
     async def _live_token(
         self, state: OnboardingState, ctx: WorkflowContext

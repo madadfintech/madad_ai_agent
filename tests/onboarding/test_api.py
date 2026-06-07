@@ -15,6 +15,7 @@ from app.services.workflow.main import app
 
 client = TestClient(app)
 IDENTITY = "+97455509000"
+DOC = "ZHVtbXk="
 
 
 def _start():
@@ -56,7 +57,7 @@ def test_full_flow_over_http() -> None:
     assert _inbound(text="YES").json()["prompt"]["step"] == "collect_details"
     assert _inbound(text="Aisha Karim").json()["prompt"]["step"] == "consent_cr"
     assert (
-        _inbound(attachments=[{"filename": "CR.pdf"}]).json()["prompt"]["step"]
+        _inbound(attachments=[{"filename": "CR.pdf", "content_base64": DOC}]).json()["prompt"]["step"]
         == "eligibility"
     )
     # Eligibility form: structured data via the inbound `data` field.
@@ -66,7 +67,7 @@ def test_full_flow_over_http() -> None:
     )
 
     assert (
-        _inbound(attachments=[{"filename": "Audited.pdf"}]).json()["prompt"]["step"]
+        _inbound(attachments=[{"filename": "Audited.pdf", "content_base64": DOC}]).json()["prompt"]["step"]
         == "buyers"
     )
     assert _inbound(data={"name": "ACME"}).json()["prompt"]["step"] == "shareholders"
@@ -83,9 +84,9 @@ def test_full_flow_over_http() -> None:
 
     docs = _inbound(
         attachments=[
-            {"filename": "Trade_License.pdf"},
-            {"filename": "Tax_Card.pdf"},
-            {"filename": "Bank_Statement.pdf"},
+            {"filename": "Trade_License.pdf", "content_base64": DOC},
+            {"filename": "Tax_Card.pdf", "content_base64": DOC},
+            {"filename": "Bank_Statement.pdf", "content_base64": DOC},
         ]
     )
     assert docs.json()["prompt"]["step"] == "journey_wait"

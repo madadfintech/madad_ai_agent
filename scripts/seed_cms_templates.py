@@ -58,6 +58,11 @@ _TEMPLATE_BODIES = {
         "assess eligibility and use the document for financing purposes. That's all.\n\n"
         "You can verify us at madadfintech.com or call 72773652."
     ),
+    "onboarding.help.contextual": (
+        "{{ answer }}\n\n"
+        "{{ next_step }}\n\n"
+        "For any query call 72773652."
+    ),
     "onboarding.declined": (
         "No problem at all! If you ever need working capital support in the future, "
         "we're here. Reach us at madadfintech.com or call 72773652. Have a great day! 👋"

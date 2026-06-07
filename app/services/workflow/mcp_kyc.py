@@ -47,16 +47,40 @@ DEFAULT_DOCUMENT_ENTITY_TYPE = "BUSINESS_DETAILS"
 
 # Per-doc-type discriminators the backend expects on the generic base64
 # upload tool. The keys are the workflow's internal document_type names
-# (used in OnboardingState.missing_documents and elsewhere).
+# (used in OnboardingState.missing_documents and elsewhere); the values MUST
+# be exact members of the backend Prisma ``DocumentType`` enum — the upload
+# endpoint does ``if (!(documentType in DocumentType)) throw BadRequest`` so an
+# off-by-a-word guess (e.g. PAYABLE_AGEING vs PAYABLE_AGING_REPORT) returns 400
+# and the document silently never lands. Verified against
+# backend-api/src/prisma/schema.prisma (2026-06-07).
 _DOCUMENT_TYPE_TO_BACKEND = {
+    # Business registration docs
     "trade_license": "TRADE_LICENSE",
     "commercial_registration": "COMMERCIAL_REGISTRATION",
-    "audited_report": "AUDITED_FINANCIAL_REPORT",
-    "bank_statement": "BANK_STATEMENT",
     "tax_card": "TAX_CARD",
     "establishment_card": "ESTABLISHMENT_CARD",
+    "article_of_association": "ARTICLE_OF_ASSOCIATION",
+    "national_address_certificate": "BUSINESS_ADDRESS_PROOF",
     "vat_certificate": "VAT_CERTIFICATE",
+    # Financial docs (all BUSINESS_DETAILS entity)
+    "audited_report": "AUDITED_FINANCIAL_REPORT",
+    "bank_statement": "BANK_STATEMENT",
+    "credit_bureau_report": "COMMERCIAL_CREDIT_REPORT",
+    "payable_ageing": "PAYABLE_AGING_REPORT",
+    "receivable_ageing": "RECEIVABLES_AGING_REPORT",
+    "interim_statement": "INTERIM_FINANCIAL_REPORT",
+    # Shareholder docs (SHAREHOLDER entity — see _SHAREHOLDER_DOCUMENT_TYPES)
+    "qid": "SHAREHOLDER_QID",
+    "passport": "SHAREHOLDER_PASSPORT",
+    "proof_of_address": "SHAREHOLDER_PROOF_OF_ADDRESS",
 }
+
+# Workflow doc types whose backend home is the SHAREHOLDER entity rather than
+# the business. We upload them WITHOUT a shareholderId: the backend parks them
+# on the business and ``handleAsyncExtraction`` auto-assigns each to the
+# matching shareholder by extracted ID — the same drag-and-drop path the
+# msme-portal uses. (backend kyc.service.uploadDocuments, 2026-06-07.)
+_SHAREHOLDER_DOCUMENT_TYPES = {"qid", "passport", "proof_of_address"}
 
 
 def _backend_document_type(workflow_doc_type: str) -> str:
@@ -66,6 +90,14 @@ def _backend_document_type(workflow_doc_type: str) -> str:
     return _DOCUMENT_TYPE_TO_BACKEND.get(
         workflow_doc_type, workflow_doc_type.upper()
     )
+
+
+def _entity_type_for(workflow_doc_type: str) -> str:
+    """The backend ``documentEntityType`` a given doc type belongs under."""
+
+    if workflow_doc_type in _SHAREHOLDER_DOCUMENT_TYPES:
+        return "SHAREHOLDER"
+    return DEFAULT_DOCUMENT_ENTITY_TYPE
 
 
 class McpKycClient:
@@ -145,7 +177,7 @@ class McpKycClient:
                 "base64": content_base64,
                 "metadata": {
                     "access_token": access_token,
-                    "document_entity_type": DEFAULT_DOCUMENT_ENTITY_TYPE,
+                    "document_entity_type": _entity_type_for(document_type),
                     "document_type": _backend_document_type(document_type),
                     "document_label": filename,
                 },

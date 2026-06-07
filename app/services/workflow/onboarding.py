@@ -1633,16 +1633,18 @@ class OnboardingWorkflow(WorkflowDefinition):
         # assign each uploaded file to the next still-missing required doc so the
         # user's uploads actually satisfy the checklist and advance to completion.
         pending: list[str] = list(state.missing_documents)
-        validated: list[str] = []  # doc_types we acknowledge as Received & Validated
+        validated: list[str] = []  # uploaded + accepted by backend → ✅
+        unprocessed: list[str] = []  # backend rejected / no token → ⏳ honest
         for att in attachments:
             doc_type = att.get("document_type") or _infer_doc_type(att.get("filename") or "")
             if not doc_type and pending:
                 doc_type = pending[0]
-            if doc_type in pending:
-                pending.remove(doc_type)
-            if doc_type and doc_type not in validated:
-                validated.append(doc_type)
-            if state.access_token and doc_type:
+            if not doc_type:
+                continue
+            # Only acknowledge "Received & Validated" if the backend actually
+            # accepted the upload — never claim success on a swallowed error.
+            uploaded_ok = False
+            if state.access_token:
                 try:
                     await self._kyc.upload_document_base64(
                         access_token=state.access_token,
@@ -1651,6 +1653,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                         document_type=doc_type,
                         mime_type=att.get("mime_type"),
                     )
+                    uploaded_ok = True
                 except Exception as exc:  # noqa: BLE001 — degrade in staging
                     ctx.logger.warning(
                         "document_upload.failed",
@@ -1658,12 +1661,21 @@ class OnboardingWorkflow(WorkflowDefinition):
                         error=str(exc)[:200],
                         note="staging-tolerant: continuing without this doc",
                     )
-        # Acknowledge exactly what we extracted: a per-document "Received &
-        # Validated" checklist. A ZIP gets the "📦 Extracting…" header; a single
-        # file just gets its own ✅ line. The lenient coffee message follows in
-        # documents_complete.
-        await self._acknowledge_uploads(ctx, state, validated, saw_zip=saw_zip)
-        # Remaining = required docs this batch did not cover. Tracked locally so
+            if uploaded_ok:
+                if doc_type in pending:
+                    pending.remove(doc_type)
+                if doc_type not in validated:
+                    validated.append(doc_type)
+            elif doc_type not in unprocessed and doc_type not in validated:
+                unprocessed.append(doc_type)
+        # Acknowledge exactly what landed: ✅ per accepted document, ⏳ per one we
+        # received but couldn't auto-validate (kept honest — no false ✅). A ZIP
+        # gets the "📦 Extracting…" header; loose files just get their lines. The
+        # lenient coffee message follows in documents_complete.
+        await self._acknowledge_uploads(
+            ctx, state, validated, unprocessed, saw_zip=saw_zip
+        )
+        # Remaining = required docs this batch did not land. Tracked locally so
         # generic-filename uploads reliably complete the checklist (we do not
         # re-query the backend's requested-docs list, which kept returning the
         # just-uploaded docs as still-missing and caused the loop).
@@ -1684,18 +1696,28 @@ class OnboardingWorkflow(WorkflowDefinition):
         ctx: WorkflowContext,
         state: OnboardingState,
         validated: list[str],
+        unprocessed: list[str],
         *,
         saw_zip: bool,
     ) -> None:
-        """Send the "Received & Validated" checklist for this upload batch."""
+        """Send the per-document checklist for this upload batch.
 
-        if not validated:
+        ✅ for docs the backend accepted; ⏳ for ones we received but couldn't
+        auto-validate — honest, never a false ✅.
+        """
+
+        if not validated and not unprocessed:
             return
-        lines = "\n".join(
-            f"✅ {DOCUMENT_LABELS.get(doc, doc.replace('_', ' ').title())} "
-            "— Received & Validated"
-            for doc in validated
-        )
+
+        def _label(doc: str) -> str:
+            return DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title())
+
+        rows = [f"✅ {_label(doc)} — Received & Validated" for doc in validated]
+        rows += [
+            f"⏳ {_label(doc)} — received, our team will review it"
+            for doc in unprocessed
+        ]
+        lines = "\n".join(rows)
         template_key = (
             "onboarding.documents.zip_received"
             if saw_zip

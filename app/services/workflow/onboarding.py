@@ -67,6 +67,7 @@ between turns.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.shared.workflow import (
@@ -85,7 +86,7 @@ from .ports import (
     MonetizationPaymentClient,
     Reminders,
 )
-from .state import JourneyStatus, OnboardingState, is_yes, reply_attachments, reply_text
+from .state import JourneyStatus, OnboardingState, is_no, is_yes, reply_attachments, reply_text
 
 # QAR 6,000 is the current monetization onboarding fee (Madad ops M-5 may
 # vary it by segment later — the workflow falls back to whatever the
@@ -94,6 +95,9 @@ ONBOARDING_FEE_QAR = 6000
 
 TEMPLATE_KEYS = [
     "onboarding.campaign.intro",
+    "onboarding.campaign.awaiting_yes_no",
+    "onboarding.help.what_is_madad",
+    "onboarding.help.security",
     "onboarding.declined",
     "onboarding.domain_blocked",
     "onboarding.collect_details.request",
@@ -106,6 +110,9 @@ TEMPLATE_KEYS = [
     "onboarding.documents.checklist",
     "onboarding.documents.missing",
     "onboarding.documents.complete",
+    "onboarding.upload.required",
+    "onboarding.status.pending",
+    "onboarding.payment.awaiting",
     "onboarding.not_qualified",
     "onboarding.payment.request",
     "onboarding.offers.preview",
@@ -134,6 +141,96 @@ DEFAULT_ELIGIBILITY_FORM: dict[str, Any] = {
     "employees": "10",
 }
 
+HELP_KEYWORDS = (
+    "what is madad",
+    "who is madad",
+    "what's madad",
+    "about madad",
+)
+
+SECURITY_KEYWORDS = (
+    "scam",
+    "scammed",
+    "fraud",
+    "fake",
+    "legit",
+    "safe",
+)
+
+STATUS_KEYWORDS = (
+    "status",
+    "update",
+    "where",
+    "progress",
+    "application",
+)
+
+
+def _off_script_template(value: Any) -> str | None:
+    text = reply_text(value).lower()
+    if any(keyword in text for keyword in SECURITY_KEYWORDS):
+        return "onboarding.help.security"
+    if any(keyword in text for keyword in HELP_KEYWORDS):
+        return "onboarding.help.what_is_madad"
+    return None
+
+
+def _is_status_query(value: Any) -> bool:
+    text = reply_text(value).lower()
+    return any(keyword in text for keyword in STATUS_KEYWORDS)
+
+
+def _extract_email(text: str) -> str | None:
+    match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", text)
+    return match.group(0) if match else None
+
+
+def _parse_buyer_text(text: str) -> dict[str, Any]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return {}
+    contact_email = _extract_email(text)
+    return {
+        "name": lines[0],
+        **({"contact_email": contact_email} if contact_email else {}),
+    }
+
+
+def _parse_shareholder_text(text: str, fallback_phone: str | None) -> list[dict[str, Any]]:
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    first_line = cleaned.splitlines()[0].strip()
+    name = re.sub(r"\b\d+(?:\.\d+)?\s*%?\b", "", first_line).strip(" ,-")
+    if not name:
+        name = first_line
+    return [{"name": name, "phoneNumber": fallback_phone or "+97400000000"}]
+
+
+DEFAULT_WHATSAPP_REQUIRED_DOCS = [
+    "trade_license",
+    "tax_card",
+    "bank_statement",
+]
+
+DOCUMENT_LABELS = {
+    "trade_license": "Trade License",
+    "tax_card": "Tax Card",
+    "national_address_certificate": "National Address Certificate",
+    "article_of_association": "Article of Association",
+    "establishment_card": "Establishment Card",
+    "bank_statement": "Bank Statement (last 6 months)",
+    "audited_report": "Audited Report",
+    "audited_financial_report": "Audited Financial Statement",
+    "credit_bureau_report": "Qatar Credit Bureau Report",
+    "payable_ageing": "Payable Ageing Schedule",
+    "receivable_ageing": "Receivable Ageing Schedule",
+    "interim_statement": "Interim Financial Statement",
+    "qid": "Shareholder QID",
+    "passport": "Shareholder Passport",
+    "proof_of_address": "Shareholder Proof of Address",
+}
+
 # Filename → KYC document_type inference for the documents upload loop.
 DOC_TYPE_KEYWORDS = {
     "trade": "trade_license",
@@ -151,6 +248,13 @@ def _infer_doc_type(filename: str) -> str | None:
         if keyword in lowered:
             return doc_type
     return None
+
+
+def _format_documents(documents: list[str]) -> str:
+    if not documents:
+        return "required documents"
+    labels = [DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title()) for doc in documents]
+    return "\n".join(f"{idx}. {label}" for idx, label in enumerate(labels, start=1))
 
 
 def _is_conflict_error(exc: BaseException) -> bool:
@@ -255,7 +359,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         graph.add_conditional_edges(
             "campaign_await",
             self._route_entry,
-            {"check_contact": "check_contact_send", "declined": "declined"},
+            {
+                "check_contact": "check_contact_send",
+                "declined": "declined",
+                "ask_again": "campaign_await",
+            },
         )
         graph.add_edge("check_contact_send", "check_contact_await")
         graph.add_conditional_edges(
@@ -285,7 +393,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         )
 
         graph.add_edge("consent_send", "consent_await")
-        graph.add_edge("consent_await", "cr_upload_base64")
+        graph.add_conditional_edges(
+            "consent_await",
+            self._route_consent_upload,
+            {"uploaded": "cr_upload_base64", "missing": "consent_await"},
+        )
         graph.add_edge("cr_upload_base64", "eligibility_intake_send")
         graph.add_edge("eligibility_intake_send", "eligibility_intake_await")
         graph.add_edge("eligibility_intake_await", "eligibility_update")
@@ -296,13 +408,28 @@ class OnboardingWorkflow(WorkflowDefinition):
         )
 
         graph.add_edge("financials_send", "financials_await")
-        graph.add_edge("financials_await", "financials_upload_base64")
+        graph.add_conditional_edges(
+            "financials_await",
+            self._route_financials_upload,
+            {"uploaded": "financials_upload_base64", "missing": "financials_await"},
+        )
         graph.add_edge("financials_upload_base64", "documents_list_fetch")
         graph.add_edge("documents_list_fetch", "buyers_collect_send")
         graph.add_edge("buyers_collect_send", "buyers_collect_await")
-        graph.add_edge("buyers_collect_await", "shareholders_collect_send")
+        graph.add_conditional_edges(
+            "buyers_collect_await",
+            self._route_buyer,
+            {"received": "shareholders_collect_send", "missing": "buyers_collect_await"},
+        )
         graph.add_edge("shareholders_collect_send", "shareholders_collect_await")
-        graph.add_edge("shareholders_collect_await", "documents_upload_loop_send")
+        graph.add_conditional_edges(
+            "shareholders_collect_await",
+            self._route_shareholders,
+            {
+                "received": "documents_upload_loop_send",
+                "missing": "shareholders_collect_await",
+            },
+        )
         graph.add_edge("documents_upload_loop_send", "documents_upload_loop_await")
         graph.add_conditional_edges(
             "documents_upload_loop_await",
@@ -373,7 +500,19 @@ class OnboardingWorkflow(WorkflowDefinition):
 
     async def _campaign_await(self, state: OnboardingState, ctx: WorkflowContext) -> dict[str, Any]:
         reply = await_input({"waiting_for": "reply", "step": "campaign"})
-        return self._step("campaign_await", ctx, entry_reply="YES" if is_yes(reply) else "NO")
+        help_template = _off_script_template(reply)
+        if help_template is not None:
+            await self._send(ctx, state, help_template)
+            await self._send(ctx, state, "onboarding.campaign.awaiting_yes_no")
+            return self._step("campaign_await", ctx, entry_reply="ASK")
+        if is_yes(reply):
+            entry_reply = "YES"
+        elif is_no(reply):
+            entry_reply = "NO"
+        else:
+            await self._send(ctx, state, "onboarding.campaign.awaiting_yes_no")
+            entry_reply = "ASK"
+        return self._step("campaign_await", ctx, entry_reply=entry_reply)
 
     async def _declined(self, state: OnboardingState, ctx: WorkflowContext) -> dict[str, Any]:
         await self._send(ctx, state, "onboarding.declined")
@@ -546,8 +685,17 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "consent_cr"})
+        help_template = _off_script_template(reply)
+        if help_template is not None:
+            await self._send(ctx, state, help_template)
         attachments = reply_attachments(reply)
         if not attachments:
+            await self._send(
+                ctx,
+                state,
+                "onboarding.upload.required",
+                {"document": "Commercial Registration (CR)"},
+            )
             return self._step("consent_await", ctx, consent=False)
         first = attachments[0]
         return self._step(
@@ -689,9 +837,18 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "financials"})
+        help_template = _off_script_template(reply)
+        if help_template is not None:
+            await self._send(ctx, state, help_template)
         attachments = reply_attachments(reply)
         await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
         if not attachments:
+            await self._send(
+                ctx,
+                state,
+                "onboarding.upload.required",
+                {"document": "Audited Financial Statement"},
+            )
             return self._step("financials_await", ctx, financials_received=False)
         first = attachments[0]
         return self._step(
@@ -733,6 +890,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             if isinstance(result, dict):
                 missing = list(result.get("missing", []))
+        if not missing and ctx.channel is Channel.WHATSAPP:
+            missing = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
         return self._step("documents_list_fetch", ctx, missing_documents=missing)
 
     async def _buyers_collect_send(
@@ -745,7 +904,16 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "buyers", "step": "buyers"})
+        help_template = _off_script_template(reply)
+        if help_template is not None:
+            await self._send(ctx, state, help_template)
+            await self._send(ctx, state, "onboarding.buyers.request")
+            return self._step("buyers_collect_await", ctx, buyers=list(state.buyers))
         buyer = reply if isinstance(reply, dict) else {}
+        if isinstance(reply, dict) and not any(k in reply for k in {"name", "cr_number", "contact_person", "contact_number", "contact_email", "buyer_type", "buyer_sector"}):
+            parsed = _parse_buyer_text(reply_text(reply))
+            if parsed:
+                buyer = parsed
         # Only forward fields the UAT add_buyer tool accepts; everything else
         # (e.g. demo runner's `country`) is dropped so the call passes
         # pydantic validation at the cluster.
@@ -754,6 +922,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             "contact_email", "buyer_type", "buyer_sector",
         }
         data = {k: v for k, v in buyer.items() if k in allowed}
+        if not data:
+            await self._send(ctx, state, "onboarding.buyers.request")
+            return self._step("buyers_collect_await", ctx, buyers=list(state.buyers))
         if data and state.access_token:
             try:
                 await self._kyc.add_buyer(access_token=state.access_token, data=data)
@@ -781,9 +952,18 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "shareholders", "step": "shareholders"})
+        help_template = _off_script_template(reply)
+        if help_template is not None:
+            await self._send(ctx, state, help_template)
+            await self._send(ctx, state, "onboarding.shareholders.request")
+            return self._step(
+                "shareholders_collect_await", ctx, shareholders=list(state.shareholders)
+            )
         payload = reply if isinstance(reply, dict) else {}
         raw = payload.get("shareholders")
         items: list[dict[str, Any]] = list(raw) if isinstance(raw, list) else []
+        if not items:
+            items = _parse_shareholder_text(reply_text(reply), ctx.identity)
         # Per Ishan's KYC_ADD_SHAREHOLDERS schema (2026-06-06): each
         # shareholder requires ``name + phoneNumber``; the cluster also
         # accepts ``firstName / lastName / middleName / email / address``
@@ -812,6 +992,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                     )
                     continue
             sanitized.append(record)
+        if not sanitized:
+            await self._send(ctx, state, "onboarding.shareholders.request")
+            return self._step(
+                "shareholders_collect_await", ctx, shareholders=list(state.shareholders)
+            )
         if sanitized and state.access_token:
             try:
                 await self._kyc.add_shareholders(
@@ -842,7 +1027,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             else "onboarding.documents.checklist"
         )
         await self._send(
-            ctx, state, template_key, {"documents": ", ".join(state.missing_documents)}
+            ctx, state, template_key, {"documents": _format_documents(state.missing_documents)}
         )
         await self._reminders.schedule(
             "incomplete_docs",
@@ -856,7 +1041,23 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "documents"})
+        help_template = _off_script_template(reply)
+        if help_template is not None:
+            await self._send(ctx, state, help_template)
         attachments = reply_attachments(reply)
+        if not attachments:
+            await self._send(
+                ctx,
+                state,
+                "onboarding.upload.required",
+                {"document": _format_documents(state.missing_documents)},
+            )
+            return self._step(
+                "documents_upload_loop_await",
+                ctx,
+                missing_documents=list(state.missing_documents),
+                documents_received=False,
+            )
         for att in attachments:
             doc_type = att.get("document_type") or _infer_doc_type(att.get("filename") or "")
             if state.access_token and doc_type:
@@ -891,7 +1092,12 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-        return self._step("documents_upload_loop_await", ctx, missing_documents=missing)
+        return self._step(
+            "documents_upload_loop_await",
+            ctx,
+            missing_documents=missing,
+            documents_received=True,
+        )
 
     async def _documents_complete(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -932,6 +1138,17 @@ class OnboardingWorkflow(WorkflowDefinition):
         # implied journey_status; capture it so the next poll routes
         # immediately rather than waiting for the backend to catch up.
         payload = await_input({"waiting_for": "journey_status", "step": "journey_wait"})
+        help_template = _off_script_template(payload)
+        if help_template is not None:
+            await self._send(ctx, state, help_template)
+            return self._step(
+                "journey_wait_await", ctx, last_status_source="poll"
+            )
+        if _is_status_query(payload):
+            await self._send(ctx, state, "onboarding.status.pending")
+            return self._step(
+                "journey_wait_await", ctx, last_status_source="poll"
+            )
         source = _extract_status_source(payload)
         fields: dict[str, Any] = {"last_status_source": source}
         forced = _extract_journey_status(payload)
@@ -1073,6 +1290,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         result = await_input({"waiting_for": "payment", "step": "payment"})
+        help_template = _off_script_template(result)
+        if help_template is not None:
+            await self._send(ctx, state, help_template)
+            await self._send(ctx, state, "onboarding.payment.awaiting")
+            return self._step("payment_await", ctx, paid=False)
+        if _is_status_query(result):
+            await self._send(ctx, state, "onboarding.payment.awaiting")
+            return self._step("payment_await", ctx, paid=False)
         paid = bool(result.get("paid")) if isinstance(result, dict) else False
         if paid:
             await self._reminders.suppress(
@@ -1104,6 +1329,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         payload = await_input({"waiting_for": "journey_status", "step": "lender_wait"})
+        help_template = _off_script_template(payload)
+        if help_template is not None:
+            await self._send(ctx, state, help_template)
+            return self._step("lender_wait_await", ctx, last_status_source="poll")
+        if _is_status_query(payload):
+            await self._send(ctx, state, "onboarding.status.pending")
+            return self._step("lender_wait_await", ctx, last_status_source="poll")
         source = _extract_status_source(payload)
         fields: dict[str, Any] = {"last_status_source": source}
         forced = _extract_journey_status(payload)
@@ -1148,7 +1380,11 @@ class OnboardingWorkflow(WorkflowDefinition):
     # -- routers --------------------------------------------------------------
 
     def _route_entry(self, state: OnboardingState) -> str:
-        return "check_contact" if state.entry_reply == "YES" else "declined"
+        if state.entry_reply == "YES":
+            return "check_contact"
+        if state.entry_reply == "NO":
+            return "declined"
+        return "ask_again"
 
     def _route_check_contact(self, state: OnboardingState) -> str:
         result: Any = state.check_contact_result
@@ -1177,10 +1413,24 @@ class OnboardingWorkflow(WorkflowDefinition):
         # fast-path; Phase 2 always proceeds to consent + CR.
         return "consent"
 
+    def _route_consent_upload(self, state: OnboardingState) -> str:
+        return "uploaded" if state.consent and state.cr_ref else "missing"
+
     def _route_eligibility_status(self, state: OnboardingState) -> str:
         return "eligible" if state.eligible else "ineligible"
 
+    def _route_financials_upload(self, state: OnboardingState) -> str:
+        return "uploaded" if state.financials_received else "missing"
+
+    def _route_buyer(self, state: OnboardingState) -> str:
+        return "received" if state.buyers else "missing"
+
+    def _route_shareholders(self, state: OnboardingState) -> str:
+        return "received" if state.shareholders else "missing"
+
     def _route_documents(self, state: OnboardingState) -> str:
+        if not state.documents_received:
+            return "missing"
         return "missing" if state.missing_documents else "complete"
 
     def _route_payment(self, state: OnboardingState) -> str:

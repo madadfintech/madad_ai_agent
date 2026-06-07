@@ -31,27 +31,63 @@ from app.shared.i18n import Locale
 # Operators can override any of these in the CMS admin endpoint after seeding.
 _TEMPLATE_BODIES = {
     "onboarding.campaign.intro": (
-        "Welcome to MADAD! Reply YES to start your invoice financing setup, "
-        "or NO to opt out."
+        "Hello! 👋\n\n"
+        "We are Madad (madadfintech.com) — a business finance company in Qatar. "
+        "We provide financing support to unlock cash stuck with your clients in invoices.\n\n"
+        "Are you interested in taking financing for your business?\n"
+        "Reply YES or NO"
+    ),
+    "onboarding.campaign.awaiting_yes_no": (
+        "Are you interested in taking financing for your business?\n"
+        "Please reply YES or NO. For any query call 72773652."
+    ),
+    "onboarding.help.what_is_madad": (
+        "Hello! 👋\n\n"
+        "We are Madad (madadfintech.com) — a regulated business finance company "
+        "in Qatar. We help businesses unlock working capital from invoices owed "
+        "by enterprise or government clients.\n\n"
+        "✅ Fast financing — funds within 5 working days of approval\n"
+        "✅ Multiple bank offers — you choose\n"
+        "✅ Sharia-compliant · Regulated by Qatar Central Bank\n\n"
+        "You can verify us at madadfintech.com or call 72773652."
+    ),
+    "onboarding.help.security": (
+        "Absolutely — your data is completely safe with us. 🔒\n\n"
+        "We are a regulated entity under Qatar Central Bank. The consent simply "
+        "means you agree that Madad may access your business information to "
+        "assess eligibility and use the document for financing purposes. That's all.\n\n"
+        "You can verify us at madadfintech.com or call 72773652."
     ),
     "onboarding.declined": (
-        "Thanks for your time. Reply START anytime to begin onboarding."
+        "No problem at all! If you ever need working capital support in the future, "
+        "we're here. Reach us at madadfintech.com or call 72773652. Have a great day! 👋"
     ),
     "onboarding.domain_blocked": (
         "It looks like {{ domain }} is already registered with another team. "
         "Please contact your administrator or use a personal email."
     ),
     "onboarding.collect_details.request": (
-        "Welcome to MADAD! To create your account please share: "
-        "1) Your first + last name "
-        "2) Your business's legal entity name "
-        "3) Your CR (Commercial Registration) number "
-        "4) Is your business based in Qatar? "
+        "Great to hear you're interested! 🎉\n\n"
+        "To create your account please share:\n"
+        "1) Your first + last name\n"
+        "2) Your business's legal entity name\n"
+        "3) Your CR (Commercial Registration) number\n"
+        "4) Is your business based in Qatar?\n"
         "5) Your role at the business (FOUNDER / DIRECTOR / SHAREHOLDER / ...)"
     ),
     "onboarding.consent.request": (
-        "We need your consent + Commercial Registration document. Reply with "
-        "the CR as an attachment to continue."
+        "Great to know! 🎉 We have financed many businesses like yours in Qatar.\n\n"
+        "To start the journey we need to first verify that your business is in Qatar "
+        "and eligible for financing.\n\n"
+        "We need your Commercial Registration (CR) to verify this.\n\n"
+        "Before you share, please note:\n"
+        "✅ We are a regulated entity under Qatar Central Bank\n"
+        "🔗 Privacy Policy\n"
+        "🔒 Terms & Conditions\n"
+        "📊 Data & Credit Bureau Consent\n\n"
+        "By sharing your CR you agree to the above. Please go ahead and share "
+        "your CR document as a PDF or photo in this chat.\n\n"
+        "Any questions? Reply here or call us on 72773652."
     ),
     "onboarding.eligibility.intake.request": (
         "Quick business questionnaire — please share: "
@@ -68,7 +104,11 @@ _TEMPLATE_BODIES = {
         "our team for more information."
     ),
     "onboarding.financials.request": (
-        "Please share your audited financial report (PDF attachment)."
+        "Awesome, thanks for sharing! 🙌\n\n"
+        "We can see that your business is registered in Qatar — all good so far! ✅\n\n"
+        "To further assess your eligibility we need to know your financials. "
+        "Please share your last Audited Financial Statement.\n\n"
+        "For any query call us on 72773652."
     ),
     "onboarding.buyers.request": (
         "Please share your main buyer's details (name, country, contact)."
@@ -77,32 +117,65 @@ _TEMPLATE_BODIES = {
         "Please share your shareholders' details (name, percentage)."
     ),
     "onboarding.documents.checklist": (
-        "We need the following documents to proceed: {{ documents }}. "
-        "Please reply with them as attachments."
+        "🎉 Congratulations! Your business is pre-qualified for financing.\n\n"
+        "You can have cash in your account within 5 working days of completing your application!\n\n"
+        "We now need the following documents to complete your application:\n"
+        "{{ documents }}\n\n"
+        "📤 Share the documents here as individual PDFs/photos or as a ZIP file."
     ),
     "onboarding.documents.missing": (
-        "We're still missing: {{ documents }}. Please reply with the remaining "
-        "documents."
+        "We've processed what you sent. ✅\n\n"
+        "⚠️ Still needed:\n"
+        "{{ documents }}\n\n"
+        "Please send the missing items and I'll update the checklist."
     ),
     "onboarding.documents.complete": (
-        "All required documents received — thank you!"
+        "🎊 Great — all documents received!\n\n"
+        "We will share your assessment report within 24 hours. If all looks good, "
+        "we will forward your application to our banking partners in Qatar.\n\n"
+        "Meanwhile, enjoy your coffee ☕\n\n"
+        "For any query call 72773652 or visit madadfintech.com"
+    ),
+    "onboarding.upload.required": (
+        "Please attach {{ document }} to continue. Text alone is not enough for this step.\n\n"
+        "For any query call 72773652."
+    ),
+    "onboarding.status.pending": (
+        "Hi! Your application is currently under review with Madad. 👍\n\n"
+        "I'll notify you as soon as the next update is available. You can also "
+        "track your status at madadfintech.com. For queries call 72773652."
+    ),
+    "onboarding.payment.awaiting": (
+        "Your application is ready to move forward. Please complete the secure "
+        "QAR 6,000 onboarding and assessment fee payment using the link shared above.\n\n"
+        "Once payment is received, your application will be forwarded immediately."
     ),
     "onboarding.not_qualified": (
         "Unfortunately your application wasn't accepted by our lender "
         "partners this time. Please reach out to our team."
     ),
     "onboarding.payment.request": (
-        "Your onboarding fee of QAR {{ amount }} is ready. Please complete "
-        "payment via the secure link below:\n\n"
+        "Hello! 👋\n\n"
+        "Your application has been reviewed by our team. Based on this score, "
+        "we believe you have high chances of getting approval from our banking partners. 💪\n\n"
+        "Your application is ready to be forwarded.\n"
+        "To submit your application to the banks, a one-time onboarding and assessment fee "
+        "of QAR {{ amount }} is required.\n\n"
+        "Pay QAR {{ amount }} →\n"
         "{{ payment_link }}\n\n"
+        "To know more about our pricing, visit madadfintech.com/pricing.\n\n"
+        "Once payment is received, your application will be forwarded immediately.\n\n"
         "Reference: {{ provider_ref }}"
     ),
     "onboarding.offers.preview": (
-        "Great news — you have {{ count }} financing offer(s) ready to review!"
+        "🎉 Exciting news — your financing offers are ready!\n\n"
+        "You have {{ count }} financing offer(s) ready to review."
     ),
     "onboarding.offer.handoff": (
-        "Please visit madadfintech.com to review and accept your offer. "
-        "You'll receive a confirmation once you're done."
+        "💬 Feel free to ask me anything about these offers right here!\n\n"
+        "When you're ready to select, please login to your Madad account to finalise "
+        "your offer — this is where you'll also manage your invoices going forward.\n\n"
+        "Login to Madad Platform → madadfintech.com"
     ),
     "onboarding.activated": (
         "Your credit line is now active! You can start submitting invoices "

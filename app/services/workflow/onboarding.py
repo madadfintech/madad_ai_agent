@@ -67,8 +67,12 @@ between turns.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import io
 import os
 import re
+import zipfile
 from typing import Any
 
 import httpx
@@ -114,6 +118,8 @@ TEMPLATE_KEYS = [
     "onboarding.shareholders.request",
     "onboarding.documents.checklist",
     "onboarding.documents.missing",
+    "onboarding.documents.zip_received",
+    "onboarding.documents.single_received",
     "onboarding.documents.complete",
     "onboarding.upload.required",
     "onboarding.status.pending",
@@ -305,6 +311,83 @@ def _valid_upload_attachments(value: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _is_zip_attachment(attachment: dict[str, Any]) -> bool:
+    """True if the attachment is a ZIP archive (by mime type or extension)."""
+
+    mime = str(attachment.get("mime_type") or "").lower()
+    if "zip" in mime:
+        return True
+    filename = str(attachment.get("filename") or "").lower()
+    return filename.endswith(".zip")
+
+
+def _guess_mime_for(filename: str) -> str:
+    lowered = filename.lower()
+    if lowered.endswith(".pdf"):
+        return "application/pdf"
+    if lowered.endswith((".png",)):
+        return "image/png"
+    if lowered.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lowered.endswith((".tif", ".tiff")):
+        return "image/tiff"
+    return "application/octet-stream"
+
+
+def _expand_zip_attachments(
+    attachments: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Unpack any ZIP attachments into their member files.
+
+    SMEs are asked to send "all documents in one ZIP" — Meta delivers it as a
+    single ``application/zip`` attachment with base64 bytes. We unzip it
+    in-memory and emit one synthetic attachment per member file (each carrying
+    its own base64 + guessed mime) so the existing per-document upload + classify
+    pipeline runs over every file exactly as if they were sent individually.
+
+    Non-ZIP attachments pass through untouched. Returns ``(expanded, saw_zip)``.
+    Degrades gracefully: a corrupt/unreadable ZIP is kept as-is (saw_zip stays
+    False) so the flow still acknowledges *something* rather than dropping it.
+    """
+
+    expanded: list[dict[str, Any]] = []
+    saw_zip = False
+    for attachment in attachments:
+        if not _is_zip_attachment(attachment):
+            expanded.append(attachment)
+            continue
+        try:
+            raw = base64.b64decode(str(attachment.get("content_base64") or ""))
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                members = [
+                    info
+                    for info in archive.infolist()
+                    if not info.is_dir()
+                    and not info.filename.startswith("__MACOSX/")
+                    and not info.filename.rsplit("/", 1)[-1].startswith(".")
+                ]
+                if not members:
+                    expanded.append(attachment)
+                    continue
+                saw_zip = True
+                for info in members:
+                    member_name = info.filename.rsplit("/", 1)[-1]
+                    member_bytes = archive.read(info)
+                    expanded.append(
+                        {
+                            "filename": member_name,
+                            "content_base64": base64.b64encode(member_bytes).decode(
+                                "ascii"
+                            ),
+                            "mime_type": _guess_mime_for(member_name),
+                        }
+                    )
+        except (zipfile.BadZipFile, binascii.Error, ValueError, OSError):
+            # Not a real/readable ZIP — treat it as an ordinary attachment.
+            expanded.append(attachment)
+    return expanded, saw_zip
+
+
 def _extract_email(text: str) -> str | None:
     match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", text)
     return match.group(0) if match else None
@@ -413,13 +496,35 @@ DOCUMENT_LABELS = {
     "proof_of_address": "Shareholder Proof of Address",
 }
 
-# Filename → KYC document_type inference for the documents upload loop.
+# Filename → KYC document_type inference for the documents upload loop. Ordered
+# loosely most-specific-first; the first keyword found in the (lowercased)
+# filename wins. Covers every code in DEFAULT_WHATSAPP_REQUIRED_DOCS so a ZIP of
+# sensibly-named files (e.g. ArticleOfAssociation.pdf, QID_Shareholder2.pdf)
+# classifies without the next-pending fallback.
 DOC_TYPE_KEYWORDS = {
     "trade": "trade_license",
     "tax": "tax_card",
+    "national address": "national_address_certificate",
+    "nationaladdress": "national_address_certificate",
+    "address cert": "national_address_certificate",
+    "article": "article_of_association",
+    "aoa": "article_of_association",
+    "association": "article_of_association",
+    "establishment": "establishment_card",
+    "credit bureau": "credit_bureau_report",
+    "creditbureau": "credit_bureau_report",
+    "bureau": "credit_bureau_report",
+    "payable": "payable_ageing",
+    "receivable": "receivable_ageing",
+    "interim": "interim_statement",
     "bank": "bank_statement",
     "audited": "audited_report",
-    "establishment": "establishment_card",
+    "audit": "audited_report",
+    "passport": "passport",
+    "qid": "qid",
+    "national id": "qid",
+    "proof of address": "proof_of_address",
+    "proofofaddress": "proof_of_address",
     "vat": "vat_certificate",
 }
 
@@ -1515,6 +1620,12 @@ class OnboardingWorkflow(WorkflowDefinition):
                 missing_documents=list(state.missing_documents),
                 documents_received=False,
             )
+        # A single ZIP ("send everything in one file") expands into one synthetic
+        # attachment per member document — each then runs the same classify +
+        # upload pipeline as an individually-sent file (matching the msme-portal
+        # complete-onboarding behaviour, where every doc lands on the backend KYC
+        # endpoint that drives classification + extraction).
+        attachments, saw_zip = _expand_zip_attachments(attachments)
         # Track remaining required docs locally. WhatsApp media almost always
         # arrives with a generic filename (IMG-xxxx.jpg), so _infer_doc_type
         # returns None and the upload used to be skipped entirely — the checklist
@@ -1522,12 +1633,15 @@ class OnboardingWorkflow(WorkflowDefinition):
         # assign each uploaded file to the next still-missing required doc so the
         # user's uploads actually satisfy the checklist and advance to completion.
         pending: list[str] = list(state.missing_documents)
+        validated: list[str] = []  # doc_types we acknowledge as Received & Validated
         for att in attachments:
             doc_type = att.get("document_type") or _infer_doc_type(att.get("filename") or "")
             if not doc_type and pending:
                 doc_type = pending[0]
             if doc_type in pending:
                 pending.remove(doc_type)
+            if doc_type and doc_type not in validated:
+                validated.append(doc_type)
             if state.access_token and doc_type:
                 try:
                     await self._kyc.upload_document_base64(
@@ -1544,6 +1658,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                         error=str(exc)[:200],
                         note="staging-tolerant: continuing without this doc",
                     )
+        # Acknowledge exactly what we extracted: a per-document "Received &
+        # Validated" checklist. A ZIP gets the "📦 Extracting…" header; a single
+        # file just gets its own ✅ line. The lenient coffee message follows in
+        # documents_complete.
+        await self._acknowledge_uploads(ctx, state, validated, saw_zip=saw_zip)
         # Remaining = required docs this batch did not cover. Tracked locally so
         # generic-filename uploads reliably complete the checklist (we do not
         # re-query the backend's requested-docs list, which kept returning the
@@ -1559,6 +1678,30 @@ class OnboardingWorkflow(WorkflowDefinition):
             missing_documents=missing,
             documents_received=bool(attachments),
         )
+
+    async def _acknowledge_uploads(
+        self,
+        ctx: WorkflowContext,
+        state: OnboardingState,
+        validated: list[str],
+        *,
+        saw_zip: bool,
+    ) -> None:
+        """Send the "Received & Validated" checklist for this upload batch."""
+
+        if not validated:
+            return
+        lines = "\n".join(
+            f"✅ {DOCUMENT_LABELS.get(doc, doc.replace('_', ' ').title())} "
+            "— Received & Validated"
+            for doc in validated
+        )
+        template_key = (
+            "onboarding.documents.zip_received"
+            if saw_zip
+            else "onboarding.documents.single_received"
+        )
+        await self._send(ctx, state, template_key, {"results": lines})
 
     async def _documents_complete(
         self, state: OnboardingState, ctx: WorkflowContext

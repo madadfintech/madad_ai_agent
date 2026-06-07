@@ -156,8 +156,19 @@ _TEMPLATE_BODIES = {
         "{{ documents }}\n\n"
         "No rush — send them one at a time or all together."
     ),
+    # Acknowledgement when the SME sends everything in one ZIP — header + the
+    # per-document "Received & Validated" checklist built by the workflow.
+    "onboarding.documents.zip_received": (
+        "📦 ZIP received! Extracting your documents...\n\n"
+        "{{ results }}"
+    ),
+    # Acknowledgement when one (or a few) loose files are sent — just the
+    # per-document "Received & Validated" lines.
+    "onboarding.documents.single_received": (
+        "{{ results }}"
+    ),
     "onboarding.documents.complete": (
-        "🎊 Great — documents received!\n\n"
+        "🎊 Great — all documents received!\n\n"
         "We will share your assessment report within 24 hours. If all looks good, "
         "we will forward your application to our banking partners in Qatar.\n\n"
         "Meanwhile, enjoy your coffee ☕\n\n"

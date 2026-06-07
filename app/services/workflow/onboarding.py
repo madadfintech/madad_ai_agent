@@ -1363,8 +1363,19 @@ class OnboardingWorkflow(WorkflowDefinition):
                 missing_documents=list(state.missing_documents),
                 documents_received=False,
             )
+        # Track remaining required docs locally. WhatsApp media almost always
+        # arrives with a generic filename (IMG-xxxx.jpg), so _infer_doc_type
+        # returns None and the upload used to be skipped entirely — the checklist
+        # never cleared and the flow looped forever on "still needed". FAILSAFE:
+        # assign each uploaded file to the next still-missing required doc so the
+        # user's uploads actually satisfy the checklist and advance to completion.
+        pending: list[str] = list(state.missing_documents)
         for att in attachments:
             doc_type = att.get("document_type") or _infer_doc_type(att.get("filename") or "")
+            if not doc_type and pending:
+                doc_type = pending[0]
+            if doc_type in pending:
+                pending.remove(doc_type)
             if state.access_token and doc_type:
                 try:
                     await self._kyc.upload_document_base64(
@@ -1381,18 +1392,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                         error=str(exc)[:200],
                         note="staging-tolerant: continuing without this doc",
                     )
-        missing: list[str] = list(state.missing_documents)
-        if state.access_token:
-            try:
-                result = await self._kyc.get_admin_requested_documents(
-                    access_token=state.access_token
-                )
-                if isinstance(result, dict):
-                    missing = list(result.get("missing", []))
-            except Exception as exc:  # noqa: BLE001
-                ctx.logger.warning(
-                    "get_admin_requested_documents.failed", error=str(exc)[:200]
-                )
+        # Remaining = required docs this batch did not cover. Tracked locally so
+        # generic-filename uploads reliably complete the checklist (we do not
+        # re-query the backend's requested-docs list, which kept returning the
+        # just-uploaded docs as still-missing and caused the loop).
+        missing = pending
         if not missing:
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id

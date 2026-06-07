@@ -164,11 +164,14 @@ _TEMPLATE_BODIES = {
     ),
     "onboarding.payment.request": (
         "Hello! 👋\n\n"
-        "Your application has been reviewed by our team. Based on this score, "
-        "we believe you have high chances of getting approval from our banking partners. 💪\n\n"
+        "Your application has been reviewed by our team. Here is your result:\n\n"
+        "📊 Madad Score\n"
+        "{{ madad_score }} / 100 · {{ score_band }}\n\n"
+        "Based on this score, we believe you have high chances of getting approval "
+        "from our banking partners. 💪\n\n"
         "Your application is ready to be forwarded.\n"
-        "To submit your application to the banks, a one-time onboarding and assessment fee "
-        "of QAR {{ amount }} is required.\n\n"
+        "To submit your application to the banks, a one-time onboarding and "
+        "assessment fee of QAR {{ amount }} is required.\n\n"
         "Pay QAR {{ amount }} →\n"
         "{{ payment_link }}\n\n"
         "To know more about our pricing, visit madadfintech.com/pricing.\n\n"

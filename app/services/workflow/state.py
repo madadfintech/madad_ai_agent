@@ -82,6 +82,11 @@ class OnboardingState(WorkflowState):
     journey_status: JourneyStatus | None = None
     last_polled_at: datetime | None = None
     last_status_source: StatusSource | None = None
+    # Madad Score (0-100) — populated from the `prequalification.completed`
+    # webhook payload (per Ishan 2026-06-07, the only auto-emitted event today
+    # carries `{ madadScore }`). Surfaced to the SME on the Step 5 payment
+    # gate message (PDF: "Madad Score 78 / 100 · Strong").
+    madad_score: int | None = None
 
     # Step 1: new-lead onboarding-details capture (precedes complete_onboarding).
     # ALL 9 fields the cluster's AUTH_COMPLETE_ONBOARDING tool requires for a

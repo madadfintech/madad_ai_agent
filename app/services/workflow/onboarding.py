@@ -1180,6 +1180,9 @@ class OnboardingWorkflow(WorkflowDefinition):
         forced = _extract_journey_status(payload)
         if forced is not None:
             fields["journey_status"] = forced
+        score = _extract_madad_score(payload)
+        if score is not None:
+            fields["madad_score"] = score
         return self._step("journey_wait_await", ctx, **fields)
 
     async def _not_qualified(
@@ -1276,6 +1279,12 @@ class OnboardingWorkflow(WorkflowDefinition):
             "amount":         f"{ONBOARDING_FEE_QAR:,}",
             "payment_link":   state.payment_link or "",
             "provider_ref":   state.payment_provider_ref or "",
+            # Madad Score is captured from the prequalification.completed webhook
+            # payload (see _extract_madad_score) — surfaced at the payment gate
+            # per the PDF Step 5 card. Defaults to empty string so a template
+            # that conditionally renders the score doesn't show "None".
+            "madad_score":    str(state.madad_score) if state.madad_score is not None else "",
+            "score_band":     _score_band(state.madad_score),
         }
         await self._send(ctx, state, "onboarding.payment.request", variables)
         await self._reminders.schedule(
@@ -1367,6 +1376,9 @@ class OnboardingWorkflow(WorkflowDefinition):
         forced = _extract_journey_status(payload)
         if forced is not None:
             fields["journey_status"] = forced
+        score = _extract_madad_score(payload)
+        if score is not None:
+            fields["madad_score"] = score
         return self._step("lender_wait_await", ctx, **fields)
 
     async def _offers_fetch(
@@ -1624,3 +1636,40 @@ def _extract_journey_status(payload: Any) -> JourneyStatus | None:
         return JourneyStatus(raw)
     except ValueError:
         return None
+
+
+def _extract_madad_score(payload: Any) -> int | None:
+    """Pull ``madadScore`` off a resume payload.
+
+    Per Ishan (2026-06-07), the ``prequalification.completed`` webhook is
+    the only auto-emitted event today and carries ``{ madadScore }`` (number
+    or null). The dispatcher merges the raw payload into the resume payload
+    so the field arrives camelCase. Returns ``None`` if absent or not a
+    coercible integer (the PDF caps it at 100; we accept any int).
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("madadScore")
+    if raw is None:
+        raw = payload.get("madad_score")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _score_band(score: int | None) -> str:
+    """Map a Madad Score to the PDF's band label ("Strong" / "Moderate" /
+    "Weak"). PDF Step 5 example shows 78 = Strong, no formal cutoff given;
+    using a reasonable default of >=70 Strong, >=50 Moderate, else Weak."""
+
+    if score is None:
+        return ""
+    if score >= 70:
+        return "Strong"
+    if score >= 50:
+        return "Moderate"
+    return "Weak"

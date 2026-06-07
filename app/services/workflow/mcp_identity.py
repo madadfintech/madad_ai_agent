@@ -23,6 +23,7 @@ materialising :class:`ChannelSession`, :class:`ContactCheckResult` and
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Any
 
@@ -59,6 +60,32 @@ def _channel_value(channel: Channel) -> str:
     return channel.value.upper()
 
 
+def _is_backend_checkable_phone(phone: str) -> bool:
+    """Madad's current check-contact endpoint validates Qatar phone numbers.
+
+    Real Qatar WhatsApp users arrive as ``+974XXXXXXXX`` and can be checked.
+    Staging/test WhatsApp identities may be non-Qatar (e.g. ``+91...``). Those
+    should continue as organic/new leads instead of failing the conversation.
+    """
+
+    compact = phone.replace(" ", "").replace("-", "")
+    digits = compact[1:] if compact.startswith("+") else compact
+    return (digits.startswith("974") and len(digits) == 11) or len(digits) == 8
+
+
+def _non_qatar_whatsapp_auth_email() -> str | None:
+    """Optional staging bridge from non-Qatar WhatsApp test numbers to a real
+    Madad email identity.
+
+    The conversation still uses WhatsApp for outbound messages, but auth/session
+    resolution can use an existing UAT MSME email. This is intentionally env
+    gated so production Qatar WhatsApp identities keep the normal phone path.
+    """
+
+    value = os.getenv("WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL", "").strip().lower()
+    return value or None
+
+
 class McpMadadIdentityClient:
     """MCP-backed implementation of the :class:`MadadIdentityClient` port."""
 
@@ -75,11 +102,25 @@ class McpMadadIdentityClient:
         display_name: str | None = None,
         create_onboarding_token: bool = True,
     ) -> ChannelSession:
+        auth_email = (
+            _non_qatar_whatsapp_auth_email()
+            if channel is Channel.WHATSAPP and not _is_backend_checkable_phone(identifier)
+            else None
+        )
+        if auth_email:
+            channel_value = _channel_value(Channel.EMAIL)
+            identifier_value = auth_email
+        else:
+            channel_value = _channel_value(channel)
+            identifier_value = identifier
+
         payload: dict[str, Any] = {
-            "channel": _channel_value(channel),
-            "identifier": identifier,
+            "channel": channel_value,
+            "identifier": identifier_value,
             "create_onboarding_token": create_onboarding_token,
         }
+        if auth_email:
+            payload["email"] = auth_email
         if email is not None:
             payload["email"] = email
         if phone is not None:
@@ -105,6 +146,22 @@ class McpMadadIdentityClient:
     async def check_contact(
         self, *, phone: str | None = None, email: str | None = None
     ) -> ContactCheckResult:
+        if phone is not None and email is None and not _is_backend_checkable_phone(phone):
+            auth_email = _non_qatar_whatsapp_auth_email()
+            if auth_email:
+                email = auth_email
+                phone = None
+            else:
+                return ContactCheckResult(
+                    exists=False,
+                    domain_exists=False,
+                    raw={
+                        "skipped": True,
+                        "reason": "non_qatar_whatsapp_phone",
+                        "phone": phone,
+                    },
+                )
+
         payload: dict[str, Any] = {}
         if phone is not None:
             payload["phone"] = phone

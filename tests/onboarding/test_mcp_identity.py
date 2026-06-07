@@ -128,6 +128,68 @@ async def test_check_contact_omits_unset_args() -> None:
     assert payload == {"phone": "+97499900000"}
 
 
+async def test_check_contact_non_qatar_whatsapp_phone_continues_as_new_lead(monkeypatch) -> None:
+    monkeypatch.delenv("WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL", raising=False)
+    caller = InMemoryMCPClient(
+        handlers={
+            Tools.AUTH_CHECK_CONTACT: lambda p: pytest.fail(
+                "non-Qatar staging phone should not call backend check-contact"
+            )
+        }
+    )
+
+    result = await McpMadadIdentityClient(caller).check_contact(phone="+918287611995")
+
+    assert result.exists is False
+    assert result.domain_exists is False
+    assert result.raw["reason"] == "non_qatar_whatsapp_phone"
+    assert caller.calls == []
+
+
+async def test_check_contact_non_qatar_whatsapp_phone_can_use_auth_email_alias(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL",
+        "tech.external1@madadfintech.com",
+    )
+    caller = InMemoryMCPClient(
+        handlers={
+            Tools.AUTH_CHECK_CONTACT: lambda p: {"exists": True, "field": "email"}
+        }
+    )
+
+    result = await McpMadadIdentityClient(caller).check_contact(phone="+918287611995")
+
+    assert result.exists is True
+    assert result.field == "email"
+    _, payload = caller.calls[0]
+    assert payload == {"email": "tech.external1@madadfintech.com"}
+
+
+async def test_open_session_non_qatar_whatsapp_can_use_auth_email_alias(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL",
+        "tech.external1@madadfintech.com",
+    )
+    caller = InMemoryMCPClient(
+        handlers={
+            Tools.MCP_CREATE_CHANNEL_SESSION: lambda p: {
+                "sessionType": "existing_user",
+                "accessToken": "AT-123",
+            }
+        }
+    )
+
+    await McpMadadIdentityClient(caller).open_session(
+        channel=WA,
+        identifier="+918287611995",
+    )
+
+    _, payload = caller.calls[0]
+    assert payload["channel"] == "EMAIL"
+    assert payload["identifier"] == "tech.external1@madadfintech.com"
+    assert payload["email"] == "tech.external1@madadfintech.com"
+
+
 # -- complete_onboarding ------------------------------------------------------
 
 

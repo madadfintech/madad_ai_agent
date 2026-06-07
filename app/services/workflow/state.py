@@ -115,6 +115,7 @@ class OnboardingState(WorkflowState):
 
     # Step 5–6: dynamic checklist + counterparties.
     missing_documents: list[str] = []
+    documents_received: bool = False
     buyers: list[dict[str, Any]] = []
     shareholders: list[dict[str, Any]] = []
 
@@ -155,3 +156,7 @@ def reply_attachments(value: Any) -> list[dict[str, Any]]:
 
 def is_yes(value: Any) -> bool:
     return reply_text(value).upper() in {"YES", "Y", "نعم"}
+
+
+def is_no(value: Any) -> bool:
+    return reply_text(value).upper() in {"NO", "N", "لا"}

@@ -23,6 +23,7 @@ materialising :class:`ChannelSession`, :class:`ContactCheckResult` and
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from datetime import datetime
@@ -90,11 +91,21 @@ def _placeholder_email_for_phone(phone: str) -> str:
     """
 
     digits = re.sub(r"\D", "", phone or "") or "unknown"
-    domain = (
+    # Parent domain (overridable). Each phone gets its OWN unique SUBDOMAIN under
+    # it. The backend guards signup/login per email DOMAIN — it blocks when any
+    # user already has ``email endsWith '@' + domain`` (auth.service.ts) — so a
+    # SHARED placeholder domain made every WhatsApp lead after the first fail with
+    # "domain already registered". The subdomain here is a deterministic hash of
+    # the phone: same phone → same email (so check_contact / open_session resume
+    # the SAME user and repeat messages don't fork a new account), while two
+    # different phones get different, collision-free, random-looking domains.
+    # Valid e-mail syntax, and NO backend change required.
+    base = (
         os.getenv("WORKFLOW__WHATSAPP_PLACEHOLDER_EMAIL_DOMAIN", "").strip()
-        or "wa.madadfintech.com"
+        or "madadfintech.com"
     )
-    return f"wa{digits}@{domain}"
+    token = hashlib.sha256(digits.encode("utf-8")).hexdigest()[:20]
+    return f"wa{digits}@wa{token}.{base}"
 
 
 class McpMadadIdentityClient:

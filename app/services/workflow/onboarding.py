@@ -1890,11 +1890,9 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "received" if state.shareholders else "missing"
 
     def _route_documents(self, state: OnboardingState) -> str:
-        if not state.documents_received:
-            return "await_again"
-        # Loop back (showing the N/M progress meter) until every required doc is
-        # in, then complete ("coffee").
-        return "complete" if not state.missing_documents else "missing"
+        # Lenient: SMEs send many docs at once and won't upload every item, so as
+        # soon as ANY document arrives we move on ("our team will review them").
+        return "complete" if state.documents_received else "await_again"
 
     def _route_payment(self, state: OnboardingState) -> str:
         return "paid" if state.paid else "unpaid"

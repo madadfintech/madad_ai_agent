@@ -16,7 +16,17 @@ from pydantic import BaseModel, Field
 from app.shared.workflow.enums import Channel
 from app.shared.workflow.utils import new_id
 
-SessionType = Literal["existing_user", "new_lead"]
+SessionType = Literal[
+    "existing_user",
+    "new_lead",
+    # Per Ishan (2026-06-07): backend returns this when
+    # ``create_user_if_missing=True`` minted a fresh SIGN_UP account on the
+    # spot (WhatsApp organic-entry path).
+    "new_user_created",
+    # Per Ishan: backend returns this when a portal user already exists for
+    # the phone — agent should tell them to log in to madadfintech.com.
+    "existing_portal_user",
+]
 ContactField = Literal["phone", "email"]
 
 # -- Messenger (outbound conversation via Communication + CMS) ---------------
@@ -124,6 +134,12 @@ class ChannelSession(BaseModel):
     refresh_token: str | None = None
     token_expires_at: int | None = None  # unix epoch seconds when known
     user_or_lead_ref: str | None = None
+    # Per Ishan (2026-06-07): the channel-session response also carries
+    # ``referenceNumber`` (= ``User.uniqueId`` on the backend) which is the
+    # user-facing application reference (e.g. ``Y6NICTES``, 8-char uppercase
+    # alphanumeric — NOT the 7-digit format the PDF mock shows). Populates
+    # immediately on account creation.
+    reference_number: str | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -174,6 +190,7 @@ class MadadIdentityClient(Protocol):
         phone: str | None = None,
         display_name: str | None = None,
         create_onboarding_token: bool = True,
+        create_user_if_missing: bool = False,
     ) -> ChannelSession: ...
 
     async def check_contact(
@@ -199,6 +216,37 @@ class MadadIdentityClient(Protocol):
     async def refresh(self, *, refresh_token: str) -> AuthTokens: ...
 
     async def logout(self, *, access_token: str) -> None: ...
+
+    async def update_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+        step: int | None = None,
+        touch_inbound: bool = False,
+    ) -> dict[str, Any]:
+        """Per Ishan (2026-06-07): record a WhatsApp lead's onboarding step.
+
+        Backend hard-gates the pre-qualified document checklist on ``step >= 3``,
+        so the agent MUST call this with ``step=3`` after the audited financial
+        report upload + account-created message fires. ``touch_inbound=True`` on
+        every inbound keeps Meta's 24h window fresh. Identify the lead by
+        ``user_id``, OR by ``channel + identifier`` (phone).
+        """
+        ...
+
+    async def get_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        """Read the current onboarding step / last_inbound_at / journey_status
+        for a WhatsApp lead. Used for resume logic when the workflow loses its
+        own in-memory state."""
+        ...
 
 
 class InMemoryMadadIdentityClient:
@@ -247,6 +295,7 @@ class InMemoryMadadIdentityClient:
         phone: str | None = None,
         display_name: str | None = None,
         create_onboarding_token: bool = True,
+        create_user_if_missing: bool = False,
     ) -> ChannelSession:
         self._record(
             "open_session",
@@ -256,6 +305,7 @@ class InMemoryMadadIdentityClient:
             phone=phone,
             display_name=display_name,
             create_onboarding_token=create_onboarding_token,
+            create_user_if_missing=create_user_if_missing,
         )
         # The MCP bridge tool resolves identifier-on-channel — the in-memory
         # equivalent looks up whichever index matches the channel.
@@ -268,6 +318,20 @@ class InMemoryMadadIdentityClient:
                 access_token=new_id("at"),
                 refresh_token=new_id("rt"),
                 user_or_lead_ref=user_id,
+                raw={"identifier": identifier, "channel": str(channel)},
+            )
+        # Per Ishan (2026-06-07): when create_user_if_missing=True (the
+        # WhatsApp organic-entry path), the backend auto-creates a SIGN_UP
+        # account from the phone number alone and returns an accessToken
+        # directly — no separate complete_onboarding round-trip needed.
+        # Simulate that here so the in-memory tests cover the new branch.
+        if create_user_if_missing:
+            return ChannelSession(
+                session_type="new_user_created",
+                access_token=new_id("at"),
+                refresh_token=new_id("rt"),
+                user_or_lead_ref=new_id("user"),
+                reference_number=new_id("ref")[-8:].upper(),
                 raw={"identifier": identifier, "channel": str(channel)},
             )
         return ChannelSession(
@@ -342,6 +406,40 @@ class InMemoryMadadIdentityClient:
         self._record("logout", access_token=access_token)
         self._revoked_tokens.add(access_token)
 
+    async def update_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+        step: int | None = None,
+        touch_inbound: bool = False,
+    ) -> dict[str, Any]:
+        self._record(
+            "update_onboarding_progress",
+            user_id=user_id,
+            channel=channel,
+            identifier=identifier,
+            step=step,
+            touch_inbound=touch_inbound,
+        )
+        return {"step": step, "touch_inbound": touch_inbound, "user_id": user_id}
+
+    async def get_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        self._record(
+            "get_onboarding_progress",
+            user_id=user_id,
+            channel=channel,
+            identifier=identifier,
+        )
+        return {"step": 0, "journey_status": "SIGN_UP", "last_inbound_at": None}
+
 
 # -- KycClient: the new port the Phase 2 graph uses for KYC tools -------------
 
@@ -404,7 +502,17 @@ class KycClient(Protocol):
         content_base64: str,
         filename: str,
         mime_type: str | None = None,
-    ) -> dict[str, Any]: ...
+        document_param: str | None = None,
+        document_label: str | None = None,
+    ) -> dict[str, Any]:
+        """Per Ishan (2026-06-07): preferred upload tool for WhatsApp/email
+        attachments where the SME hasn't told us what doc type they're
+        sending. The backend classifier (same one the MSME portal uses)
+        decides the type and routes to the right entity slot; the response
+        carries the resolved ``document_type`` so the agent can acknowledge
+        per-doc without filename guessing on our side.
+        """
+        ...
 
     async def classify_and_upload_zip_base64(
         self,
@@ -412,7 +520,14 @@ class KycClient(Protocol):
         access_token: str,
         content_base64: str,
         filename: str,
-    ) -> dict[str, Any]: ...
+        continue_on_error: bool = True,
+    ) -> dict[str, Any]:
+        """Expand a ZIP and classify + upload every member through the
+        portal pipeline. Returns the per-file checklist (file_name,
+        resolved document_type, confidently_classified bool) — exactly the
+        shape needed to render the PDF Step 4 'ZIP received / found these /
+        still missing X' message."""
+        ...
 
     async def add_buyer(
         self, *, access_token: str, data: dict[str, Any]
@@ -535,24 +650,49 @@ class InMemoryKycClient:
         content_base64: str,
         filename: str,
         mime_type: str | None = None,
+        document_param: str | None = None,
+        document_label: str | None = None,
     ) -> dict[str, Any]:
+        """In-memory classifier: looks at the filename keywords to pick a
+        type (mirrors the workflow's old _infer_doc_type), defaults to
+        ``ADDITIONAL_DOCUMENT`` so files are never lost."""
         self._record(
             "classify_and_upload_document_base64",
             access_token=access_token,
             filename=filename,
             mime_type=mime_type,
+            document_param=document_param,
+            document_label=document_label,
         )
-        key = filename or new_id("doc")
-        self.uploaded_documents[key] = {
+        # Tiny stand-in classifier: filename keywords decide.
+        lowered = (filename or "").lower()
+        keyword_map = {
+            "cr": "commercial_registration",
+            "commercial": "commercial_registration",
+            "audited": "audited_report",
+            "financial": "audited_report",
+            "trade": "trade_license",
+            "tax": "tax_card",
+            "bank": "bank_statement",
+            "vat": "vat_certificate",
+            "establishment": "establishment_card",
+            "qid": "qid",
+            "passport": "passport",
+        }
+        document_type = "additional_document"
+        for kw, dt in keyword_map.items():
+            if kw in lowered:
+                document_type = dt
+                break
+        self.uploaded_documents[document_type] = {
             "filename": filename,
             "content_base64": content_base64,
             "mime_type": mime_type,
         }
         return {
-            "classified": True,
-            "document_type": "additional_document",
-            "classification_label": filename or "Document",
             "document_id": new_id("doc"),
+            "document_type": document_type,
+            "confidently_classified": document_type != "additional_document",
         }
 
     async def classify_and_upload_zip_base64(
@@ -561,31 +701,17 @@ class InMemoryKycClient:
         access_token: str,
         content_base64: str,
         filename: str,
+        continue_on_error: bool = True,
     ) -> dict[str, Any]:
+        """In-memory ZIP classify-and-upload — empty checklist by default;
+        tests can preload self.zip_contents to model contents."""
         self._record(
             "classify_and_upload_zip_base64",
             access_token=access_token,
             filename=filename,
+            continue_on_error=continue_on_error,
         )
-        key = filename or new_id("zip")
-        self.uploaded_documents[key] = {
-            "filename": filename,
-            "content_base64": content_base64,
-        }
-        return {
-            "success": True,
-            "uploaded_count": 1,
-            "error_count": 0,
-            "documents": [
-                {
-                    "file_name": filename,
-                    "classified": True,
-                    "document_type": "additional_document",
-                    "classification_label": filename or "Document",
-                }
-            ],
-            "errors": [],
-        }
+        return {"checklist": [], "uploaded_count": 0}
 
     async def add_buyer(
         self, *, access_token: str, data: dict[str, Any]
@@ -826,6 +952,10 @@ class RecordingReminders(Reminders):
     def __init__(self) -> None:
         self.scheduled: list[str] = []
         self.suppressed: list[str | None] = []
+        # Full call log: ``(reason, {channel, identity, target_ref, variables})``.
+        # Tests inspect ``variables`` to verify A9 (payment-link + missing-docs
+        # threading).
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def schedule(
         self,
@@ -837,6 +967,15 @@ class RecordingReminders(Reminders):
         variables: dict[str, Any] | None = None,
     ) -> None:
         self.scheduled.append(reason)
+        self.calls.append((
+            reason,
+            {
+                "channel": channel,
+                "identity": identity,
+                "target_ref": target_ref,
+                "variables": variables or {},
+            },
+        ))
 
     async def suppress(self, *, target_ref: str | None) -> None:
         self.suppressed.append(target_ref)

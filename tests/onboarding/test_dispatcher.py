@@ -19,9 +19,12 @@ async def test_inbound_starts_then_resumes_same_run(harness):
     assert first.prompt["step"] == "campaign"
     run_id = first.run.run_id
 
-    second = await dispatcher.inbound(WA, IDENTITY, text="YES")  # YES → resume same run
+    # YES → resume same run. Post-main-merge the new-lead branch uses
+    # create_user_if_missing=True so we land at consent_cr directly (no
+    # collect_details step anymore).
+    second = await dispatcher.inbound(WA, IDENTITY, text="YES")
     assert second.run.run_id == run_id
-    assert second.prompt["step"] == "collect_details"
+    assert second.prompt["step"] == "consent_cr"
 
 
 async def test_on_inbound_with_message_object(harness):
@@ -35,26 +38,29 @@ async def test_on_inbound_with_message_object(harness):
 
 
 async def test_resume_external_status_update(harness):
+    """Drive the post-main spec-aligned flow:
+    campaign → YES → CR upload → audited upload →
+    PARK(prequalify_wait) → prequalification.completed webhook →
+    documents upload → PARK(journey_wait) → status_update PRE_QUALIFIED → payment.
+    """
     dispatcher = harness.platform.dispatcher
     runtime = harness.platform.runtime
 
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    await dispatcher.inbound(WA, IDENTITY, text="YES")
-    await dispatcher.inbound(WA, IDENTITY, text="Aisha Karim")
+    await dispatcher.inbound(WA, IDENTITY, text="YES")  # → consent_cr
     await dispatcher.inbound(
         WA, IDENTITY, attachments=[{"filename": "CR.pdf", "content_base64": DOC}]
-    )
-    # Eligibility form payload (no attachments / text — pure dict).
-    await dispatcher.resume_external(
-        WA, IDENTITY, {"annual_revenue_qar": 1000}
-    )
+    )  # → financials
     await dispatcher.inbound(
         WA, IDENTITY, attachments=[{"filename": "Audited.pdf", "content_base64": DOC}]
-    )
-    await dispatcher.resume_external(WA, IDENTITY, {"name": "ACME"})
+    )  # → prequalify_wait
+
+    # Release the prequalification gate (Postman/admin would emit this in
+    # production; here we resume_external with the canonical event).
     await dispatcher.resume_external(
-        WA, IDENTITY, {"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]}
-    )
+        WA, IDENTITY, {"event": "prequalification.completed", "madadScore": 78}
+    )  # → documents
+
     await dispatcher.inbound(
         WA,
         IDENTITY,
@@ -62,10 +68,13 @@ async def test_resume_external_status_update(harness):
             {"filename": "Trade_License.pdf", "content_base64": DOC},
             {"filename": "Tax_Card.pdf", "content_base64": DOC},
         ],
-    )
+    )  # → journey_wait
 
-    # Webhook-driven status update advances the journey out of journey_wait.
+    # Backend fires the payment-trigger webhook (madad_score.ready in the
+    # spec; emit explicit journey_status to satisfy _is_payment_trigger).
     harness.identity.journey_status = "PRE_QUALIFIED"
-    result = await dispatcher.resume_external(WA, IDENTITY, {"type": "status_update"})
+    result = await dispatcher.resume_external(
+        WA, IDENTITY, {"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"}
+    )
 
     assert result.prompt["step"] == "payment"

@@ -56,7 +56,7 @@ class CommunicationMessenger(Messenger):
         variables: dict[str, Any] | None = None,
         locale: str = "en",
     ) -> bool:
-        from app.services.communication.models import MessageStatus
+        from app.services.communication.models import MessageStatus  # type: ignore[attr-defined]
         from app.shared.i18n import Locale
 
         message = await self._comms.send(

@@ -11,30 +11,32 @@ IDENTITY = "+97455500701"
 
 
 async def _drive_to_payment_block(harness):
-    """Drive the workflow up to and through the payment chain (paid)."""
+    """Drive the spec-aligned flow up to the payment_await interrupt."""
 
     runtime = harness.platform.runtime
+    doc = "ZHVtbXk="
 
     async def resume(message):
         return await runtime.resume(WA, IDENTITY, message=message)
 
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     await resume({"text": "YES"})
-    await resume({"first_name": "A", "last_name": "B"})
-    await resume({"attachments": [{"filename": "CR.pdf"}]})
-    await resume({"annual_revenue_qar": 1000})
-    await resume({"attachments": [{"filename": "Audited.pdf"}]})
-    await resume({"name": "Buyer 1"})
-    await resume({"shareholders": [{"name": "A", "percentage": 100}]})
+    await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
+    await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
+    await resume({"event": "prequalification.completed", "madadScore": 78})
     await resume(
-        {"attachments": [{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}]}
+        {
+            "attachments": [
+                {"filename": "Trade_License.pdf", "content_base64": doc},
+                {"filename": "Tax_Card.pdf", "content_base64": doc},
+            ]
+        }
     )
 
     harness.identity.journey_status = "PRE_QUALIFIED"
-    after_status = await resume({"type": "status_update"})
-    # After the status update the chain has already run silently up to the
-    # payment_await await — the prompt confirms we're at the payment-wait
-    # interrupt.
+    after_status = await resume(
+        {"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"}
+    )
     assert after_status.prompt == {"waiting_for": "payment", "step": "payment"}
     return after_status
 
@@ -43,12 +45,10 @@ async def test_payment_chain_runs_in_order(harness):
     await _drive_to_payment_block(harness)
 
     names = [name for name, _ in harness.payments.calls]
-    # First get_business_details happens during _eligibility_update (state
-    # syncs the backend's normalized eligibility values back into state);
-    # the second + rest are the payment chain proper.
+    # Spec-aligned flow dropped the eligibility_update node, so the duplicate
+    # state-sync call no longer happens. Only the payment chain proper.
     assert names == [
-        "get_business_details",                # from eligibility_update state-sync
-        "get_business_details",                # from business_details_fetch node
+        "get_business_details",
         "list_monetization_products",
         "create_monetization_payment",
         "send_monetization_payment_link",
@@ -128,9 +128,8 @@ async def test_send_link_uses_channel_and_identity_from_context(harness):
 async def test_payment_request_template_sent_at_send_link_node(harness):
     await _drive_to_payment_block(harness)
 
-    # The chain only sends ONE conversational message — the introductory
-    # "your payment is ready" template at payment_send_link. The MCP tool
-    # itself delivers the actual link via the channel from the Madad
-    # backend (we don't duplicate-send).
+    # The chain sends ONE conversational message at payment_send_link. Main
+    # switched to the interactive CTA variant `payment.request.button` (the
+    # "Pay QAR 6,000 →" tappable button) instead of plain `payment.request`.
     templates = harness.messenger.templates()
-    assert templates.count("onboarding.payment.request") == 1
+    assert templates.count("onboarding.payment.request.button") == 1

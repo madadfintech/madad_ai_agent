@@ -82,7 +82,6 @@ class OnboardingState(WorkflowState):
     journey_status: JourneyStatus | None = None
     last_polled_at: datetime | None = None
     last_status_source: StatusSource | None = None
-
     # Step 1: new-lead onboarding-details capture (precedes complete_onboarding).
     # ALL 9 fields the cluster's AUTH_COMPLETE_ONBOARDING tool requires for a
     # fresh signup; email/phone are normally derived from the channel identity
@@ -125,6 +124,12 @@ class OnboardingState(WorkflowState):
     prequalified: bool = False
     payment_ready: bool = False
     madad_score: int | None = None
+    # Per Ishan (2026-06-07): backend tracks the conversational onboarding
+    # step for WhatsApp leads via ``madad_mcp_update_onboarding_progress``.
+    # Hard-gates the pre-qualified document checklist on ``step >= 3``.
+    # Recorded so the workflow doesn't re-call the tool with a stale (lower)
+    # step number on retries / resumes.
+    onboarding_progress_step: int | None = None
 
     # Step 7–8: payment + offers.
     paid: bool = False

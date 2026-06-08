@@ -54,33 +54,25 @@ def test_full_flow_over_http() -> None:
     assert started.json()["waiting"] is True
     assert started.json()["prompt"]["step"] == "campaign"
 
-    assert _inbound(text="YES").json()["prompt"]["step"] == "collect_details"
-    assert _inbound(text="Aisha Karim").json()["prompt"]["step"] == "consent_cr"
+    # Post-main spec-aligned flow: YES → consent_cr direct (no collect_details
+    # form), CR → financials direct (no 7-field eligibility form), audited →
+    # PARK(prequalify_wait), prequalification.completed → documents, doc upload
+    # → PARK(journey_wait or payment_wait depending on path), payment chain.
+    assert _inbound(text="YES").json()["prompt"]["step"] == "consent_cr"
     assert (
-        _inbound(attachments=[{"filename": "CR.pdf", "content_base64": DOC}]).json()["prompt"]["step"]
-        == "eligibility"
-    )
-    # Eligibility form: structured data via the inbound `data` field.
-    assert (
-        _inbound(data={"annual_revenue_qar": 1000}).json()["prompt"]["step"]
+        _inbound(attachments=[{"filename": "CR.pdf", "content_base64": DOC}]).json()["prompt"]["step"]  # noqa: E501
         == "financials"
     )
-
     assert (
-        _inbound(attachments=[{"filename": "Audited.pdf", "content_base64": DOC}]).json()["prompt"]["step"]
-        == "buyers"
-    )
-    assert _inbound(data={"name": "ACME"}).json()["prompt"]["step"] == "shareholders"
-    assert (
-        _inbound(
-            data={"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]}
-        ).json()["prompt"]["step"]
-        == "documents"
+        _inbound(attachments=[{"filename": "Audited.pdf", "content_base64": DOC}]).json()["prompt"]["step"]  # noqa: E501
+        == "prequalify_wait"
     )
 
-    status = client.get("/workflow/status", params={"channel": "whatsapp", "identity": IDENTITY})
-    assert status.status_code == 200
-    assert status.json()["status"] == "waiting_for_input"
+    # Release prequalification gate via webhook.
+    advanced = _backend_event(
+        "prequalification.completed", payload={"madadScore": 78}, event_id="evt-prequal"
+    )
+    assert advanced.json()["prompt"]["step"] == "documents"
 
     docs = _inbound(
         attachments=[
@@ -89,21 +81,24 @@ def test_full_flow_over_http() -> None:
             {"filename": "Bank_Statement.pdf", "content_base64": DOC},
         ]
     )
-    assert docs.json()["prompt"]["step"] == "journey_wait"
+    # After docs the workflow PARKs at payment_wait (not journey_wait — main
+    # restructured the flow so payment gate fires off madad_score.ready /
+    # payment.requested events, not status_update).
+    assert docs.json()["prompt"]["step"] == "payment_wait"
 
-    # Backend event advances journey → payment chain → payment_await.
+    # Backend fires the payment-gate trigger → payment chain → payment_await.
     platform = get_onboarding_platform()
     platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
-    advanced = _backend_event("eligibility.updated", event_id="evt-1")
+    advanced = _backend_event("madad_score.ready", {"madadScore": 78}, event_id="evt-score")
     assert advanced.json()["prompt"]["step"] == "payment"
 
     # Payment paid → lender_wait.
-    paid = _backend_event("payment.completed", {"paid": True}, event_id="evt-2")
+    paid = _backend_event("payment.completed", {"paid": True}, event_id="evt-paid")
     assert paid.json()["prompt"]["step"] == "lender_wait"
 
     # ACCEPTED → offers_fetch → offer handoff terminal.
     platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
-    final = _backend_event("offers.available", event_id="evt-3")
+    final = _backend_event("offers.available", event_id="evt-offers")
     assert final.json()["completed"] is True
     assert final.json()["outcome"] == "offer_handoff"
 

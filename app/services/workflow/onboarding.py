@@ -86,6 +86,7 @@ from app.shared.workflow import (
 from app.shared.workflow.enums import Channel
 from app.shared.workflow.state import HistoryEntry
 
+from .mcp_kyc import workflow_doc_type as _workflow_doc_type
 from .ports import (
     KycClient,
     MadadIdentityClient,
@@ -124,11 +125,13 @@ TEMPLATE_KEYS = [
     "onboarding.upload.required",
     "onboarding.status.pending",
     "onboarding.payment.awaiting",
+    "onboarding.payment.confirmed",
     "onboarding.not_qualified",
     "onboarding.payment.request",
     "onboarding.payment.request.button",
     "onboarding.offers.preview",
     "onboarding.offer.handoff",
+    "onboarding.offer.handoff.button",
     "onboarding.activated",
 ]
 
@@ -544,6 +547,75 @@ def _format_documents(documents: list[str]) -> str:
     return "\n".join(f"{idx}. {label}" for idx, label in enumerate(labels, start=1))
 
 
+def _format_banks_list(banks: list[str]) -> str:
+    """Render the assigned-banks list as natural prose ('A and B', 'A, B and
+    C') for the Step 6 payment-confirmed message. Empty list → 'our banking
+    partners' so the sentence still reads correctly."""
+
+    cleaned = [b for b in banks if b]
+    if not cleaned:
+        return "our banking partners"
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
+
+
+def _format_offer_cards(offers: list[dict[str, Any]]) -> str:
+    """Render the offer set as PDF Step 8-style cards (one block per offer).
+
+    Per Ishan's confirmed schema (2026-06-07): each offer carries
+    ``lender, creditLimit, interestRate, tenureDays, processingFee,
+    expiryDate``. Fields are camelCase but snake_case copies are tolerated
+    so test fixtures with shorthand shapes don't crash.
+
+    Returns the empty string when there are no offers so the template
+    placeholder substitutes cleanly to nothing.
+    """
+
+    if not offers:
+        return ""
+
+    def _g(offer: dict[str, Any], *keys: str) -> Any:
+        for k in keys:
+            if k in offer and offer[k] is not None:
+                return offer[k]
+        return None
+
+    def _fmt_qar(value: Any) -> str:
+        try:
+            return f"QAR {int(value):,}"
+        except (TypeError, ValueError):
+            return f"QAR {value}" if value is not None else "QAR —"
+
+    def _fmt_pct(value: Any) -> str:
+        try:
+            return f"{float(value):g}% p.a."
+        except (TypeError, ValueError):
+            return f"{value} p.a." if value is not None else "—"
+
+    def _fmt_days(value: Any) -> str:
+        try:
+            return f"{int(value)} days"
+        except (TypeError, ValueError):
+            return f"{value}" if value is not None else "—"
+
+    lines: list[str] = []
+    for idx, offer in enumerate(offers, start=1):
+        lender = _g(offer, "lender", "bank_name", "bankName") or "Lender"
+        limit = _fmt_qar(_g(offer, "creditLimit", "credit_limit", "limit"))
+        rate = _fmt_pct(_g(offer, "interestRate", "interest_rate", "rate"))
+        tenure = _fmt_days(_g(offer, "tenureDays", "tenure_days", "tenure"))
+        fee_value = _g(offer, "processingFee", "processing_fee", "fee")
+        fee = _fmt_qar(fee_value) + " fee" if fee_value is not None else "no fee"
+        lines.append(
+            f"🏦 Offer {idx} — {lender}\n"
+            f"💰 {limit} · 📈 {rate} · ⏱ {tenure} · 💳 {fee}"
+        )
+    return "\n━━━━━━━━━━━━━\n".join(lines)
+
+
 def _next_step_hint(state: OnboardingState) -> str:
     step = state.history[-1].step if state.history else ""
     if step in {"campaign_send", "campaign_await"}:
@@ -551,7 +623,7 @@ def _next_step_hint(state: OnboardingState) -> str:
     if step in {"consent_send", "consent_await"}:
         return "Right now I need your Commercial Registration (CR) as a PDF or photo."
     if step in {"eligibility_intake_send", "eligibility_intake_await"}:
-        return "Right now I need the 7 quick business details: Qatar-based, business age, CR validity, company type, sector, turnover, and employees."
+        return "Right now I need the 7 quick business details: Qatar-based, business age, CR validity, company type, sector, turnover, and employees."  # noqa: E501
     if step in {"financials_send", "financials_await"}:
         return "Right now I need your latest Audited Financial Statement as a PDF or photo."
     if step in {"buyers_collect_send", "buyers_collect_await"}:
@@ -561,7 +633,7 @@ def _next_step_hint(state: OnboardingState) -> str:
     if step in {"documents_upload_loop_send", "documents_upload_loop_await"}:
         return f"Right now I need these documents:\n{_format_documents(state.missing_documents)}"
     if step in {"payment_send_link", "payment_await"}:
-        return "Right now your payment link is ready. Once payment is complete, we will forward your application."
+        return "Right now your payment link is ready. Once payment is complete, we will forward your application."  # noqa: E501
     if step in {"documents_complete", "journey_wait_await", "lender_wait_await"}:
         return "Your application is under review. I’ll notify you as soon as there is an update."
     return "I’ll guide you step by step through the application."
@@ -618,6 +690,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "check_contact_await": self._check_contact_await,
             "domain_blocked": self._domain_blocked,
             "channel_session_first": self._channel_session_first,
+            "channel_session_create_user": self._channel_session_create_user,
             "collect_onboarding_details_send": self._collect_onboarding_details_send,
             "collect_onboarding_details_await": self._collect_onboarding_details_await,
             "complete_onboarding_send": self._complete_onboarding_send,
@@ -686,6 +759,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             {
                 "existing": "channel_session_first",
                 "new": "complete_onboarding_send",
+                # WhatsApp organic-entry: single create_user_if_missing call
+                # mints SIGN_UP + access_token in one round-trip.
+                "new_whatsapp": "channel_session_create_user",
                 "blocked": "domain_blocked",
             },
         )
@@ -703,6 +779,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         graph.add_edge("complete_onboarding_send", "channel_session_second")
         graph.add_conditional_edges(
             "channel_session_second",
+            self._route_channel_session,
+            {"consent": "consent_send"},
+        )
+        # WhatsApp organic-entry converges at consent_send via the
+        # create_user_if_missing fast-path — no complete_onboarding hop.
+        graph.add_conditional_edges(
+            "channel_session_create_user",
             self._route_channel_session,
             {"consent": "consent_send"},
         )
@@ -903,6 +986,45 @@ class OnboardingWorkflow(WorkflowDefinition):
             refresh_token=session.refresh_token,
             token_expires_at=session.token_expires_at,
             madad_user_id=session.user_or_lead_ref,
+            application_ref=session.reference_number or state.application_ref,
+        )
+
+    async def _channel_session_create_user(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """WhatsApp organic-entry: open a session with
+        ``create_user_if_missing=True``. Per Ishan (2026-06-07), the backend
+        auto-creates a SIGN_UP account from the phone alone and returns an
+        ``accessToken`` directly — no separate ``collect_details`` intake or
+        ``complete_onboarding`` round-trip required. The ``referenceNumber``
+        on the response (``User.uniqueId``) populates immediately so the
+        account-created message can surface it on the very next step.
+        """
+
+        session = await self._identity.open_session(
+            channel=_channel(ctx),
+            identifier=ctx.identity,
+            create_onboarding_token=False,
+            create_user_if_missing=True,
+        )
+        # Step 1 — lead created (SIGN_UP). Record with the freshly-minted
+        # user_id so subsequent progress calls don't need channel+identifier.
+        progress_step = await self._update_progress(
+            state.model_copy(update={"madad_user_id": session.user_or_lead_ref}),
+            ctx,
+            step=1,
+        )
+        return self._step(
+            "channel_session_create_user",
+            ctx,
+            channel_session_response=session,
+            session_type=session.session_type,
+            access_token=session.access_token,
+            refresh_token=session.refresh_token,
+            token_expires_at=session.token_expires_at,
+            madad_user_id=session.user_or_lead_ref,
+            application_ref=session.reference_number or state.application_ref,
+            onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
 
     async def _collect_onboarding_details_send(
@@ -954,10 +1076,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         cr = data.get("cr_number") or _line(2)
         if "is_qatar_based" in data:
             qatar: bool | None = bool(data["is_qatar_based"])
-        elif _line(3) is not None:
-            qatar = _line(3).lower() in ("yes", "y", "true", "qatar", "qatar based")
         else:
-            qatar = None
+            line3 = _line(3)
+            qatar = (
+                line3.lower() in ("yes", "y", "true", "qatar", "qatar based")
+                if line3 is not None
+                else None
+            )
         role = data.get("role") or _line(4)
         return self._step(
             "collect_onboarding_details_await",
@@ -1071,7 +1196,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 state,
                 "onboarding.help.contextual",
                 {
-                    "answer": "Your application is still in progress. We still need your CR before submitting it.",
+                    "answer": "Your application is still in progress. We still need your CR before submitting it.",  # noqa: E501
                     "next_step": _next_step_hint(state),
                 },
             )
@@ -1121,9 +1246,12 @@ class OnboardingWorkflow(WorkflowDefinition):
                     "cr_upload.failed", error=str(exc)[:200],
                     note="staging-tolerant: continuing without CR uploaded",
                 )
+        # Step 2 — CR uploaded (backend journey_status: INCOMPLETE).
+        progress_step = await self._update_progress(state, ctx, step=2)
         return self._step(
             "cr_upload_base64", ctx,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
+            onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
 
     # -- Step 3: eligibility intake ------------------------------------------
@@ -1159,7 +1287,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 state,
                 "onboarding.help.contextual",
                 {
-                    "answer": "Your application is still in progress. We have not submitted it yet.",
+                    "answer": "Your application is still in progress. We have not submitted it yet.",  # noqa: E501
                     "next_step": _next_step_hint(state),
                 },
             )
@@ -1284,7 +1412,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 state,
                 "onboarding.help.contextual",
                 {
-                    "answer": "Your application is still in progress. We still need your audited financial statement before submitting it.",
+                    "answer": "Your application is still in progress. We still need your audited financial statement before submitting it.",  # noqa: E501
                     "next_step": _next_step_hint(state),
                 },
             )
@@ -1340,14 +1468,24 @@ class OnboardingWorkflow(WorkflowDefinition):
             try:
                 info = await self._identity.me(access_token=state.access_token)
                 if isinstance(info, dict):
-                    user = info.get("user") if isinstance(info.get("user"), dict) else info
+                    nested = info.get("user")
+                    user = nested if isinstance(nested, dict) else info
                     ref = str(user.get("uniqueId") or user.get("unique_id") or "")
             except Exception:  # noqa: BLE001
                 pass
         if not ref:
             ref = (re.sub(r"\D", "", ctx.identity or "")[-8:] or "MADAD")
         await self._send(ctx, state, "onboarding.account.created", {"ref": ref})
-        return self._step("financials_upload_base64", ctx)
+        # Step 3 — CRITICAL GATE. Per Ishan (2026-06-07): backend hard-gates
+        # the pre-qualified document checklist on step >= 3. Without this call
+        # the prequalification.completed webhook either won't fire or won't
+        # carry the document checklist payload.
+        progress_step = await self._update_progress(state, ctx, step=3)
+        return self._step(
+            "financials_upload_base64",
+            ctx,
+            onboarding_progress_step=progress_step or state.onboarding_progress_step,
+        )
 
     # -- Step 5-6: admin-requested documents + counterparties ----------------
 
@@ -1397,7 +1535,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 state,
                 "onboarding.help.contextual",
                 {
-                    "answer": "Your application is still in progress. We still need your main buyer details before submitting it.",
+                    "answer": "Your application is still in progress. We still need your main buyer details before submitting it.",  # noqa: E501
                     "next_step": _next_step_hint(state),
                 },
             )
@@ -1414,7 +1552,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             return self._step("buyers_collect_await", ctx, buyers=list(state.buyers))
         buyer = reply if isinstance(reply, dict) else {}
-        if not any(k in buyer for k in {"name", "cr_number", "contact_person", "contact_number", "contact_email", "buyer_type", "buyer_sector"}):
+        if not any(k in buyer for k in {"name", "cr_number", "contact_person", "contact_number", "contact_email", "buyer_type", "buyer_sector"}):  # noqa: E501
             parsed = _parse_buyer_text(reply_text(reply))
             if parsed:
                 buyer = parsed
@@ -1473,7 +1611,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 state,
                 "onboarding.help.contextual",
                 {
-                    "answer": "Your application is still in progress. We still need shareholder details before submitting it.",
+                    "answer": "Your application is still in progress. We still need shareholder details before submitting it.",  # noqa: E501
                     "next_step": _next_step_hint(state),
                 },
             )
@@ -1574,11 +1712,17 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "total": total,
             },
         )
+        # A9: nudge.incomplete_docs.{1,2,3} bodies reference {{ documents }}
+        # so the missing-list shows up in each scheduled reminder. Reuse the
+        # already-formatted list rather than re-rendering at dispatch time.
         await self._reminders.schedule(
             "incomplete_docs",
             channel=_channel(ctx),
             identity=ctx.identity,
             target_ref=state.madad_user_id or ctx.session_id,
+            variables={
+                "documents": _format_documents(state.missing_documents),
+            },
         )
         return self._step("documents_upload_loop_send", ctx)
 
@@ -1620,81 +1764,137 @@ class OnboardingWorkflow(WorkflowDefinition):
                 missing_documents=list(state.missing_documents),
                 documents_received=False,
             )
-        # Upload EXACTLY like the MSME portal /complete-onboarding drag-and-drop:
-        # whether the user dumps a ZIP ("everything in one file") or sends files
-        # one by one, each document is run through the SAME classifier the portal
-        # uses, routed to the correct slot (business / financial / shareholder),
-        # uploaded, and extracted by the backend identically. We do NOT guess the
-        # type here — the classifier decides; anything unrecognised is stored as
-        # an additional document so a user's file is never lost.
-        #
-        # First mint a live backend token from the verified WhatsApp identity. A
-        # parked run can resume with no/expired token in state — relying on the
-        # cached state.access_token here was silently dropping EVERY upload (no
-        # token → block skipped → docs marked "received" but never sent).
-        token, refresh, expires = await self._live_token(state, ctx)
-        saw_zip = any(_is_zip_attachment(att) for att in attachments)
+        # A7 (Ishan 2026-06-07): ZIP attachments now route through the
+        # backend's ``classify_and_upload_zip_base64`` tool. The backend
+        # unzips server-side, classifies every member, and returns the
+        # per-file checklist (file_name, resolved document_type,
+        # confidently_classified). This is one round-trip instead of N
+        # (one per member) and matches the msme-portal pipeline exactly.
+        # The previous local-unzipping path stays as a fallback for when
+        # the backend tool errors.
         pending: list[str] = list(state.missing_documents)
-        validated: list[str] = []  # confidently classified + uploaded → ✅
-        unprocessed: list[str] = []  # uploaded but unclassified / failed → ⏳ honest
-        uploaded_count = 0
+        validated: list[str] = []  # uploaded + accepted by backend → ✅
+        unprocessed: list[str] = []  # backend rejected / no token → ⏳ honest
+        saw_zip = False
+
+        # Mint a live backend token from the verified WhatsApp identity. A run
+        # parked since an earlier turn can resume after the 900s token TTL with
+        # an empty/expired ``state.access_token``; gating the classify-and-upload
+        # calls below on that raw value silently dropped EVERY upload (no token →
+        # skipped → docs marked "received" but never sent). The WhatsApp identity
+        # is already verified (Meta-signed webhook + WA-verified number), so we
+        # always mint a fresh token on demand here — no document may be lost.
+        token, refresh, expires = await self._live_token(state, ctx)
+
+        # Pass 1 — process ZIPs server-side. Anything that isn't a ZIP or
+        # whose server-side classify fails falls through to pass 2.
+        non_zip: list[dict[str, Any]] = []
         for att in attachments:
-            content = att.get("content_base64") or ""
-            filename = att.get("filename") or ""
-            if not content or not token:
-                if filename:
-                    unprocessed.append(filename)
+            if not _is_zip_attachment(att):
+                non_zip.append(att)
+                continue
+            if not token:
+                non_zip.append(att)
                 continue
             try:
-                if _is_zip_attachment(att):
-                    # The ZIP tool expands + classifies + uploads every member
-                    # through the portal pipeline and returns a per-file checklist.
-                    result = await self._kyc.classify_and_upload_zip_base64(
+                zip_response = await self._kyc.classify_and_upload_zip_base64(
+                    access_token=token,
+                    content_base64=att.get("content_base64") or "",
+                    filename=att.get("filename") or "",
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back to local unzip
+                ctx.logger.warning(
+                    "classify_and_upload_zip.failed",
+                    error=str(exc)[:200],
+                    note="falling back to local unzip + per-file classify",
+                )
+                expanded, _ = _expand_zip_attachments([att])
+                non_zip.extend(expanded)
+                continue
+            saw_zip = True
+            # Per-file checklist shape per Ishan's docstring:
+            # ``[{file_name, document_type, confidently_classified}, ...]``.
+            # camelCase + snake_case + body-envelope all tolerated.
+            checklist: list[Any] = []
+            if isinstance(zip_response, dict):
+                body = zip_response.get("body")
+                inner = body if isinstance(body, dict) else zip_response
+                raw = inner.get("checklist") or inner.get("files") or []
+                if isinstance(raw, list):
+                    checklist = raw
+            for entry in checklist:
+                if not isinstance(entry, dict):
+                    continue
+                backend_type = (
+                    entry.get("document_type")
+                    or entry.get("documentType")
+                    or entry.get("resolved_document_type")
+                )
+                if not isinstance(backend_type, str) or not backend_type:
+                    continue
+                zip_doc_type = _workflow_doc_type(backend_type)
+                if zip_doc_type in pending:
+                    pending.remove(zip_doc_type)
+                if zip_doc_type not in validated:
+                    validated.append(zip_doc_type)
+
+        # Pass 2 — non-ZIP attachments (and any ZIP that fell back to local).
+        for att in non_zip:
+            filename = att.get("filename") or ""
+            # A5 (Ishan 2026-06-07): prefer the classify-and-upload tool
+            # over our own filename-keyword inference + manual doc_type
+            # mapping. The backend classifier picks the type and routes to
+            # the right entity slot; the response carries the resolved
+            # ``document_type`` so we can track validated/missing without
+            # guessing on filenames like ``IMG_001.jpg``.
+            uploaded_ok = False
+            resolved_doc_type: str | None = None
+            if token:
+                try:
+                    classify_response = await self._kyc.classify_and_upload_document_base64(
                         access_token=token,
-                        content_base64=content,
-                        filename=filename,
-                    )
-                    for doc in (result or {}).get("documents", []):
-                        label = (
-                            doc.get("classification_label")
-                            or doc.get("document_type")
-                            or doc.get("file_name")
-                            or "Document"
-                        )
-                        uploaded_count += 1
-                        (validated if doc.get("classified") else unprocessed).append(label)
-                    for err in (result or {}).get("errors", []):
-                        name = err.get("file_name") if isinstance(err, dict) else str(err)
-                        unprocessed.append(name or "Document")
-                else:
-                    result = await self._kyc.classify_and_upload_document_base64(
-                        access_token=token,
-                        content_base64=content,
+                        content_base64=att.get("content_base64") or "",
                         filename=filename,
                         mime_type=att.get("mime_type"),
                     )
-                    label = (
-                        (result or {}).get("classification_label")
-                        or (result or {}).get("document_type")
-                        or filename
+                    uploaded_ok = True
+                    if isinstance(classify_response, dict):
+                        backend_type = (
+                            classify_response.get("document_type")
+                            or classify_response.get("documentType")
+                            or classify_response.get("resolved_document_type")
+                        )
+                        if isinstance(backend_type, str):
+                            resolved_doc_type = _workflow_doc_type(backend_type)
+                except Exception as exc:  # noqa: BLE001 — degrade in staging
+                    ctx.logger.warning(
+                        "classify_and_upload.failed",
+                        filename=filename,
+                        error=str(exc)[:200],
+                        note="staging-tolerant: continuing without this doc",
                     )
-                    uploaded_count += 1
-                    (validated if (result or {}).get("classified") else unprocessed).append(label)
-            except Exception as exc:  # noqa: BLE001 — never crash the run on an upload hiccup
-                ctx.logger.warning(
-                    "document_upload.failed", filename=filename, error=str(exc)[:200]
-                )
-                unprocessed.append(filename or "Document")
-        # Advance the local checklist positionally by however many landed. The
-        # classifier knows the true type backend-side; we keep the lightweight
-        # local counter the flow relies on to reach completion (we do NOT re-query
-        # the backend's requested-docs list, which kept returning just-uploaded
-        # docs as still-missing and caused the loop).
-        for _ in range(min(uploaded_count, len(pending))):
-            pending.pop(0)
-        # Acknowledge exactly what landed: ✅ per confidently-classified document,
-        # ⏳ per one received but not auto-classified (kept honest — no false ✅).
-        # A ZIP gets the "📦 Extracting…" header; loose files just get their lines.
+            # Fall back to the filename inference / pending hint when the
+            # classifier didn't return a usable type (rare — happens when
+            # the backend stores as ADDITIONAL_DOCUMENT). This keeps the
+            # missing-docs accounting honest without dropping the file.
+            doc_type: str | None = resolved_doc_type
+            if not doc_type:
+                doc_type = att.get("document_type") or _infer_doc_type(filename)
+            if not doc_type and pending:
+                doc_type = pending[0]
+            if not doc_type:
+                continue
+            if uploaded_ok:
+                if doc_type in pending:
+                    pending.remove(doc_type)
+                if doc_type not in validated:
+                    validated.append(doc_type)
+            elif doc_type not in unprocessed and doc_type not in validated:
+                unprocessed.append(doc_type)
+        # Acknowledge exactly what landed: ✅ per accepted document, ⏳ per one we
+        # received but couldn't auto-validate (kept honest — no false ✅). A ZIP
+        # gets the "📦 Extracting…" header; loose files just get their lines. The
+        # lenient coffee message follows in documents_complete.
         await self._acknowledge_uploads(
             ctx, state, validated, unprocessed, saw_zip=saw_zip
         )
@@ -1755,7 +1955,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         await self._send(ctx, state, "onboarding.documents.complete")
-        return self._step("documents_complete", ctx)
+        # Step 5 — all docs submitted, waiting for risk assessment.
+        progress_step = await self._update_progress(state, ctx, step=5)
+        return self._step(
+            "documents_complete",
+            ctx,
+            onboarding_progress_step=progress_step or state.onboarding_progress_step,
+        )
 
     # -- Postman-triggered gates (pre-qualification + payment) ----------------
 
@@ -1789,7 +1995,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         # not ignored — we never re-send or stall on it.
         payload = await_input({"waiting_for": "prequalification", "step": "prequalify_wait"})
         if self._is_prequalify_trigger(payload):
-            return self._step("prequalify_wait_await", ctx, prequalified=True)
+            # Step 4 — pre-qualified, full-doc checklist about to be sent.
+            progress_step = await self._update_progress(state, ctx, step=4)
+            return self._step(
+                "prequalify_wait_await",
+                ctx,
+                prequalified=True,
+                onboarding_progress_step=progress_step or state.onboarding_progress_step,
+            )
         await self._smart_contextual(
             ctx,
             state,
@@ -1871,7 +2084,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 ctx,
                 state,
                 "onboarding.help.contextual",
-                {"answer": "I’m here and tracking your application.", "next_step": _next_step_hint(state)},
+                {"answer": "I’m here and tracking your application.", "next_step": _next_step_hint(state)},  # noqa: E501
             )
             return self._step(
                 "journey_wait_await", ctx, last_status_source="chat"
@@ -2030,11 +2243,22 @@ class OnboardingWorkflow(WorkflowDefinition):
                 )
         if not sent_as_button:
             await self._send(ctx, state, "onboarding.payment.request", variables)
+        # Step 6 — Madad score + payment gate sent to user.
+        await self._update_progress(state, ctx, step=6)
+        # A9 (Ishan 2026-06-07): per the PDF Step 5 nudge spec, every payment-
+        # pending nudge re-sends the payment link. The nudge templates
+        # (nudge.payment_pending.{1,2,3}) substitute {{ amount }} and
+        # {{ payment_link }} at dispatch time; thread the live values
+        # through to the scheduler so each scheduled step renders correctly.
         await self._reminders.schedule(
             "payment_pending",
             channel=_channel(ctx),
             identity=ctx.identity,
             target_ref=state.madad_user_id or ctx.session_id,
+            variables={
+                "amount":       amount,
+                "payment_link": state.payment_link or "",
+            },
         )
         # ALSO fire the backend's notification trigger as a side-channel —
         # if it succeeds the SME gets a Madad-branded copy of the link too,
@@ -2086,7 +2310,71 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
+            # Step 7 — payment received, application forwarded to banks.
+            await self._update_progress(state, ctx, step=7)
+            # A8a: PDF Step 6 — "Thank you — payment received! Forwarded to
+            # <banks>". Read the assigned banks from BusinessDetails.banksToSend
+            # (per Ishan 2026-06-07: populates when admin sets QUALIFIED /
+            # forwards). Fail-safe to the empty list so the message still goes
+            # out — minus the bank-list line.
+            banks = await self._fetch_banks_to_send(state, ctx)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.payment.confirmed",
+                {
+                    "banks":     _format_banks_list(banks),
+                    "ref":       state.application_ref or "",
+                    "bank_count": len(banks),
+                },
+            )
         return self._step("payment_await", ctx, paid=paid)
+
+    async def _fetch_banks_to_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> list[str]:
+        """Read \`BusinessDetails.banksToSend\` for the current SME — the list of
+        banks the admin marked as targets when forwarding the application.
+        Tolerates camelCase / snake_case / list-or-string shapes."""
+        if not state.access_token:
+            return []
+        try:
+            # MonetizationPaymentClient also wraps madad_kyc_get_business_details
+            # (it needs business_details_id for payment writes); reusing that
+            # avoids adding a parallel method on KycClient.
+            result = await self._pay.get_business_details(access_token=state.access_token)
+        except Exception as exc:  # noqa: BLE001 — degrade in staging
+            ctx.logger.warning(
+                "business_details.banks_fetch_failed",
+                error=str(exc)[:200],
+                note="continuing without bank list",
+            )
+            return []
+        if not isinstance(result, dict):
+            return []
+        # The cluster adapter unwraps to ``business_details_id`` flat dict;
+        # main also stashes the raw camelCase response so look both places.
+        candidates: list[Any] = []
+        raw = result.get("banksToSend") or result.get("banks_to_send")
+        if raw is not None:
+            candidates.append(raw)
+        for key in ("businessDetails", "business_details"):
+            nested = result.get(key)
+            if isinstance(nested, dict):
+                inner = nested.get("banksToSend") or nested.get("banks_to_send")
+                if inner is not None:
+                    candidates.append(inner)
+        banks: list[str] = []
+        for value in candidates:
+            if isinstance(value, list):
+                banks.extend(str(b) for b in value if b)
+                break
+            if isinstance(value, str) and value.strip():
+                # The backend JSONB column might come back as a comma-separated
+                # string in some edge cases — split it.
+                banks.extend([s.strip() for s in value.split(",") if s.strip()])
+                break
+        return banks
 
     # -- Step 8: lender + offers + terminals ----------------------------------
 
@@ -2126,7 +2414,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 ctx,
                 state,
                 "onboarding.help.contextual",
-                {"answer": "I’m here and tracking your lender review.", "next_step": _next_step_hint(state)},
+                {"answer": "I’m here and tracking your lender review.", "next_step": _next_step_hint(state)},  # noqa: E501
             )
             return self._step("lender_wait_await", ctx, last_status_source="chat")
         if _is_portal_query(payload):
@@ -2170,26 +2458,131 @@ class OnboardingWorkflow(WorkflowDefinition):
                 raw = info.get("offers")
                 if isinstance(raw, list):
                     offers = list(raw)
-        return self._step("offers_fetch", ctx, offers=offers)
+        # Step 8 — offers ready, handing off to platform.
+        progress_step = await self._update_progress(state, ctx, step=8)
+        return self._step(
+            "offers_fetch",
+            ctx,
+            offers=offers,
+            onboarding_progress_step=progress_step or state.onboarding_progress_step,
+        )
 
     async def _offer_view_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
+        # A6 (Ishan 2026-06-07): render PDF Step 8 structured offer cards —
+        # one block per offer with lender + credit limit + interest rate +
+        # tenure + processing fee. Falls back to a count-only line if the
+        # offer list is empty (auth_me hasn't surfaced offers yet).
         await self._send(
-            ctx, state, "onboarding.offers.preview", {"count": len(state.offers)}
+            ctx,
+            state,
+            "onboarding.offers.preview",
+            {
+                "count": len(state.offers),
+                "offer_cards": _format_offer_cards(state.offers),
+            },
         )
         return self._step("offer_view_send", ctx)
 
     async def _offer_handoff_to_madad(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        await self._send(ctx, state, "onboarding.offer.handoff")
+        # PDF Step 8 — tappable "Login to Madad →" CTA-URL button on WhatsApp
+        # (Meta caps the label at 20 chars). Falls back to the plain-text
+        # template (with the URL inline) if the interactive path fails.
+        portal_url = "https://madadfintech.com"
+        sent_as_button = False
+        if ctx.channel is Channel.WHATSAPP:
+            try:
+                sent_as_button = await self._msg.send_cta_url(
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    template_key="onboarding.offer.handoff.button",
+                    button_text="Login to Madad →",
+                    button_url=portal_url,
+                    variables={},
+                    locale=state.locale,
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back to text
+                ctx.logger.warning(
+                    "offer_handoff.cta_failed",
+                    error=str(exc)[:200],
+                    note="falling back to plain-text handoff message",
+                )
+        if not sent_as_button:
+            await self._send(ctx, state, "onboarding.offer.handoff")
         return self._step("offer_handoff_to_madad", ctx, outcome="offer_handoff")
 
     async def _activated(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        await self._send(ctx, state, "onboarding.activated")
+        # A8b: PDF Step 9 — render the accepted offer's lender / limit / rate /
+        # tenure on the activation message. Prefer state.selected_offer if set
+        # (offer-handoff flow); otherwise look at state.offers (offers_fetch
+        # may have populated it from auth_me); otherwise call auth_me directly
+        # for the latest offer set.
+        offer = state.selected_offer or {}
+        offers = list(state.offers)
+        if not offer and not offers and state.access_token:
+            try:
+                info = await self._identity.me(access_token=state.access_token)
+                if isinstance(info, dict):
+                    raw = info.get("offers")
+                    if isinstance(raw, list):
+                        offers = raw
+            except Exception as exc:  # noqa: BLE001 — degrade in staging
+                ctx.logger.warning(
+                    "activated.offers_fetch_failed",
+                    error=str(exc)[:200],
+                    note="continuing with generic activation message",
+                )
+        if not offer and offers:
+            # Look for an explicitly-accepted offer; fall back to the first.
+            for cand in offers:
+                if isinstance(cand, dict):
+                    status = str(
+                        cand.get("status") or cand.get("offerStatus") or ""
+                    ).upper()
+                    if "ACCEPT" in status:
+                        offer = cand
+                        break
+            if not offer:
+                first = offers[0] if offers else {}
+                offer = first if isinstance(first, dict) else {}
+
+        def _g(key_camel: str, key_snake: str) -> Any:
+            value = offer.get(key_camel)
+            if value is None:
+                value = offer.get(key_snake)
+            return value
+
+        lender = _g("lender", "lender") or "your bank"
+        try:
+            limit = f"QAR {int(_g('creditLimit', 'credit_limit') or 0):,}"
+        except (TypeError, ValueError):
+            limit = "QAR —"
+        try:
+            rate = f"{float(_g('interestRate', 'interest_rate') or 0):g}%"
+        except (TypeError, ValueError):
+            rate = "—"
+        try:
+            tenure = f"{int(_g('tenureDays', 'tenure_days') or 0)} days"
+        except (TypeError, ValueError):
+            tenure = "—"
+
+        await self._send(
+            ctx,
+            state,
+            "onboarding.activated",
+            {
+                "lender": lender,
+                "limit": limit,
+                "rate": rate,
+                "tenure": tenure,
+                "ref": state.application_ref or "",
+            },
+        )
         return self._step("activated", ctx, outcome="completed")
 
     # -- routers --------------------------------------------------------------
@@ -2204,7 +2597,7 @@ class OnboardingWorkflow(WorkflowDefinition):
     def _route_check_contact(self, state: OnboardingState) -> str:
         result: Any = state.check_contact_result
         if result is None:
-            return "new"
+            return self._new_lead_route(state)
         # LangGraph's checkpointer may round-trip the Pydantic model as a
         # plain dict between nodes. Read both shapes so the router doesn't
         # silently fall through to "new" when the cluster confirmed an
@@ -2221,7 +2614,16 @@ class OnboardingWorkflow(WorkflowDefinition):
             return "existing"
         if domain_exists:
             return "blocked"
-        return "new"
+        return self._new_lead_route(state)
+
+    def _new_lead_route(self, state: OnboardingState) -> str:
+        """Per Ishan (2026-06-07): WhatsApp organic-entry new leads skip the
+        collect_details + complete_onboarding hops. The single
+        ``open_session(create_user_if_missing=True)`` call mints a SIGN_UP
+        account from the phone alone and returns the access_token directly.
+        Email new-leads still need the full path because the backend can't
+        infer business identity from an email address alone."""
+        return "new_whatsapp" if state.channel is Channel.WHATSAPP else "new"
 
     def _route_channel_session(self, state: OnboardingState) -> str:
         # Phase 6 (invoice financing) will branch existing users into a
@@ -2308,8 +2710,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             except Exception:
                 pass
         if status:
-            return f"Your Madad application status is {status}. I’ll keep guiding you here as the next step becomes available."
-        return "Your Madad application is in progress. I’ll keep guiding you here as the next step becomes available."
+            return f"Your Madad application status is {status}. I’ll keep guiding you here as the next step becomes available."  # noqa: E501
+        return "Your Madad application is in progress. I’ll keep guiding you here as the next step becomes available."  # noqa: E501
 
     async def _safe_portal_answer(self, state: OnboardingState) -> str:
         unique_id = None
@@ -2317,9 +2719,10 @@ class OnboardingWorkflow(WorkflowDefinition):
             try:
                 info = await self._identity.me(access_token=state.access_token)
                 if isinstance(info, dict):
-                    user = info.get("user") if isinstance(info.get("user"), dict) else info
+                    nested = info.get("user")
+                    user = nested if isinstance(nested, dict) else info
                     unique_id = user.get("uniqueId") or user.get("unique_id")
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
         prefix = f"Your Madad ID is {unique_id}. " if unique_id else ""
         return (
@@ -2330,22 +2733,17 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _live_token(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> tuple[str | None, str | None, int | None]:
-        """Return a live ``(access_token, refresh_token, expires_at)``, minting
-        one on demand from the verified WhatsApp identity when needed.
+        """Return a non-expired ``(access_token, refresh_token, expires_at)``.
 
-        Production journeys span days; the Madad access_token only lives 900s,
-        and a parked run can resume with an empty or long-expired token in
-        state. The WhatsApp identity is already verified (Meta-signed inbound
-        webhook + a WhatsApp-verified phone number), so the backend mints a
-        fresh agent access token from the identity alone — no password, no
-        login. Possession of the verified number IS the credential.
+        Production journeys span days; the Madad access_token only lives 900s.
+        Whenever the existing token is within 60s of expiry (or already
+        past), re-open the channel session to mint a fresh one. The new
+        tuple is returned for the node to write back into state via its
+        return dict so subsequent turns inherit the live credentials.
 
-        We therefore reuse the cached token only while it is comfortably
-        unexpired; otherwise (missing OR near/past expiry) we re-open the
-        channel session to mint a new one. The fresh tuple is returned so the
-        calling node can write it back into state for subsequent turns. On a
-        mint failure the stale tuple is returned and the downstream MCP call
-        degrades — better to keep moving than crash the run.
+        On refresh failure the stale tuple is returned and the downstream
+        MCP call will 401 — which our tolerant wrappers absorb. Better to
+        keep moving than crash the run.
         """
 
         token = state.access_token
@@ -2355,8 +2753,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         # Fast path: a cached token that is still comfortably valid.
         if token and (expires is None or expires - now_ts > 60):
             return token, refresh, expires
-        # Mint on demand — covers both the near-expiry refresh case AND the
-        # "run has no token in state" case that was silently dropping uploads.
+        # Otherwise MINT ON DEMAND. The WhatsApp identity is already verified
+        # (Meta-signed inbound webhook + a WhatsApp-verified number), so the
+        # backend mints a fresh agent access token from the identity alone — no
+        # password, no login. This covers both the near-expiry refresh case AND
+        # the "run resumed with no token in state" case that was silently
+        # dropping document uploads.
         try:
             session = await self._identity.open_session(
                 channel=_channel(ctx),
@@ -2466,6 +2868,49 @@ class OnboardingWorkflow(WorkflowDefinition):
             variables=variables or {},
             locale=locale or state.locale,
         )
+
+    async def _update_progress(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        step: int,
+    ) -> int | None:
+        """Send the canonical conversational step to Madad backend.
+
+        Per Ishan (2026-06-07): WhatsApp leads must have their conversational
+        step tracked via ``madad_mcp_update_onboarding_progress``. The backend
+        hard-gates the pre-qualified document checklist on ``step >= 3``.
+
+        Skips when:
+          * the channel isn't WhatsApp (Email leads aren't tracked this way);
+          * the step is <= the last recorded step (don't regress on retries);
+          * the backend call fails (logged as warning, workflow continues).
+
+        Returns the recorded step on success (caller writes it back to state)
+        or None when skipped.
+        """
+
+        if ctx.channel is not Channel.WHATSAPP:
+            return None
+        if state.onboarding_progress_step is not None and step <= state.onboarding_progress_step:
+            return None
+        try:
+            await self._identity.update_onboarding_progress(
+                user_id=state.madad_user_id,
+                channel=ctx.channel,
+                identifier=ctx.identity,
+                step=step,
+                touch_inbound=False,
+            )
+            return step
+        except Exception as exc:  # noqa: BLE001 — degrade in staging
+            ctx.logger.warning(
+                "update_onboarding_progress.failed",
+                step=step,
+                error=str(exc)[:200],
+                note="staging-tolerant: continuing (will retry on next progression)",
+            )
+            return None
 
     @staticmethod
     def _step(name: str, ctx: WorkflowContext, **fields: Any) -> dict[str, Any]:

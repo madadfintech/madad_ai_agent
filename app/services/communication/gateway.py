@@ -110,12 +110,13 @@ class McpCommunicationGateway(CommunicationGateway):
                 raw=response,
             )
 
-        tool = _TOOL_BY_CHANNEL.get(message.channel)
-        if tool is None:
+        mapped = _TOOL_BY_CHANNEL.get(message.channel)
+        if mapped is None:
             raise GatewayError(
                 f"No MCP tool mapped for channel {message.channel}",
                 details={"channel": str(message.channel)},
             )
+        tool = mapped
         payload = _build_outbound_payload(message.channel, message)
         try:
             response = await self._tools.call_tool(tool, payload)

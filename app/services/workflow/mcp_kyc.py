@@ -92,6 +92,23 @@ def _backend_document_type(workflow_doc_type: str) -> str:
     )
 
 
+# Inverse of _DOCUMENT_TYPE_TO_BACKEND — backend SCREAMING_SNAKE → workflow snake.
+# Built once at module load. When the backend's classify-and-upload tool returns
+# a document_type we don't recognise (e.g. ``ADDITIONAL_DOCUMENT``), the caller
+# should keep the file but flag it as unmapped.
+_BACKEND_TO_DOCUMENT_TYPE = {v: k for k, v in _DOCUMENT_TYPE_TO_BACKEND.items()}
+
+
+def workflow_doc_type(backend_doc_type: str) -> str:
+    """Map a backend SCREAMING_SNAKE document_type back to the workflow's
+    snake_case label. Unknown types lowercase-pass-through so the missing-
+    docs accounting can still track them (just with a non-canonical name)."""
+
+    return _BACKEND_TO_DOCUMENT_TYPE.get(
+        backend_doc_type, backend_doc_type.lower()
+    )
+
+
 def _entity_type_for(workflow_doc_type: str) -> str:
     """The backend ``documentEntityType`` a given doc type belongs under."""
 
@@ -191,19 +208,21 @@ class McpKycClient:
         content_base64: str,
         filename: str,
         mime_type: str | None = None,
+        document_param: str | None = None,
+        document_label: str | None = None,
     ) -> dict[str, Any]:
-        # Portal-parity upload: the cluster runs the SAME classifier the MSME
-        # complete-onboarding page uses, routes the doc to the correct slot, and
-        # uploads it so backend extraction runs identically — no caller-supplied
-        # document_type. Args are top-level (not nested in metadata).
+        payload: dict[str, Any] = {
+            "file_name": filename,
+            "mime_type": mime_type or _infer_mime_type(filename),
+            "base64": content_base64,
+            "access_token": access_token,
+        }
+        if document_param is not None:
+            payload["document_param"] = document_param
+        if document_label is not None:
+            payload["document_label"] = document_label
         return await self._tools.call_tool(
-            Tools.KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64,
-            {
-                "file_name": filename,
-                "base64": content_base64,
-                "access_token": access_token,
-                "mime_type": mime_type or _infer_mime_type(filename),
-            },
+            Tools.KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64, payload
         )
 
     async def classify_and_upload_zip_base64(
@@ -212,16 +231,15 @@ class McpKycClient:
         access_token: str,
         content_base64: str,
         filename: str,
+        continue_on_error: bool = True,
     ) -> dict[str, Any]:
-        # Expand + classify + upload every member of a ZIP through the portal
-        # pipeline; returns a per-file checklist (file_name / document_type /
-        # classified) for the WhatsApp acknowledgement.
         return await self._tools.call_tool(
             Tools.KYC_CLASSIFY_AND_UPLOAD_ZIP_BASE64,
             {
                 "file_name": filename,
                 "base64": content_base64,
                 "access_token": access_token,
+                "continue_on_error": continue_on_error,
             },
         )
 

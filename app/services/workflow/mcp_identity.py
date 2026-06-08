@@ -123,10 +123,21 @@ class McpMadadIdentityClient:
         phone: str | None = None,
         display_name: str | None = None,
         create_onboarding_token: bool = True,
+        create_user_if_missing: bool = False,
     ) -> ChannelSession:
+        # When we intend to CREATE the user (WhatsApp organic-entry YES), keep the
+        # real WhatsApp phone + channel — do NOT divert to a placeholder email.
+        # The backend's create-on-YES (createWhatsappLeadUser) only fires for
+        # channel=WHATSAPP and stores the phone as-is for any country, so a
+        # non-Qatar number like +91… must NOT be swapped to EMAIL here or no
+        # WhatsApp lead is ever created (the user never appears in the portal).
+        # The placeholder-email swap stays for the read-only check_contact path
+        # where the backend can't yet validate non-Qatar numbers.
         auth_email = (
             _placeholder_email_for_phone(phone or identifier)
-            if channel is Channel.WHATSAPP and not _is_backend_checkable_phone(identifier)
+            if channel is Channel.WHATSAPP
+            and not create_user_if_missing
+            and not _is_backend_checkable_phone(identifier)
             else None
         )
         if auth_email:
@@ -141,6 +152,14 @@ class McpMadadIdentityClient:
             "identifier": identifier_value,
             "create_onboarding_token": create_onboarding_token,
         }
+        # Per Ishan (2026-06-07): set create_user_if_missing=True on the
+        # WhatsApp organic-entry call. Backend auto-creates a SIGN_UP account
+        # from the phone number alone (no email/password) and returns an
+        # accessToken directly — drops the separate complete_onboarding hop.
+        # Only forward when True so existing-user resumes don't accidentally
+        # toggle the flag on for unrelated paths.
+        if create_user_if_missing:
+            payload["create_user_if_missing"] = True
         if auth_email:
             payload["email"] = auth_email
         if email is not None:
@@ -162,6 +181,7 @@ class McpMadadIdentityClient:
                 response.get("expiresInSeconds"),
             ),
             user_or_lead_ref=response.get("userOrLeadRef") or response.get("userId"),
+            reference_number=response.get("referenceNumber"),
             raw=response,
         )
 
@@ -263,4 +283,46 @@ class McpMadadIdentityClient:
     async def logout(self, *, access_token: str) -> None:
         await self._tools.call_tool(
             Tools.AUTH_LOGOUT, {"access_token": access_token}
+        )
+
+    async def update_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+        step: int | None = None,
+        touch_inbound: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if user_id is not None:
+            payload["user_id"] = user_id
+        if channel is not None:
+            payload["channel"] = _channel_value(channel)
+        if identifier is not None:
+            payload["identifier"] = identifier
+        if step is not None:
+            payload["step"] = step
+        if touch_inbound:
+            payload["touch_inbound"] = True
+        return await self._tools.call_tool(
+            Tools.MCP_UPDATE_ONBOARDING_PROGRESS, payload
+        )
+
+    async def get_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if user_id is not None:
+            payload["user_id"] = user_id
+        if channel is not None:
+            payload["channel"] = _channel_value(channel)
+        if identifier is not None:
+            payload["identifier"] = identifier
+        return await self._tools.call_tool(
+            Tools.MCP_GET_ONBOARDING_PROGRESS, payload
         )

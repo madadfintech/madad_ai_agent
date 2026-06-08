@@ -128,48 +128,66 @@ async def test_check_contact_omits_unset_args() -> None:
     assert payload == {"phone": "+97499900000"}
 
 
-async def test_check_contact_non_qatar_whatsapp_phone_continues_as_new_lead(monkeypatch) -> None:
+async def test_check_contact_non_qatar_whatsapp_phone_uses_deterministic_placeholder(
+    monkeypatch,
+) -> None:
+    """Per main commit 906d87b: every non-Qatar WhatsApp phone gets its OWN
+    deterministic placeholder email (so two different phones never collide on a
+    single shared test account). The backend IS called — with the synthetic
+    per-phone email as the channel identifier."""
     monkeypatch.delenv("WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL", raising=False)
-    caller = InMemoryMCPClient(
-        handlers={
-            Tools.AUTH_CHECK_CONTACT: lambda p: pytest.fail(
-                "non-Qatar staging phone should not call backend check-contact"
-            )
-        }
-    )
+    captured: list[dict] = []
+
+    def _capture(p: dict) -> dict:
+        captured.append(p)
+        return {"exists": False}
+
+    caller = InMemoryMCPClient(handlers={Tools.AUTH_CHECK_CONTACT: _capture})
 
     result = await McpMadadIdentityClient(caller).check_contact(phone="+918287611995")
 
     assert result.exists is False
-    assert result.domain_exists is False
-    assert result.raw["reason"] == "non_qatar_whatsapp_phone"
-    assert caller.calls == []
+    # The backend was called with the per-phone synthetic email.
+    assert len(captured) == 1
+    payload_email = captured[0].get("email", "")
+    assert "918287611995" in payload_email
+    assert payload_email.endswith(".madadfintech.com")
 
 
-async def test_check_contact_non_qatar_whatsapp_phone_can_use_auth_email_alias(monkeypatch) -> None:
-    monkeypatch.setenv(
-        "WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL",
-        "tech.external1@madadfintech.com",
-    )
-    caller = InMemoryMCPClient(
-        handlers={
-            Tools.AUTH_CHECK_CONTACT: lambda p: {"exists": True, "field": "email"}
-        }
-    )
+async def test_check_contact_non_qatar_whatsapp_phone_is_deterministic(
+    monkeypatch,
+) -> None:
+    """Calling check_contact twice with the same phone hits the same synthetic
+    email (so repeat WhatsApp messages from the same lead resume the same
+    user, not fork a new account)."""
+    monkeypatch.delenv("WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL", raising=False)
+    captured: list[dict] = []
 
-    result = await McpMadadIdentityClient(caller).check_contact(phone="+918287611995")
+    def _capture(p: dict) -> dict:
+        captured.append(p)
+        return {"exists": False}
 
-    assert result.exists is True
-    assert result.field == "email"
-    _, payload = caller.calls[0]
-    assert payload == {"email": "tech.external1@madadfintech.com"}
+    caller = InMemoryMCPClient(handlers={Tools.AUTH_CHECK_CONTACT: _capture})
+    adapter = McpMadadIdentityClient(caller)
+
+    await adapter.check_contact(phone="+918287611995")
+    await adapter.check_contact(phone="+918287611995")
+
+    assert len(captured) == 2
+    assert captured[0]["email"] == captured[1]["email"]
+    # And a different phone gets a different email.
+    captured.clear()
+    await adapter.check_contact(phone="+918287611996")
+    await adapter.check_contact(phone="+918287611995")
+    assert captured[0]["email"] != captured[1]["email"]
 
 
-async def test_open_session_non_qatar_whatsapp_can_use_auth_email_alias(monkeypatch) -> None:
-    monkeypatch.setenv(
-        "WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL",
-        "tech.external1@madadfintech.com",
-    )
+async def test_open_session_non_qatar_whatsapp_uses_per_phone_placeholder(
+    monkeypatch,
+) -> None:
+    """open_session also routes non-Qatar WhatsApp through the per-phone
+    placeholder email — same path as check_contact."""
+    monkeypatch.delenv("WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL", raising=False)
     caller = InMemoryMCPClient(
         handlers={
             Tools.MCP_CREATE_CHANNEL_SESSION: lambda p: {
@@ -186,8 +204,8 @@ async def test_open_session_non_qatar_whatsapp_can_use_auth_email_alias(monkeypa
 
     _, payload = caller.calls[0]
     assert payload["channel"] == "EMAIL"
-    assert payload["identifier"] == "tech.external1@madadfintech.com"
-    assert payload["email"] == "tech.external1@madadfintech.com"
+    assert "918287611995" in payload["identifier"]
+    assert payload["identifier"].endswith(".madadfintech.com")
 
 
 # -- complete_onboarding ------------------------------------------------------

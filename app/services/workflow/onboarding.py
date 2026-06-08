@@ -618,6 +618,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "check_contact_await": self._check_contact_await,
             "domain_blocked": self._domain_blocked,
             "channel_session_first": self._channel_session_first,
+            "channel_session_create_user": self._channel_session_create_user,
             "collect_onboarding_details_send": self._collect_onboarding_details_send,
             "collect_onboarding_details_await": self._collect_onboarding_details_await,
             "complete_onboarding_send": self._complete_onboarding_send,
@@ -686,6 +687,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             {
                 "existing": "channel_session_first",
                 "new": "complete_onboarding_send",
+                # WhatsApp organic-entry: single create_user_if_missing call
+                # mints SIGN_UP + access_token in one round-trip.
+                "new_whatsapp": "channel_session_create_user",
                 "blocked": "domain_blocked",
             },
         )
@@ -703,6 +707,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         graph.add_edge("complete_onboarding_send", "channel_session_second")
         graph.add_conditional_edges(
             "channel_session_second",
+            self._route_channel_session,
+            {"consent": "consent_send"},
+        )
+        # WhatsApp organic-entry converges at consent_send via the
+        # create_user_if_missing fast-path — no complete_onboarding hop.
+        graph.add_conditional_edges(
+            "channel_session_create_user",
             self._route_channel_session,
             {"consent": "consent_send"},
         )
@@ -903,6 +914,37 @@ class OnboardingWorkflow(WorkflowDefinition):
             refresh_token=session.refresh_token,
             token_expires_at=session.token_expires_at,
             madad_user_id=session.user_or_lead_ref,
+            application_ref=session.reference_number or state.application_ref,
+        )
+
+    async def _channel_session_create_user(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """WhatsApp organic-entry: open a session with
+        ``create_user_if_missing=True``. Per Ishan (2026-06-07), the backend
+        auto-creates a SIGN_UP account from the phone alone and returns an
+        ``accessToken`` directly — no separate ``collect_details`` intake or
+        ``complete_onboarding`` round-trip required. The ``referenceNumber``
+        on the response (``User.uniqueId``) populates immediately so the
+        account-created message can surface it on the very next step.
+        """
+
+        session = await self._identity.open_session(
+            channel=_channel(ctx),
+            identifier=ctx.identity,
+            create_onboarding_token=False,
+            create_user_if_missing=True,
+        )
+        return self._step(
+            "channel_session_create_user",
+            ctx,
+            channel_session_response=session,
+            session_type=session.session_type,
+            access_token=session.access_token,
+            refresh_token=session.refresh_token,
+            token_expires_at=session.token_expires_at,
+            madad_user_id=session.user_or_lead_ref,
+            application_ref=session.reference_number or state.application_ref,
         )
 
     async def _collect_onboarding_details_send(
@@ -2182,7 +2224,7 @@ class OnboardingWorkflow(WorkflowDefinition):
     def _route_check_contact(self, state: OnboardingState) -> str:
         result: Any = state.check_contact_result
         if result is None:
-            return "new"
+            return self._new_lead_route(state)
         # LangGraph's checkpointer may round-trip the Pydantic model as a
         # plain dict between nodes. Read both shapes so the router doesn't
         # silently fall through to "new" when the cluster confirmed an
@@ -2199,7 +2241,16 @@ class OnboardingWorkflow(WorkflowDefinition):
             return "existing"
         if domain_exists:
             return "blocked"
-        return "new"
+        return self._new_lead_route(state)
+
+    def _new_lead_route(self, state: OnboardingState) -> str:
+        """Per Ishan (2026-06-07): WhatsApp organic-entry new leads skip the
+        collect_details + complete_onboarding hops. The single
+        ``open_session(create_user_if_missing=True)`` call mints a SIGN_UP
+        account from the phone alone and returns the access_token directly.
+        Email new-leads still need the full path because the backend can't
+        infer business identity from an email address alone."""
+        return "new_whatsapp" if state.channel is Channel.WHATSAPP else "new"
 
     def _route_channel_session(self, state: OnboardingState) -> str:
         # Phase 6 (invoice financing) will branch existing users into a

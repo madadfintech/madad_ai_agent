@@ -52,7 +52,19 @@ def _build_journey_handlers() -> dict[str, Any]:
         "journey_status": "ELIGIBLE",
     }
 
-    def _create_channel_session(_p: dict[str, Any]) -> dict[str, Any]:
+    def _create_channel_session(payload: dict[str, Any]) -> dict[str, Any]:
+        # WhatsApp organic-entry: backend mints SIGN_UP + accessToken in one
+        # call when create_user_if_missing=True is supplied.
+        if payload.get("create_user_if_missing"):
+            state["onboarding_complete"] = True
+            return {
+                "sessionType": "new_user_created",
+                "accessToken": "AT-real-1",
+                "refreshToken": "RT-real-1",
+                "tokenExpiresAt": 1_800_000_000,
+                "userOrLeadRef": "user_777",
+                "referenceNumber": "Y6NICTES",
+            }
         if state["onboarding_complete"]:
             return {
                 "sessionType": "existing_user",

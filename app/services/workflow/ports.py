@@ -16,7 +16,17 @@ from pydantic import BaseModel, Field
 from app.shared.workflow.enums import Channel
 from app.shared.workflow.utils import new_id
 
-SessionType = Literal["existing_user", "new_lead"]
+SessionType = Literal[
+    "existing_user",
+    "new_lead",
+    # Per Ishan (2026-06-07): backend returns this when
+    # ``create_user_if_missing=True`` minted a fresh SIGN_UP account on the
+    # spot (WhatsApp organic-entry path).
+    "new_user_created",
+    # Per Ishan: backend returns this when a portal user already exists for
+    # the phone — agent should tell them to log in to madadfintech.com.
+    "existing_portal_user",
+]
 ContactField = Literal["phone", "email"]
 
 # -- Messenger (outbound conversation via Communication + CMS) ---------------
@@ -180,6 +190,7 @@ class MadadIdentityClient(Protocol):
         phone: str | None = None,
         display_name: str | None = None,
         create_onboarding_token: bool = True,
+        create_user_if_missing: bool = False,
     ) -> ChannelSession: ...
 
     async def check_contact(
@@ -253,6 +264,7 @@ class InMemoryMadadIdentityClient:
         phone: str | None = None,
         display_name: str | None = None,
         create_onboarding_token: bool = True,
+        create_user_if_missing: bool = False,
     ) -> ChannelSession:
         self._record(
             "open_session",
@@ -262,6 +274,7 @@ class InMemoryMadadIdentityClient:
             phone=phone,
             display_name=display_name,
             create_onboarding_token=create_onboarding_token,
+            create_user_if_missing=create_user_if_missing,
         )
         # The MCP bridge tool resolves identifier-on-channel — the in-memory
         # equivalent looks up whichever index matches the channel.
@@ -274,6 +287,20 @@ class InMemoryMadadIdentityClient:
                 access_token=new_id("at"),
                 refresh_token=new_id("rt"),
                 user_or_lead_ref=user_id,
+                raw={"identifier": identifier, "channel": str(channel)},
+            )
+        # Per Ishan (2026-06-07): when create_user_if_missing=True (the
+        # WhatsApp organic-entry path), the backend auto-creates a SIGN_UP
+        # account from the phone number alone and returns an accessToken
+        # directly — no separate complete_onboarding round-trip needed.
+        # Simulate that here so the in-memory tests cover the new branch.
+        if create_user_if_missing:
+            return ChannelSession(
+                session_type="new_user_created",
+                access_token=new_id("at"),
+                refresh_token=new_id("rt"),
+                user_or_lead_ref=new_id("user"),
+                reference_number=new_id("ref")[-8:].upper(),
                 raw={"identifier": identifier, "channel": str(channel)},
             )
         return ChannelSession(

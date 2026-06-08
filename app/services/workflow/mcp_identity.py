@@ -123,6 +123,7 @@ class McpMadadIdentityClient:
         phone: str | None = None,
         display_name: str | None = None,
         create_onboarding_token: bool = True,
+        create_user_if_missing: bool = False,
     ) -> ChannelSession:
         auth_email = (
             _placeholder_email_for_phone(phone or identifier)
@@ -141,6 +142,14 @@ class McpMadadIdentityClient:
             "identifier": identifier_value,
             "create_onboarding_token": create_onboarding_token,
         }
+        # Per Ishan (2026-06-07): set create_user_if_missing=True on the
+        # WhatsApp organic-entry call. Backend auto-creates a SIGN_UP account
+        # from the phone number alone (no email/password) and returns an
+        # accessToken directly — drops the separate complete_onboarding hop.
+        # Only forward when True so existing-user resumes don't accidentally
+        # toggle the flag on for unrelated paths.
+        if create_user_if_missing:
+            payload["create_user_if_missing"] = True
         if auth_email:
             payload["email"] = auth_email
         if email is not None:

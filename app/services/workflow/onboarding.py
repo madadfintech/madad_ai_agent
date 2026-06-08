@@ -1777,6 +1777,15 @@ class OnboardingWorkflow(WorkflowDefinition):
         unprocessed: list[str] = []  # backend rejected / no token → ⏳ honest
         saw_zip = False
 
+        # Mint a live backend token from the verified WhatsApp identity. A run
+        # parked since an earlier turn can resume after the 900s token TTL with
+        # an empty/expired ``state.access_token``; gating the classify-and-upload
+        # calls below on that raw value silently dropped EVERY upload (no token →
+        # skipped → docs marked "received" but never sent). The WhatsApp identity
+        # is already verified (Meta-signed webhook + WA-verified number), so we
+        # always mint a fresh token on demand here — no document may be lost.
+        token, refresh, expires = await self._live_token(state, ctx)
+
         # Pass 1 — process ZIPs server-side. Anything that isn't a ZIP or
         # whose server-side classify fails falls through to pass 2.
         non_zip: list[dict[str, Any]] = []
@@ -1784,12 +1793,12 @@ class OnboardingWorkflow(WorkflowDefinition):
             if not _is_zip_attachment(att):
                 non_zip.append(att)
                 continue
-            if not state.access_token:
+            if not token:
                 non_zip.append(att)
                 continue
             try:
                 zip_response = await self._kyc.classify_and_upload_zip_base64(
-                    access_token=state.access_token,
+                    access_token=token,
                     content_base64=att.get("content_base64") or "",
                     filename=att.get("filename") or "",
                 )
@@ -1840,10 +1849,10 @@ class OnboardingWorkflow(WorkflowDefinition):
             # guessing on filenames like ``IMG_001.jpg``.
             uploaded_ok = False
             resolved_doc_type: str | None = None
-            if state.access_token:
+            if token:
                 try:
                     classify_response = await self._kyc.classify_and_upload_document_base64(
-                        access_token=state.access_token,
+                        access_token=token,
                         content_base64=att.get("content_base64") or "",
                         filename=filename,
                         mime_type=att.get("mime_type"),
@@ -1903,6 +1912,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx,
             missing_documents=missing,
             documents_received=bool(attachments),
+            access_token=token,
+            refresh_token=refresh,
+            token_expires_at=expires,
         )
 
     async def _acknowledge_uploads(
@@ -2737,11 +2749,16 @@ class OnboardingWorkflow(WorkflowDefinition):
         token = state.access_token
         refresh = state.refresh_token
         expires = state.token_expires_at
-        if not token:
-            return None, refresh, expires
         now_ts = ctx.clock.now().timestamp()
-        if expires is None or expires - now_ts > 60:
+        # Fast path: a cached token that is still comfortably valid.
+        if token and (expires is None or expires - now_ts > 60):
             return token, refresh, expires
+        # Otherwise MINT ON DEMAND. The WhatsApp identity is already verified
+        # (Meta-signed inbound webhook + a WhatsApp-verified number), so the
+        # backend mints a fresh agent access token from the identity alone — no
+        # password, no login. This covers both the near-expiry refresh case AND
+        # the "run resumed with no token in state" case that was silently
+        # dropping document uploads.
         try:
             session = await self._identity.open_session(
                 channel=_channel(ctx),
@@ -2749,7 +2766,8 @@ class OnboardingWorkflow(WorkflowDefinition):
                 create_onboarding_token=False,
             )
             ctx.logger.info(
-                "token.refreshed",
+                "token.minted",
+                had_cached_token=bool(token),
                 old_expires_at=expires,
                 new_expires_at=session.token_expires_at,
             )
@@ -2759,7 +2777,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 session.token_expires_at or expires,
             )
         except Exception as exc:  # noqa: BLE001
-            ctx.logger.warning("token.refresh_failed", error=str(exc)[:200])
+            ctx.logger.warning("token.mint_failed", error=str(exc)[:200])
             return token, refresh, expires
 
     async def _poll_journey_status(

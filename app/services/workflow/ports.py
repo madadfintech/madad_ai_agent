@@ -151,6 +151,11 @@ class RecordingMessenger(Messenger):
                 "identity": identity,
                 "template_key": template_key,
                 "variables": variables or {},
+                # Mirror the regular send()'s ``locale`` key so
+                # test_locale_propagates and other locale-aware tests can
+                # inspect the dispatched locale without forking the assertion
+                # by send-shape.
+                "locale": language_code,
                 "whatsapp_template": {
                     "name": template_name,
                     "language": language_code,

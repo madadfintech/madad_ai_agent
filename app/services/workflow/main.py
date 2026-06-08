@@ -178,14 +178,14 @@ async def inbound(
     return RunStatusDTO.from_result(result)
 
 
-def _canon_event_identity(channel: Any, identity: str | None) -> str | None:
+def _canon_event_identity(channel: Any, identity: str) -> str:
     """Canonicalise a backend webhook identity to the same E.164 form the inbound
     bridge keys sessions by, so the run still resolves when the backend sends the
     phone in a different shape (e.g. Qatar local "66563022" vs the session's
     "+97466563022"). WhatsApp only; other channels pass through untouched."""
     try:
         ch = str(getattr(channel, "value", channel)).lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         ch = ""
     if ch != "whatsapp" or not identity:
         return identity

@@ -919,7 +919,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                     identity=ctx.identity,
                     template_name="initiate",
                     template_key="onboarding.campaign.intro",
-                    language_code="en",
+                    # Per locale-propagation contract: thread state.locale
+                    # through to Meta's language_code so Arabic / English
+                    # template variants resolve correctly.
+                    language_code=locale,
                 )
             except Exception as exc:  # noqa: BLE001 — fall back to free text
                 ctx.logger.warning("campaign_send.template_failed", error=str(exc)[:200])

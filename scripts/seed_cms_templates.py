@@ -244,6 +244,15 @@ _TEMPLATE_BODIES = {
         "your offer — this is where you'll also manage your invoices going forward.\n\n"
         "Login to Madad Platform → madadfintech.com"
     ),
+    # Spec Step 8 button variant — body for the WhatsApp interactive CTA-URL
+    # message. The button label ("Login to Madad →") is supplied at send-time
+    # (capped at 20 chars by Meta); this body is what shows above the button.
+    "onboarding.offer.handoff.button": (
+        "💬 Feel free to ask me anything about these offers right here!\n\n"
+        "When you're ready to select, please login to your Madad account to "
+        "finalise your offer — this is where you'll also manage your invoices "
+        "going forward."
+    ),
     "onboarding.activated": (
         "Your credit line is now active! You can start submitting invoices "
         "for financing."

@@ -81,4 +81,8 @@ async def test_onboarding_drives_real_communication_and_nudge():
     messages = await comms.get_messages(conversation.conversation_id)
     texts = [m.text for m in messages]
     assert "[onboarding.campaign.intro]" in texts
-    assert "[onboarding.offer.handoff]" in texts
+    # WhatsApp uses the button variant (A11); fall back to plain text variant.
+    assert any(
+        t in texts
+        for t in ("[onboarding.offer.handoff.button]", "[onboarding.offer.handoff]")
+    )

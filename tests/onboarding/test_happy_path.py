@@ -107,7 +107,7 @@ async def test_messages_sent_once_in_order(harness):
         "onboarding.documents.complete",
         "onboarding.payment.request.button",
         "onboarding.offers.preview",
-        "onboarding.offer.handoff",
+        "onboarding.offer.handoff.button",
     ]
     for tpl in expected_subset:
         assert tpl in templates, f"expected {tpl} in {templates}"

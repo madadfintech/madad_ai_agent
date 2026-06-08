@@ -129,6 +129,7 @@ TEMPLATE_KEYS = [
     "onboarding.payment.request.button",
     "onboarding.offers.preview",
     "onboarding.offer.handoff",
+    "onboarding.offer.handoff.button",
     "onboarding.activated",
 ]
 
@@ -2247,7 +2248,30 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _offer_handoff_to_madad(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        await self._send(ctx, state, "onboarding.offer.handoff")
+        # PDF Step 8 — tappable "Login to Madad →" CTA-URL button on WhatsApp
+        # (Meta caps the label at 20 chars). Falls back to the plain-text
+        # template (with the URL inline) if the interactive path fails.
+        portal_url = "https://madadfintech.com"
+        sent_as_button = False
+        if ctx.channel is Channel.WHATSAPP:
+            try:
+                sent_as_button = await self._msg.send_cta_url(
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    template_key="onboarding.offer.handoff.button",
+                    button_text="Login to Madad →",
+                    button_url=portal_url,
+                    variables={},
+                    locale=state.locale,
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back to text
+                ctx.logger.warning(
+                    "offer_handoff.cta_failed",
+                    error=str(exc)[:200],
+                    note="falling back to plain-text handoff message",
+                )
+        if not sent_as_button:
+            await self._send(ctx, state, "onboarding.offer.handoff")
         return self._step("offer_handoff_to_madad", ctx, outcome="offer_handoff")
 
     async def _activated(

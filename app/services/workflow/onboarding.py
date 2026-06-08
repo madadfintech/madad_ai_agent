@@ -86,6 +86,7 @@ from app.shared.workflow import (
 from app.shared.workflow.enums import Channel
 from app.shared.workflow.state import HistoryEntry
 
+from .mcp_kyc import workflow_doc_type as _workflow_doc_type
 from .ports import (
     KycClient,
     MadadIdentityClient,
@@ -1703,31 +1704,50 @@ class OnboardingWorkflow(WorkflowDefinition):
         validated: list[str] = []  # uploaded + accepted by backend → ✅
         unprocessed: list[str] = []  # backend rejected / no token → ⏳ honest
         for att in attachments:
-            doc_type = att.get("document_type") or _infer_doc_type(att.get("filename") or "")
+            filename = att.get("filename") or ""
+            # A5 (Ishan 2026-06-07): prefer the classify-and-upload tool
+            # over our own filename-keyword inference + manual doc_type
+            # mapping. The backend classifier picks the type and routes to
+            # the right entity slot; the response carries the resolved
+            # ``document_type`` so we can track validated/missing without
+            # guessing on filenames like ``IMG_001.jpg``.
+            uploaded_ok = False
+            resolved_doc_type: str | None = None
+            if state.access_token:
+                try:
+                    classify_response = await self._kyc.classify_and_upload_document_base64(
+                        access_token=state.access_token,
+                        content_base64=att.get("content_base64") or "",
+                        filename=filename,
+                        mime_type=att.get("mime_type"),
+                    )
+                    uploaded_ok = True
+                    if isinstance(classify_response, dict):
+                        backend_type = (
+                            classify_response.get("document_type")
+                            or classify_response.get("documentType")
+                            or classify_response.get("resolved_document_type")
+                        )
+                        if isinstance(backend_type, str):
+                            resolved_doc_type = _workflow_doc_type(backend_type)
+                except Exception as exc:  # noqa: BLE001 — degrade in staging
+                    ctx.logger.warning(
+                        "classify_and_upload.failed",
+                        filename=filename,
+                        error=str(exc)[:200],
+                        note="staging-tolerant: continuing without this doc",
+                    )
+            # Fall back to the filename inference / pending hint when the
+            # classifier didn't return a usable type (rare — happens when
+            # the backend stores as ADDITIONAL_DOCUMENT). This keeps the
+            # missing-docs accounting honest without dropping the file.
+            doc_type = resolved_doc_type
+            if not doc_type:
+                doc_type = att.get("document_type") or _infer_doc_type(filename)
             if not doc_type and pending:
                 doc_type = pending[0]
             if not doc_type:
                 continue
-            # Only acknowledge "Received & Validated" if the backend actually
-            # accepted the upload — never claim success on a swallowed error.
-            uploaded_ok = False
-            if state.access_token:
-                try:
-                    await self._kyc.upload_document_base64(
-                        access_token=state.access_token,
-                        content_base64=att.get("content_base64") or "",
-                        filename=att.get("filename") or "",
-                        document_type=doc_type,
-                        mime_type=att.get("mime_type"),
-                    )
-                    uploaded_ok = True
-                except Exception as exc:  # noqa: BLE001 — degrade in staging
-                    ctx.logger.warning(
-                        "document_upload.failed",
-                        document_type=doc_type,
-                        error=str(exc)[:200],
-                        note="staging-tolerant: continuing without this doc",
-                    )
             if uploaded_ok:
                 if doc_type in pending:
                     pending.remove(doc_type)

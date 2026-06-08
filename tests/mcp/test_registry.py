@@ -5,12 +5,13 @@ from __future__ import annotations
 from app.shared.mcp import Tools
 
 
-def test_registry_has_70_constants_grouped_by_module() -> None:
+def test_registry_has_72_constants_grouped_by_module() -> None:
     names = Tools.all()
-    # 13 + 6 + 5 + 28 + 4 + 5 + 9 = 70. +2 vs the prior count came from
-    # MCP_UPDATE_ONBOARDING_PROGRESS + MCP_GET_ONBOARDING_PROGRESS (added
-    # 2026-06-07 by Ishan to support WhatsApp lead step tracking).
-    assert len(names) == 70
+    # 13 + 6 + 5 + 30 + 4 + 5 + 9 = 72. +2 vs prior added 2026-06-07 by
+    # Ishan: KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64 and
+    # KYC_CLASSIFY_AND_UPLOAD_ZIP_BASE64 — the portal-classifier upload
+    # tools we route WhatsApp/email attachments through.
+    assert len(names) == 72
 
     by_prefix: dict[str, int] = {}
     for value in names.values():
@@ -20,7 +21,7 @@ def test_registry_has_70_constants_grouped_by_module() -> None:
     assert by_prefix["auth"] == 13
     assert by_prefix["external"] == 6
     assert by_prefix["mcp"] == 5
-    assert by_prefix["kyc"] == 28
+    assert by_prefix["kyc"] == 30
     assert by_prefix["offers"] == 4
     assert by_prefix["payments"] == 5
     assert by_prefix["invoices"] == 9

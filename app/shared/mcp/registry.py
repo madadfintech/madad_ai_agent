@@ -64,10 +64,18 @@ class Tools:
     MCP_UPDATE_ONBOARDING_PROGRESS = "madad_mcp_update_onboarding_progress"
     MCP_GET_ONBOARDING_PROGRESS = "madad_mcp_get_onboarding_progress"
 
-    # -- KYC (28; ``madad_kyc_complete_stage`` deliberately omitted) ---------
+    # -- KYC (30; ``madad_kyc_complete_stage`` deliberately omitted) ---------
     KYC_UPDATE_ELIGIBILITY = "madad_kyc_update_eligibility"
     KYC_UPLOAD_DOCUMENT = "madad_kyc_upload_document"
     KYC_UPLOAD_DOCUMENT_BASE64 = "madad_kyc_upload_document_base64"
+    # Per Ishan (2026-06-07): the classify-and-upload tools auto-detect the
+    # document type using Madad's portal classifier. Preferred for
+    # WhatsApp/email uploads where the SME doesn't know (or doesn't say)
+    # which doc type they're sending — eliminates our filename-keyword
+    # inference and routes everything through the same backend pipeline
+    # the MSME complete-onboarding page uses.
+    KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64 = "madad_kyc_classify_and_upload_document_base64"
+    KYC_CLASSIFY_AND_UPLOAD_ZIP_BASE64 = "madad_kyc_classify_and_upload_zip_base64"
     KYC_UPLOAD_COMMERCIAL_REGISTRATION = "madad_kyc_upload_commercial_registration"
     KYC_UPLOAD_AUDITED_FINANCIAL_REPORT = "madad_kyc_upload_audited_financial_report"
     KYC_INSPECT_ZIP = "madad_kyc_inspect_zip"

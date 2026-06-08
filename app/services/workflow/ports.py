@@ -495,6 +495,40 @@ class KycClient(Protocol):
         mime_type: str | None = None,
     ) -> dict[str, Any]: ...
 
+    async def classify_and_upload_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+        document_param: str | None = None,
+        document_label: str | None = None,
+    ) -> dict[str, Any]:
+        """Per Ishan (2026-06-07): preferred upload tool for WhatsApp/email
+        attachments where the SME hasn't told us what doc type they're
+        sending. The backend classifier (same one the MSME portal uses)
+        decides the type and routes to the right entity slot; the response
+        carries the resolved ``document_type`` so the agent can acknowledge
+        per-doc without filename guessing on our side.
+        """
+        ...
+
+    async def classify_and_upload_zip_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        continue_on_error: bool = True,
+    ) -> dict[str, Any]:
+        """Expand a ZIP and classify + upload every member through the
+        portal pipeline. Returns the per-file checklist (file_name,
+        resolved document_type, confidently_classified bool) — exactly the
+        shape needed to render the PDF Step 4 'ZIP received / found these /
+        still missing X' message."""
+        ...
+
     async def add_buyer(
         self, *, access_token: str, data: dict[str, Any]
     ) -> dict[str, Any]: ...
@@ -608,6 +642,76 @@ class InMemoryKycClient:
             "mime_type": mime_type,
         }
         return {"document_id": new_id("doc"), "document_type": document_type}
+
+    async def classify_and_upload_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+        document_param: str | None = None,
+        document_label: str | None = None,
+    ) -> dict[str, Any]:
+        """In-memory classifier: looks at the filename keywords to pick a
+        type (mirrors the workflow's old _infer_doc_type), defaults to
+        ``ADDITIONAL_DOCUMENT`` so files are never lost."""
+        self._record(
+            "classify_and_upload_document_base64",
+            access_token=access_token,
+            filename=filename,
+            mime_type=mime_type,
+            document_param=document_param,
+            document_label=document_label,
+        )
+        # Tiny stand-in classifier: filename keywords decide.
+        lowered = (filename or "").lower()
+        keyword_map = {
+            "cr": "commercial_registration",
+            "commercial": "commercial_registration",
+            "audited": "audited_report",
+            "financial": "audited_report",
+            "trade": "trade_license",
+            "tax": "tax_card",
+            "bank": "bank_statement",
+            "vat": "vat_certificate",
+            "establishment": "establishment_card",
+            "qid": "qid",
+            "passport": "passport",
+        }
+        document_type = "additional_document"
+        for kw, dt in keyword_map.items():
+            if kw in lowered:
+                document_type = dt
+                break
+        self.uploaded_documents[document_type] = {
+            "filename": filename,
+            "content_base64": content_base64,
+            "mime_type": mime_type,
+        }
+        return {
+            "document_id": new_id("doc"),
+            "document_type": document_type,
+            "confidently_classified": document_type != "additional_document",
+        }
+
+    async def classify_and_upload_zip_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        continue_on_error: bool = True,
+    ) -> dict[str, Any]:
+        """In-memory ZIP classify-and-upload — empty checklist by default;
+        tests can preload self.zip_contents to model contents."""
+        self._record(
+            "classify_and_upload_zip_base64",
+            access_token=access_token,
+            filename=filename,
+            continue_on_error=continue_on_error,
+        )
+        return {"checklist": [], "uploaded_count": 0}
 
     async def add_buyer(
         self, *, access_token: str, data: dict[str, Any]

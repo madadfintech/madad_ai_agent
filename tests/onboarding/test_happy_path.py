@@ -132,7 +132,8 @@ async def test_mcp_tool_calls_happen_in_order(harness):
     # add_buyer / add_shareholders are no longer in the graph.
     assert "upload_commercial_registration" in kyc_calls
     assert "upload_audited_financial_report" in kyc_calls
-    assert "upload_document_base64" in kyc_calls
+    # A5: docs loop now routes through the classify-and-upload tool.
+    assert "classify_and_upload_document_base64" in kyc_calls
 
 
 async def test_reminders_scheduled_and_suppressed_at_wait_points(harness):

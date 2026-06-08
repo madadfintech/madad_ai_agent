@@ -92,6 +92,23 @@ def _backend_document_type(workflow_doc_type: str) -> str:
     )
 
 
+# Inverse of _DOCUMENT_TYPE_TO_BACKEND — backend SCREAMING_SNAKE → workflow snake.
+# Built once at module load. When the backend's classify-and-upload tool returns
+# a document_type we don't recognise (e.g. ``ADDITIONAL_DOCUMENT``), the caller
+# should keep the file but flag it as unmapped.
+_BACKEND_TO_DOCUMENT_TYPE = {v: k for k, v in _DOCUMENT_TYPE_TO_BACKEND.items()}
+
+
+def workflow_doc_type(backend_doc_type: str) -> str:
+    """Map a backend SCREAMING_SNAKE document_type back to the workflow's
+    snake_case label. Unknown types lowercase-pass-through so the missing-
+    docs accounting can still track them (just with a non-canonical name)."""
+
+    return _BACKEND_TO_DOCUMENT_TYPE.get(
+        backend_doc_type, backend_doc_type.lower()
+    )
+
+
 def _entity_type_for(workflow_doc_type: str) -> str:
     """The backend ``documentEntityType`` a given doc type belongs under."""
 
@@ -181,6 +198,48 @@ class McpKycClient:
                     "document_type": _backend_document_type(document_type),
                     "document_label": filename,
                 },
+            },
+        )
+
+    async def classify_and_upload_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+        document_param: str | None = None,
+        document_label: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "file_name": filename,
+            "mime_type": mime_type or _infer_mime_type(filename),
+            "base64": content_base64,
+            "access_token": access_token,
+        }
+        if document_param is not None:
+            payload["document_param"] = document_param
+        if document_label is not None:
+            payload["document_label"] = document_label
+        return await self._tools.call_tool(
+            Tools.KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64, payload
+        )
+
+    async def classify_and_upload_zip_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        continue_on_error: bool = True,
+    ) -> dict[str, Any]:
+        return await self._tools.call_tool(
+            Tools.KYC_CLASSIFY_AND_UPLOAD_ZIP_BASE64,
+            {
+                "file_name": filename,
+                "base64": content_base64,
+                "access_token": access_token,
+                "continue_on_error": continue_on_error,
             },
         )
 

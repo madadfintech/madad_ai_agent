@@ -576,6 +576,18 @@ class KycClient(Protocol):
         still missing X' message."""
         ...
 
+    async def upload_invoice_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit an invoice for financing from base64 (ACTIVE SME uploads an
+        invoice PDF). Backend reuses the portal extraction + submission path."""
+        ...
+
     async def add_buyer(
         self, *, access_token: str, data: dict[str, Any]
     ) -> dict[str, Any]: ...
@@ -759,6 +771,22 @@ class InMemoryKycClient:
             continue_on_error=continue_on_error,
         )
         return {"checklist": [], "uploaded_count": 0}
+
+    async def upload_invoice_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        self._record(
+            "upload_invoice_base64",
+            access_token=access_token,
+            filename=filename,
+            mime_type=mime_type,
+        )
+        return {"success": True, "data": {"invoiceNumber": filename}}
 
     async def add_buyer(
         self, *, access_token: str, data: dict[str, Any]

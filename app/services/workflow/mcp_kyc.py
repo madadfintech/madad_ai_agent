@@ -243,6 +243,26 @@ class McpKycClient:
             },
         )
 
+    async def upload_invoice_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        # ACTIVE SME uploads an invoice PDF → submit it for financing straight
+        # away (backend reuses the portal extraction + submission path).
+        return await self._tools.call_tool(
+            Tools.KYC_UPLOAD_INVOICE_BASE64,
+            {
+                "file_name": filename,
+                "base64": content_base64,
+                "access_token": access_token,
+                "mime_type": mime_type or _infer_mime_type(filename),
+            },
+        )
+
     async def add_buyer(
         self, *, access_token: str, data: dict[str, Any]
     ) -> dict[str, Any]:

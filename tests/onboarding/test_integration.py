@@ -53,20 +53,23 @@ async def test_onboarding_drives_real_communication_and_nudge():
     async def resume(message):
         return await runtime.resume(WA, IDENTITY, message=message)
 
+    doc = "ZHVtbXk="
     await resume({"text": "YES"})
-    await resume({"first_name": "Aisha", "last_name": "Karim"})
-    await resume({"attachments": [{"filename": "CR.pdf"}]})
-    await resume({"annual_revenue_qar": 5_000_000})
-    await resume({"attachments": [{"filename": "Audited.pdf"}]})
-    await resume({"name": "ACME LLC"})
-    await resume({"shareholders": [{"name": "Aisha", "percentage": 100}]})
+    await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
+    await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
+    await resume({"event": "prequalification.completed", "madadScore": 78})
     await resume(
-        {"attachments": [{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}]}
+        {
+            "attachments": [
+                {"filename": "Trade_License.pdf", "content_base64": doc},
+                {"filename": "Tax_Card.pdf", "content_base64": doc},
+            ]
+        }
     )
 
-    # Advance backend to drive the rest of the flow.
+    # Advance backend through payment_wait → payment → lender_wait → offers.
     platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
-    await resume({"type": "status_update"})
+    await resume({"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"})
     await resume({"type": "payment", "paid": True})
     platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
     result = await resume({"type": "status_update"})

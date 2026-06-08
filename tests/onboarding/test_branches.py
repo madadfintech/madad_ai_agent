@@ -33,51 +33,45 @@ async def test_domain_blocked_terminal_for_corporate_email(make_harness):
     assert "onboarding.domain_blocked" in harness.messenger.templates()
 
 
-async def test_ineligible_ends_flow_at_eligibility_update(make_harness):
-    harness = make_harness(eligibility_result={"eligible": False})
+# NOTE: test_ineligible_ends_flow_at_eligibility_update was deleted —
+# the eligibility_update node is no longer in the workflow graph per the
+# spec-alignment merge (commit 62d7560). The Qatar-residency check now
+# happens inline via consent_await without surfacing an explicit
+# "ineligible" terminal.
+
+# NOTE: test_missing_documents_loops_until_complete was deleted — main's
+# _route_documents is now LENIENT (returns "complete" as soon as ANY
+# attachment lands), per "fix(workflow): docs step is lenient — proceed
+# to coffee after any 1 upload" (commit d01a0e5). The missing-docs loop
+# behaviour no longer exists.
+
+
+async def _drive_to_payment(harness):
+    """Drive the spec-aligned flow up to the payment node."""
     runtime = harness.platform.runtime
+    doc = "ZHVtbXk="
 
     async def resume(message):
         return await runtime.resume(WA, IDENTITY, message=message)
 
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     await resume({"text": "YES"})
-    await resume({"first_name": "A", "last_name": "B"})
-    await resume({"attachments": [{"filename": "CR.pdf"}]})
-    result = await resume({"annual_revenue_qar": 1000})
-
-    assert result.status == RunStatus.COMPLETED
-    assert result.values["outcome"] == "not_eligible"
-    assert result.values["eligible"] is False
-    assert "onboarding.not_eligible" in harness.messenger.templates()
-
-
-async def test_missing_documents_loops_until_complete(harness):
-    runtime = harness.platform.runtime
-
-    async def resume(message):
-        return await runtime.resume(WA, IDENTITY, message=message)
-
-    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    await resume({"text": "YES"})
-    await resume({"first_name": "A", "last_name": "B"})
-    await resume({"attachments": [{"filename": "CR.pdf"}]})
-    await resume({"annual_revenue_qar": 1000})
-    await resume({"attachments": [{"filename": "Audited.pdf"}]})
-    await resume({"name": "Buyer 1"})
-    await resume({"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]})
-
-    # Upload only one of the two required documents — graph re-asks.
-    partial = await resume({"attachments": [{"filename": "Trade_License.pdf"}]})
-    assert partial.status == RunStatus.WAITING_FOR_INPUT
-    assert partial.prompt == {"waiting_for": "upload", "step": "documents"}
-    assert partial.values["missing_documents"] == ["tax_card"]
-    assert "onboarding.documents.missing" in harness.messenger.templates()
-
-    # Upload the remaining doc → reaches the post-docs status poll.
-    completed = await resume({"attachments": [{"filename": "Tax_Card.pdf"}]})
-    assert completed.values["missing_documents"] == []
-    assert "onboarding.documents.complete" in harness.messenger.templates()
+    await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
+    await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
+    await resume({"event": "prequalification.completed", "madadScore": 78})
+    await resume(
+        {
+            "attachments": [
+                {"filename": "Trade_License.pdf", "content_base64": doc},
+                {"filename": "Tax_Card.pdf", "content_base64": doc},
+            ]
+        }
+    )
+    # Release payment gate
+    harness.identity.journey_status = "PRE_QUALIFIED"
+    return await resume(
+        {"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"}
+    )
 
 
 async def test_not_qualified_post_payment_via_lender_status(make_harness):
@@ -87,19 +81,8 @@ async def test_not_qualified_post_payment_via_lender_status(make_harness):
     async def resume(message):
         return await runtime.resume(WA, IDENTITY, message=message)
 
-    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    await resume({"text": "YES"})
-    await resume({"first_name": "A", "last_name": "B"})
-    await resume({"attachments": [{"filename": "CR.pdf"}]})
-    await resume({"annual_revenue_qar": 1000})
-    await resume({"attachments": [{"filename": "Audited.pdf"}]})
-    await resume({"name": "Buyer 1"})
-    await resume({"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]})
-    await resume({"attachments": [{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}]})
-
-    # Advance to payment then back to lender wait.
-    harness.identity.journey_status = "PRE_QUALIFIED"
-    await resume({"type": "status_update"})
+    await _drive_to_payment(harness)
+    # Mark monetization payment as paid → moves to lender_wait.
     await resume({"type": "payment", "paid": True})
 
     # Backend rejects at lender stage → NOT_ACCEPTED routes to not_qualified.
@@ -114,23 +97,15 @@ async def test_not_qualified_post_payment_via_lender_status(make_harness):
 async def test_terminal_success_via_activated_status(harness):
     """If the backend reaches ACTIVATED before we hit offers_fetch (race
     between webhook + poll), the activated terminal completes the flow."""
-
     runtime = harness.platform.runtime
 
     async def resume(message):
         return await runtime.resume(WA, IDENTITY, message=message)
 
-    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    await resume({"text": "YES"})
-    await resume({"first_name": "A", "last_name": "B"})
-    await resume({"attachments": [{"filename": "CR.pdf"}]})
-    await resume({"annual_revenue_qar": 1000})
-    await resume({"attachments": [{"filename": "Audited.pdf"}]})
-    await resume({"name": "Buyer 1"})
-    await resume({"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]})
-    await resume({"attachments": [{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}]})
+    await _drive_to_payment(harness)
+    await resume({"type": "payment", "paid": True})
 
-    # Backend jumps straight to ACTIVATED at the post-docs poll.
+    # Backend jumps straight to ACTIVATED at the post-payment poll.
     harness.identity.journey_status = "ACTIVATED"
     result = await resume({"type": "status_update"})
 

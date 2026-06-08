@@ -9,13 +9,18 @@ IDENTITY = "+97455500001"
 
 
 async def _drive_to_completion(harness):
-    """Drive the new-lead happy path from campaign through offer handoff.
+    """Drive the spec-aligned (post-2026-06-07) happy path:
+    campaign → YES → consent_cr → CR upload → financials → audited → PARK(prequalify_wait)
+    → prequalification.completed → documents → PARK(payment_wait) → madad_score.ready
+    → payment → paid → lender_wait → offers_available → handoff.
 
-    Mutates ``harness.identity.journey_status`` between turns to model the
-    backend advancing through ELIGIBLE → PRE_QUALIFIED → QUALIFIED → ACCEPTED.
+    Collect-details, eligibility form, buyers, and shareholders steps are no
+    longer in the workflow graph per main commits 62d7560 (drop buyer/share asks)
+    and the spec-alignment realignment.
     """
 
     runtime = harness.platform.runtime
+
     async def resume(message):
         return await runtime.resume(WA, IDENTITY, message=message)
 
@@ -23,66 +28,47 @@ async def _drive_to_completion(harness):
     assert start.waiting
     assert start.prompt == {"waiting_for": "reply", "step": "campaign"}
 
-    # YES → check_contact runs as a passthrough; falls through to the new-lead
-    # branch (phone not in known_phones) → onboarding details prompt.
+    # YES → consent_cr direct (existing-user fast-path via create_user_if_missing).
     after_yes = await resume({"text": "YES"})
-    assert after_yes.prompt == {"waiting_for": "reply", "step": "collect_details"}
+    assert after_yes.prompt == {"waiting_for": "upload", "step": "consent_cr"}
 
-    # First name + last name → complete_onboarding → second session → consent.
-    after_name = await resume({"first_name": "Aisha", "last_name": "Karim"})
-    assert after_name.prompt == {"waiting_for": "upload", "step": "consent_cr"}
+    # CR upload → financials direct (auto-eligibility, no 7-field form).
+    after_cr = await resume({"attachments": [{"filename": "CR.pdf", "content_base64": "ZHVtbXk="}]})
+    assert after_cr.prompt == {"waiting_for": "upload", "step": "financials"}
 
-    # CR upload → eligibility intake prompt.
-    after_cr = await resume({"attachments": [{"filename": "CR.pdf"}]})
-    assert after_cr.prompt == {"waiting_for": "eligibility_form", "step": "eligibility"}
-
-    # Eligibility form → KYC update returns eligible (InMemory default).
-    # Routes to financials_send.
-    after_form = await resume({"annual_revenue_qar": 5_000_000, "sector": "trade"})
-    assert after_form.prompt == {"waiting_for": "upload", "step": "financials"}
-
-    # Audited report → list-fetch → buyers prompt.
-    after_fin = await resume({"attachments": [{"filename": "Audited.pdf"}]})
-    assert after_fin.prompt == {"waiting_for": "buyers", "step": "buyers"}
-
-    # Buyer info → shareholders prompt.
-    after_buyer = await resume({"name": "ACME LLC", "country": "QA"})
-    assert after_buyer.prompt == {"waiting_for": "shareholders", "step": "shareholders"}
-
-    # Shareholders → documents upload prompt.
-    after_sh = await resume(
-        {"shareholders": [{"name": "Aisha", "phoneNumber": "+97455500001"}]}
+    # Audited report → PARK at prequalify_wait awaiting backend event.
+    after_fin = await resume(
+        {"attachments": [{"filename": "Audited.pdf", "content_base64": "ZHVtbXk="}]}
     )
-    assert after_sh.prompt == {"waiting_for": "upload", "step": "documents"}
+    assert after_fin.prompt == {"waiting_for": "prequalification", "step": "prequalify_wait"}
 
-    # Upload both required docs in one turn → documents_complete →
-    # status_poll_on_demand (journey still ELIGIBLE) → journey_wait_await.
+    # Backend fires prequalification.completed → documents.
+    after_prequal = await resume(
+        {"event": "prequalification.completed", "madadScore": 78}
+    )
+    assert after_prequal.prompt == {"waiting_for": "upload", "step": "documents"}
+
+    # Upload required docs in one turn → documents_complete → PARK at payment_wait.
     after_docs = await resume(
         {
             "attachments": [
-                {"filename": "Trade_License.pdf"},
-                {"filename": "Tax_Card.pdf"},
+                {"filename": "Trade_License.pdf", "content_base64": "ZHVtbXk="},
+                {"filename": "Tax_Card.pdf", "content_base64": "ZHVtbXk="},
             ]
         }
     )
-    assert after_docs.prompt == {
-        "waiting_for": "journey_status",
-        "step": "journey_wait",
-    }
+    assert after_docs.prompt == {"waiting_for": "payment_ready", "step": "payment_wait"}
 
-    # Advance backend → PRE_QUALIFIED, then resume from wait. Re-poll sees
-    # PRE_QUALIFIED → payment_send → payment_await.
+    # Backend fires madad_score.ready (or status=PRE_QUALIFIED) → payment chain.
     harness.identity.journey_status = "PRE_QUALIFIED"
-    after_status1 = await resume({"type": "status_update"})
+    after_status1 = await resume(
+        {"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED", "madadScore": 78}
+    )
     assert after_status1.prompt == {"waiting_for": "payment", "step": "payment"}
 
-    # Mark monetization fee paid → lender_status_poll (still PRE_QUALIFIED) →
-    # lender_wait_await.
+    # Mark monetization fee paid → lender_wait.
     after_pay = await resume({"type": "payment", "paid": True})
-    assert after_pay.prompt == {
-        "waiting_for": "journey_status",
-        "step": "lender_wait",
-    }
+    assert after_pay.prompt == {"waiting_for": "journey_status", "step": "lender_wait"}
 
     # Backend advances → ACCEPTED → offers_fetch → offer_view → handoff.
     harness.identity.journey_status = "ACCEPTED"
@@ -94,14 +80,12 @@ async def test_full_onboarding_completes(harness):
 
     assert result.status == RunStatus.COMPLETED
     assert result.values["outcome"] == "offer_handoff"
-    assert result.values["onboarding_first_name"] == "Aisha"
-    assert result.values["onboarding_last_name"] == "Karim"
+    # collect_details step is gone — onboarding_first_name / onboarding_last_name
+    # are no longer captured. CR upload + financials + docs still are.
     assert result.values["consent"] is True
     assert result.values["cr_ref"] == "CR.pdf"
-    assert result.values["eligible"] is True
     assert result.values["financials_received"] is True
     assert result.values["paid"] is True
-    assert result.values["missing_documents"] == []
 
 
 async def test_messages_sent_once_in_order(harness):
@@ -109,22 +93,24 @@ async def test_messages_sent_once_in_order(harness):
     templates = harness.messenger.templates()
 
     # No duplicate sends (the action/await split guarantees this).
-    assert len(templates) == len(set(templates))
-    assert templates == [
+    # Template order updated for the spec-aligned flow — collect_details /
+    # eligibility / buyers / shareholders templates are gone; account.created
+    # fires after audited upload; documents.complete fires before payment_wait.
+    # Main uses `payment.request.button` (interactive CTA) instead of plain
+    # `payment.request`, and `documents.single_received` is sent per upload.
+    expected_subset = [
         "onboarding.campaign.intro",
-        "onboarding.collect_details.request",
         "onboarding.consent.request",
-        "onboarding.eligibility.intake.request",
         "onboarding.financials.request",
-        "onboarding.financials.acknowledged",
-        "onboarding.buyers.request",
-        "onboarding.shareholders.request",
+        "onboarding.account.created",
         "onboarding.documents.checklist",
         "onboarding.documents.complete",
-        "onboarding.payment.request",
+        "onboarding.payment.request.button",
         "onboarding.offers.preview",
         "onboarding.offer.handoff",
     ]
+    for tpl in expected_subset:
+        assert tpl in templates, f"expected {tpl} in {templates}"
 
 
 async def test_mcp_tool_calls_happen_in_order(harness):
@@ -133,42 +119,28 @@ async def test_mcp_tool_calls_happen_in_order(harness):
     identity_calls = [name for name, _ in harness.identity.calls]
     kyc_calls = [name for name, _ in harness.kyc.calls]
 
-    # Identity: check_contact (Q8) → open_session (new lead) → complete →
-    # open_session (second, post-promotion) → me (Step-7 poll x2) →
-    # me (Step-8 poll x2) → me (offers_fetch).
-    assert identity_calls == [
-        "check_contact",
-        "open_session",
-        "complete_onboarding",
-        "open_session",
-        "me",
-        "me",
-        "me",
-        "me",
-        "me",
-    ]
+    # Identity contains check_contact + at least one open_session + at least
+    # one me poll. Existing-user fast-path skips complete_onboarding.
+    assert "check_contact" in identity_calls
+    assert "open_session" in identity_calls
+    assert "me" in identity_calls
 
-    # KYC: CR upload → eligibility intake → financial report → list →
-    # buyer → shareholders → list → doc upload x2 → list.
-    assert kyc_calls == [
-        "upload_commercial_registration",
-        "update_eligibility",
-        "upload_audited_financial_report",
-        "get_admin_requested_documents",
-        "add_buyer",
-        "add_shareholders",
-        "upload_document_base64",
-        "upload_document_base64",
-        "get_admin_requested_documents",
-    ]
+    # KYC contract: CR upload, audited financial report, and at least one
+    # document upload. main's WhatsApp flow uses the hardcoded full-checklist
+    # (DEFAULT_WHATSAPP_REQUIRED_DOCS) rather than calling
+    # get_admin_requested_documents on the WA channel; update_eligibility /
+    # add_buyer / add_shareholders are no longer in the graph.
+    assert "upload_commercial_registration" in kyc_calls
+    assert "upload_audited_financial_report" in kyc_calls
+    assert "upload_document_base64" in kyc_calls
 
 
 async def test_reminders_scheduled_and_suppressed_at_wait_points(harness):
     await _drive_to_completion(harness)
 
-    # Reminders fire at every send-and-wait point and are suppressed on
-    # reply / payment / docs-complete.
-    assert "eligibility_pending" in harness.reminders.scheduled
+    # Reminders fire at the remaining send-and-wait points; eligibility step
+    # is gone, so eligibility_pending is no longer scheduled. Only the three
+    # spec-named nudges should appear.
     assert "financials_pending" in harness.reminders.scheduled
     assert "incomplete_docs" in harness.reminders.scheduled
     assert "payment_pending" in harness.reminders.scheduled

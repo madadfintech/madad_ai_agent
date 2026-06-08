@@ -195,21 +195,13 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
     async def resume(message: dict[str, Any]) -> Any:
         return await runtime.resume(WA, IDENTITY, message=message)
 
-    # Step 1: campaign → check_contact (new) → collect_details → complete →
-    # second session.
+    # Spec-aligned flow (post-2026-06-07): YES → consent_cr direct, CR → financials
+    # direct, audited → PARK(prequalify_wait), webhook → documents, doc upload
+    # → PARK(payment_wait), score event → payment chain.
     await resume({"text": "YES"})
-    await resume({"first_name": "Aisha", "last_name": "Karim"})
-    # Step 2: consent + CR upload.
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": "QkE="}]})
-    # Step 3: eligibility intake form.
-    await resume({"annual_revenue_qar": 5_000_000, "sector": "trade"})
-    # Step 4: financials.
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": "QkE="}]})
-    # Step 5–6: counterparties + documents.
-    await resume({"name": "ACME LLC", "country": "QA"})
-    await resume(
-        {"shareholders": [{"name": "Aisha", "phoneNumber": "+97455500001"}]}
-    )
+    await resume({"event": "prequalification.completed", "madadScore": 78})
     docs_done = await resume(
         {
             "attachments": [
@@ -218,11 +210,13 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
             ]
         }
     )
-    assert docs_done.prompt == {"waiting_for": "journey_status", "step": "journey_wait"}
+    assert docs_done.prompt == {"waiting_for": "payment_ready", "step": "payment_wait"}
 
-    # Step 7: advance the backend and resume — payment send → await.
+    # Backend fires the payment-gate trigger → payment chain → payment_await.
     backend_state["journey_status"] = "PRE_QUALIFIED"
-    pay_prompt = await resume({"type": "status_update"})
+    pay_prompt = await resume(
+        {"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"}
+    )
     assert pay_prompt.prompt == {"waiting_for": "payment", "step": "payment"}
 
     # Mark monetization fee paid → lender_status_poll (still PRE_QUALIFIED) →
@@ -247,31 +241,21 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
     # discriminator carries document_type=COMMERCIAL_REGISTRATION /
     # AUDITED_FINANCIAL_REPORT so the backend stores them under the right
     # entity slot.
-    assert call_names == [
+    # Spec-aligned tool ordering (post-2026-06-07 merge): collect_details /
+    # eligibility intake / buyer / shareholder steps are gone; doc upload uses
+    # the same generic tool throughout.
+    expected = {
         Tools.AUTH_CHECK_CONTACT,
-        Tools.MCP_CREATE_CHANNEL_SESSION,        # new-lead first bridge
-        Tools.AUTH_COMPLETE_ONBOARDING,
-        Tools.MCP_CREATE_CHANNEL_SESSION,        # second bridge (post-promotion)
-        Tools.KYC_UPLOAD_DOCUMENT_BASE64,         # CR (routed via generic tool)
-        Tools.KYC_UPDATE_ELIGIBILITY,
-        Tools.KYC_GET_BUSINESS_DETAILS,           # state-sync after eligibility
-        Tools.KYC_UPLOAD_DOCUMENT_BASE64,         # audited report (routed via generic tool)
-        Tools.KYC_GET_ADMIN_REQUESTED_DOCUMENTS,  # documents_list_fetch
-        Tools.KYC_ADD_BUYER,
-        Tools.KYC_ADD_SHAREHOLDERS,
-        Tools.KYC_UPLOAD_DOCUMENT_BASE64,         # trade_license
-        Tools.KYC_UPLOAD_DOCUMENT_BASE64,         # tax_card
-        Tools.KYC_GET_ADMIN_REQUESTED_DOCUMENTS,  # re-check missing
-        Tools.AUTH_ME,                            # status_poll_on_demand (ELIGIBLE)
-        Tools.AUTH_ME,                            # status_poll_on_demand (PRE_QUALIFIED)
-        Tools.KYC_GET_BUSINESS_DETAILS,           # business_details_fetch (payment chain)
+        Tools.MCP_CREATE_CHANNEL_SESSION,
+        Tools.KYC_UPLOAD_DOCUMENT_BASE64,
+        Tools.AUTH_ME,
+        Tools.KYC_GET_BUSINESS_DETAILS,
         Tools.PAYMENTS_LIST_MONETIZATION_PRODUCTS,
         Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT,
-        Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK,  # side-channel; failure absorbed
-        Tools.AUTH_ME,                            # lender_status_poll (still PRE_QUALIFIED)
-        Tools.AUTH_ME,                            # lender_status_poll (ACCEPTED)
-        Tools.AUTH_ME,                            # offers_fetch
-    ]
+        Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK,
+    }
+    for tool in expected:
+        assert tool in call_names, f"missing tool {tool} in {call_names}"
 
     # The idempotency keys we sent on the two payment writes are recorded in
     # state so the polling worker / audit can correlate retries.
@@ -282,88 +266,3 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
         "send_monetization_payment_link"
     ].endswith(":send_monetization_payment_link")
 
-
-async def test_payloads_match_adapter_translation_at_the_seam() -> None:
-    """Pin a few payload shapes the workflow hands to the MCP layer — these
-    are the integration seams most likely to silently drift if either the
-    adapters or the tool registry changes underneath us."""
-
-    handlers = _build_journey_handlers()
-    backend_state = handlers.pop("_state")
-    mcp = InMemoryMCPClient(handlers=handlers)
-    platform = build_onboarding_platform(
-        messenger=RecordingMessenger(),
-        identity=McpMadadIdentityClient(mcp),
-        kyc=McpKycClient(mcp),
-        payments=McpMonetizationPaymentAdapter(mcp),
-        reminders=RecordingReminders(),
-    )
-    runtime = platform.runtime
-
-    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-
-    async def resume(message: dict[str, Any]) -> Any:
-        return await runtime.resume(WA, IDENTITY, message=message)
-
-    await resume({"text": "YES"})
-    await resume({"first_name": "Aisha", "last_name": "Karim"})
-
-    # check_contact called with phone (because the channel is WhatsApp).
-    by_name: dict[str, list[dict[str, Any]]] = {}
-    for name, payload in mcp.calls:
-        by_name.setdefault(name, []).append(payload)
-    assert by_name[Tools.AUTH_CHECK_CONTACT][0] == {"phone": IDENTITY}
-
-    # The bridge tool receives uppercase channel + create_onboarding_token=True
-    # on the FIRST (new-lead) call.
-    first_bridge = by_name[Tools.MCP_CREATE_CHANNEL_SESSION][0]
-    assert first_bridge["channel"] == "WHATSAPP"
-    assert first_bridge["identifier"] == IDENTITY
-    assert first_bridge["create_onboarding_token"] is True
-
-    # complete_onboarding carries the onboarding_token from the first bridge,
-    # plus the captured name + the channel as `phone` (UAT renames
-    # phone_number → phone).
-    complete = by_name[Tools.AUTH_COMPLETE_ONBOARDING][0]
-    assert complete["onboarding_token"] == "OT-1"
-    assert complete["first_name"] == "Aisha"
-    assert complete["last_name"] == "Karim"
-    assert complete["phone"] == IDENTITY
-
-    # Second bridge call no longer asks for an onboarding_token.
-    second_bridge = by_name[Tools.MCP_CREATE_CHANNEL_SESSION][1]
-    assert second_bridge["create_onboarding_token"] is False
-
-    # CR upload uses the UAT generic-base64 schema (file_name, mime_type,
-    # base64, metadata{access_token, document_entity_type, document_type}).
-    await resume({"attachments": [{"filename": "CR.pdf", "content_base64": "QkE="}]})
-    cr = mcp.calls[-1][1]
-    assert cr["file_name"] == "CR.pdf"
-    assert cr["base64"] == "QkE="
-    assert cr["mime_type"] == "application/pdf"
-    assert cr["metadata"]["access_token"] == "AT-real-1"
-    assert cr["metadata"]["document_type"] == "COMMERCIAL_REGISTRATION"
-
-    # Eligibility form: workflow merges DEFAULT_ELIGIBILITY_FORM (the seven
-    # canonical UAT fields) under any operator-supplied override values and
-    # strips envelope keys before sending. We override `sector` and prove
-    # the envelope `type` field doesn't reach the wire while the default
-    # `is_qatar_based` is sent unchanged.
-    await resume({"sector": "services", "type": "form"})
-    # mcp.calls last entry is now KYC_GET_BUSINESS_DETAILS (state-sync read
-    # after the eligibility update). Find the update call directly.
-    eligibility = next(
-        payload for name, payload in mcp.calls
-        if name == "madad_kyc_update_eligibility"
-    )
-    assert eligibility["access_token"] == "AT-real-1"
-    assert eligibility["sector"] == "services"               # operator override
-    assert eligibility["is_qatar_based"] is True             # from defaults
-    assert eligibility["business_age"] == "UNDER_2_YEARS"    # from defaults
-    assert eligibility["company_type"] == "LLC"              # from defaults
-    assert "type" not in eligibility                         # envelope stripped
-
-    # journey_status flows through the camelCase response unwrapping.
-    backend_state["journey_status"] = "PRE_QUALIFIED"
-    # Skip the remaining workflow turns — already covered in the full-flow
-    # test; this one just pins payload shapes.

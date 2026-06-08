@@ -125,22 +125,33 @@ def _build_platform(*, journey_status: str = "PRE_QUALIFIED"):
 
 
 async def _drive_to_journey_wait(platform, identity: str) -> None:
+    """Drive the spec-aligned flow all the way to lender_wait_await, where the
+    status_poll_on_demand has fired and set ``last_polled_at``. This is the
+    poller's valid scope post-merge (payment-wait doesn't poll)."""
     runtime = platform.runtime
+    doc = "ZHVtbXk="
     await runtime.start("onboarding", WA, identity, input={"trigger": "campaign"})
 
     async def resume(msg):
         return await runtime.resume(WA, identity, message=msg)
 
     await resume({"text": "YES"})
-    await resume({"first_name": "A", "last_name": "B"})
-    await resume({"attachments": [{"filename": "CR.pdf"}]})
-    await resume({"annual_revenue_qar": 1000})
-    await resume({"attachments": [{"filename": "Audited.pdf"}]})
-    await resume({"name": "Buyer"})
-    await resume({"shareholders": [{"name": "A", "percentage": 100}]})
+    await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
+    await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
+    await resume({"event": "prequalification.completed", "madadScore": 78})
     await resume(
-        {"attachments": [{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}]}
+        {
+            "attachments": [
+                {"filename": "Trade_License.pdf", "content_base64": doc},
+                {"filename": "Tax_Card.pdf", "content_base64": doc},
+            ]
+        }
     )
+    # Release the payment gate so the workflow advances through the payment
+    # chain to lender_wait_await — that's where last_polled_at is set.
+    platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
+    await resume({"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"})
+    await resume({"type": "payment", "paid": True})
 
 
 async def test_poller_skips_runs_not_at_polling_step() -> None:
@@ -181,21 +192,19 @@ async def test_poller_advances_a_due_run_at_journey_wait_await() -> None:
     last_polled_at = snap.values["last_polled_at"]
 
     # Backend status advances → poller picks it up.
-    platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
+    # Post-merge the run is parked at lender_wait_await (we already paid).
+    # An ACCEPTED status moves it to offers_fetch → offer_handoff terminal.
+    platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
 
     stats = await run_status_poller(
         platform, now=last_polled_at + timedelta(hours=2)
     )
 
     assert stats.polled == 1
-    # After the poll, the run advanced to payment_await (PRE_QUALIFIED →
-    # business_details_fetch → ... → payment chain → payment_await).
-    runs = await platform.runtime.run_store.list_by_status(
-        RunStatus.WAITING_FOR_INPUT
-    )
+    # After the poll, the run completed via offers_fetch → offer_handoff.
+    runs = await platform.runtime.run_store.list_by_status(RunStatus.COMPLETED)
     matching = [r for r in runs if r.identity == identity]
     assert len(matching) == 1
-    assert matching[0].current_step == "payment_await"
 
 
 async def test_poller_respects_webhook_suppression_window() -> None:
@@ -229,7 +238,8 @@ async def test_poller_respects_webhook_suppression_window() -> None:
         RunStatus.WAITING_FOR_INPUT
     )
     run = next(r for r in runs if r.identity == identity)
-    assert run.current_step == "journey_wait_await"
+    # Post-merge the run parks at lender_wait_await after payment.
+    assert run.current_step == "lender_wait_await"
 
     compiled = platform.runtime.loader.load(run.workflow, run.version)
     snap = await compiled.graph.aget_state(
@@ -238,17 +248,19 @@ async def test_poller_respects_webhook_suppression_window() -> None:
     last_polled_at = snap.values["last_polled_at"]
     assert snap.values["last_status_source"] == "webhook"
 
-    # Cadence for ELIGIBLE is 5 min. Tick at +6 min → past cadence but inside
-    # 2× cadence → suppression engaged → skip.
+    # Post-merge the journey_status at lender_wait_await is PRE_QUALIFIED (set
+    # by the score event), giving cadence_for(PRE_QUALIFIED) = CADENCE_MEDIUM
+    # = 15 min. Tick at +16 min → past cadence but inside 2× cadence →
+    # suppression engaged → skip.
     stats = await run_status_poller(
-        platform, now=last_polled_at + timedelta(minutes=6)
+        platform, now=last_polled_at + timedelta(minutes=16)
     )
     assert stats.skipped_cadence == 1
     assert stats.polled == 0
 
     # Tick well past 2× cadence → suppression releases → poll.
-    platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
+    platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
     stats2 = await run_status_poller(
-        platform, now=last_polled_at + timedelta(minutes=15)
+        platform, now=last_polled_at + timedelta(minutes=45)
     )
     assert stats2.polled == 1

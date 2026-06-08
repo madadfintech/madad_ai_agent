@@ -1632,6 +1632,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         # never cleared and the flow looped forever on "still needed". FAILSAFE:
         # assign each uploaded file to the next still-missing required doc so the
         # user's uploads actually satisfy the checklist and advance to completion.
+        # Mint a live backend token from the verified WhatsApp identity. The run
+        # may be parked with no/expired token in state — relying on the cached
+        # state.access_token here was silently dropping EVERY upload (no token →
+        # block skipped → docs marked "received" but never sent). NO document a
+        # user uploads may be lost, so we always obtain a fresh token first.
+        token, refresh, expires = await self._live_token(state, ctx)
         pending: list[str] = list(state.missing_documents)
         validated: list[str] = []  # uploaded + accepted by backend → ✅
         unprocessed: list[str] = []  # backend rejected / no token → ⏳ honest
@@ -1644,10 +1650,10 @@ class OnboardingWorkflow(WorkflowDefinition):
             # Only acknowledge "Received & Validated" if the backend actually
             # accepted the upload — never claim success on a swallowed error.
             uploaded_ok = False
-            if state.access_token:
+            if token:
                 try:
                     await self._kyc.upload_document_base64(
-                        access_token=state.access_token,
+                        access_token=token,
                         content_base64=att.get("content_base64") or "",
                         filename=att.get("filename") or "",
                         document_type=doc_type,
@@ -1689,6 +1695,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx,
             missing_documents=missing,
             documents_received=bool(attachments),
+            access_token=token,
+            refresh_token=refresh,
+            token_expires_at=expires,
         )
 
     async def _acknowledge_uploads(
@@ -2304,27 +2313,33 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _live_token(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> tuple[str | None, str | None, int | None]:
-        """Return a non-expired ``(access_token, refresh_token, expires_at)``.
+        """Return a live ``(access_token, refresh_token, expires_at)``, minting
+        one on demand from the verified WhatsApp identity when needed.
 
-        Production journeys span days; the Madad access_token only lives 900s.
-        Whenever the existing token is within 60s of expiry (or already
-        past), re-open the channel session to mint a fresh one. The new
-        tuple is returned for the node to write back into state via its
-        return dict so subsequent turns inherit the live credentials.
+        Production journeys span days; the Madad access_token only lives 900s,
+        and a parked run can resume with an empty or long-expired token in
+        state. The WhatsApp identity is already verified (Meta-signed inbound
+        webhook + a WhatsApp-verified phone number), so the backend mints a
+        fresh agent access token from the identity alone — no password, no
+        login. Possession of the verified number IS the credential.
 
-        On refresh failure the stale tuple is returned and the downstream
-        MCP call will 401 — which our tolerant wrappers absorb. Better to
-        keep moving than crash the run.
+        We therefore reuse the cached token only while it is comfortably
+        unexpired; otherwise (missing OR near/past expiry) we re-open the
+        channel session to mint a new one. The fresh tuple is returned so the
+        calling node can write it back into state for subsequent turns. On a
+        mint failure the stale tuple is returned and the downstream MCP call
+        degrades — better to keep moving than crash the run.
         """
 
         token = state.access_token
         refresh = state.refresh_token
         expires = state.token_expires_at
-        if not token:
-            return None, refresh, expires
         now_ts = ctx.clock.now().timestamp()
-        if expires is None or expires - now_ts > 60:
+        # Fast path: a cached token that is still comfortably valid.
+        if token and (expires is None or expires - now_ts > 60):
             return token, refresh, expires
+        # Mint on demand — covers both the near-expiry refresh case AND the
+        # "run has no token in state" case that was silently dropping uploads.
         try:
             session = await self._identity.open_session(
                 channel=_channel(ctx),
@@ -2332,7 +2347,8 @@ class OnboardingWorkflow(WorkflowDefinition):
                 create_onboarding_token=False,
             )
             ctx.logger.info(
-                "token.refreshed",
+                "token.minted",
+                had_cached_token=bool(token),
                 old_expires_at=expires,
                 new_expires_at=session.token_expires_at,
             )
@@ -2342,7 +2358,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 session.token_expires_at or expires,
             )
         except Exception as exc:  # noqa: BLE001
-            ctx.logger.warning("token.refresh_failed", error=str(exc)[:200])
+            ctx.logger.warning("token.mint_failed", error=str(exc)[:200])
             return token, refresh, expires
 
     async def _poll_journey_status(

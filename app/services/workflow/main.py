@@ -178,6 +178,25 @@ async def inbound(
     return RunStatusDTO.from_result(result)
 
 
+def _canon_event_identity(channel: Any, identity: str | None) -> str | None:
+    """Canonicalise a backend webhook identity to the same E.164 form the inbound
+    bridge keys sessions by, so the run still resolves when the backend sends the
+    phone in a different shape (e.g. Qatar local "66563022" vs the session's
+    "+97466563022"). WhatsApp only; other channels pass through untouched."""
+    try:
+        ch = str(getattr(channel, "value", channel)).lower()
+    except Exception:
+        ch = ""
+    if ch != "whatsapp" or not identity:
+        return identity
+    digits = "".join(c for c in identity if c.isdigit())
+    if not digits:
+        return identity
+    if len(digits) == 8:  # Qatar local number -> prepend country code
+        digits = "974" + digits
+    return "+" + digits
+
+
 @app.post(
     "/workflow/madad/events/{event_type}",
     response_model=None,
@@ -204,7 +223,7 @@ async def madad_event(
             event_type=event_type,
             event_id=event_id,
             channel=req.channel,
-            identity=req.identity,
+            identity=_canon_event_identity(req.channel, req.identity),
             payload=req.payload,
         )
     except UnknownEventTypeError as exc:

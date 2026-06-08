@@ -71,8 +71,14 @@ class InMemoryCommunicationGateway(CommunicationGateway):
 # the workflow distinguishes OTP-style sends from informational sends.
 _TOOL_BY_CHANNEL: dict[Channel, str] = {
     Channel.WHATSAPP: Tools.EXT_SEND_WHATSAPP_TEXT,
-    Channel.EMAIL: Tools.EXT_SEND_EMAIL_OTP,
+    # Arbitrary-content email send (subject + body), NOT the OTP tool — so the
+    # agent can drive a full email onboarding thread, not just verification codes.
+    Channel.EMAIL: Tools.EXT_SEND_EMAIL_TEXT,
 }
+
+# Default subject for agent-driven email when the message carries none in its
+# metadata. Per-step subjects can be supplied via message.metadata["subject"].
+_DEFAULT_EMAIL_SUBJECT = "Madad Financing — update on your application"
 
 
 class McpCommunicationGateway(CommunicationGateway):
@@ -164,8 +170,14 @@ def _build_outbound_payload(channel: Channel, message: Message) -> dict[str, Any
     if channel is Channel.WHATSAPP:
         return {"to": message.identity, "body": message.text or ""}
     if channel is Channel.EMAIL:
-        # The current EMAIL mapping is to EXT_SEND_EMAIL_OTP — a
-        # send-an-OTP tool, NOT arbitrary-email-content. The body is
-        # discarded by the backend; only the recipient address is used.
-        return {"email": message.identity}
+        # Arbitrary-content email via madad_external_send_email_text: subject +
+        # body. Subject comes from the message metadata when the step supplies
+        # one, else a sensible default. (Was previously the OTP tool, which
+        # discarded the body.)
+        subject = (message.metadata or {}).get("subject") or _DEFAULT_EMAIL_SUBJECT
+        return {
+            "to": message.identity,
+            "subject": str(subject),
+            "body_text": message.text or "",
+        }
     return {"to": message.identity, "body": message.text or ""}

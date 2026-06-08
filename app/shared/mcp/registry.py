@@ -48,6 +48,7 @@ class Tools:
     # -- external communications (backend-routed) ----------------------------
     EXT_SEND_SMS_OTP = "madad_external_send_sms_otp"
     EXT_SEND_EMAIL_OTP = "madad_external_send_email_otp"
+    EXT_SEND_EMAIL_TEXT = "madad_external_send_email_text"
     EXT_VERIFY_OTP = "madad_external_verify_otp"
     EXT_SEND_WHATSAPP_TEXT = "madad_external_send_whatsapp_text"
     EXT_SEND_WHATSAPP_TEMPLATE = "madad_external_send_whatsapp_template"

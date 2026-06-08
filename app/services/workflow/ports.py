@@ -217,6 +217,37 @@ class MadadIdentityClient(Protocol):
 
     async def logout(self, *, access_token: str) -> None: ...
 
+    async def update_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+        step: int | None = None,
+        touch_inbound: bool = False,
+    ) -> dict[str, Any]:
+        """Per Ishan (2026-06-07): record a WhatsApp lead's onboarding step.
+
+        Backend hard-gates the pre-qualified document checklist on ``step >= 3``,
+        so the agent MUST call this with ``step=3`` after the audited financial
+        report upload + account-created message fires. ``touch_inbound=True`` on
+        every inbound keeps Meta's 24h window fresh. Identify the lead by
+        ``user_id``, OR by ``channel + identifier`` (phone).
+        """
+        ...
+
+    async def get_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        """Read the current onboarding step / last_inbound_at / journey_status
+        for a WhatsApp lead. Used for resume logic when the workflow loses its
+        own in-memory state."""
+        ...
+
 
 class InMemoryMadadIdentityClient:
     """Configurable fake implementing :class:`MadadIdentityClient`.
@@ -374,6 +405,40 @@ class InMemoryMadadIdentityClient:
     async def logout(self, *, access_token: str) -> None:
         self._record("logout", access_token=access_token)
         self._revoked_tokens.add(access_token)
+
+    async def update_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+        step: int | None = None,
+        touch_inbound: bool = False,
+    ) -> dict[str, Any]:
+        self._record(
+            "update_onboarding_progress",
+            user_id=user_id,
+            channel=channel,
+            identifier=identifier,
+            step=step,
+            touch_inbound=touch_inbound,
+        )
+        return {"step": step, "touch_inbound": touch_inbound, "user_id": user_id}
+
+    async def get_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        self._record(
+            "get_onboarding_progress",
+            user_id=user_id,
+            channel=channel,
+            identifier=identifier,
+        )
+        return {"step": 0, "journey_status": "SIGN_UP", "last_inbound_at": None}
 
 
 # -- KycClient: the new port the Phase 2 graph uses for KYC tools -------------

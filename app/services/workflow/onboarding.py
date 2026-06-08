@@ -935,6 +935,13 @@ class OnboardingWorkflow(WorkflowDefinition):
             create_onboarding_token=False,
             create_user_if_missing=True,
         )
+        # Step 1 — lead created (SIGN_UP). Record with the freshly-minted
+        # user_id so subsequent progress calls don't need channel+identifier.
+        progress_step = await self._update_progress(
+            state.model_copy(update={"madad_user_id": session.user_or_lead_ref}),
+            ctx,
+            step=1,
+        )
         return self._step(
             "channel_session_create_user",
             ctx,
@@ -945,6 +952,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             token_expires_at=session.token_expires_at,
             madad_user_id=session.user_or_lead_ref,
             application_ref=session.reference_number or state.application_ref,
+            onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
 
     async def _collect_onboarding_details_send(
@@ -1166,9 +1174,12 @@ class OnboardingWorkflow(WorkflowDefinition):
                     "cr_upload.failed", error=str(exc)[:200],
                     note="staging-tolerant: continuing without CR uploaded",
                 )
+        # Step 2 — CR uploaded (backend journey_status: INCOMPLETE).
+        progress_step = await self._update_progress(state, ctx, step=2)
         return self._step(
             "cr_upload_base64", ctx,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
+            onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
 
     # -- Step 3: eligibility intake ------------------------------------------
@@ -1393,7 +1404,16 @@ class OnboardingWorkflow(WorkflowDefinition):
         if not ref:
             ref = (re.sub(r"\D", "", ctx.identity or "")[-8:] or "MADAD")
         await self._send(ctx, state, "onboarding.account.created", {"ref": ref})
-        return self._step("financials_upload_base64", ctx)
+        # Step 3 — CRITICAL GATE. Per Ishan (2026-06-07): backend hard-gates
+        # the pre-qualified document checklist on step >= 3. Without this call
+        # the prequalification.completed webhook either won't fire or won't
+        # carry the document checklist payload.
+        progress_step = await self._update_progress(state, ctx, step=3)
+        return self._step(
+            "financials_upload_base64",
+            ctx,
+            onboarding_progress_step=progress_step or state.onboarding_progress_step,
+        )
 
     # -- Step 5-6: admin-requested documents + counterparties ----------------
 
@@ -1775,7 +1795,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         await self._send(ctx, state, "onboarding.documents.complete")
-        return self._step("documents_complete", ctx)
+        # Step 5 — all docs submitted, waiting for risk assessment.
+        progress_step = await self._update_progress(state, ctx, step=5)
+        return self._step(
+            "documents_complete",
+            ctx,
+            onboarding_progress_step=progress_step or state.onboarding_progress_step,
+        )
 
     # -- Postman-triggered gates (pre-qualification + payment) ----------------
 
@@ -1809,7 +1835,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         # not ignored — we never re-send or stall on it.
         payload = await_input({"waiting_for": "prequalification", "step": "prequalify_wait"})
         if self._is_prequalify_trigger(payload):
-            return self._step("prequalify_wait_await", ctx, prequalified=True)
+            # Step 4 — pre-qualified, full-doc checklist about to be sent.
+            progress_step = await self._update_progress(state, ctx, step=4)
+            return self._step(
+                "prequalify_wait_await",
+                ctx,
+                prequalified=True,
+                onboarding_progress_step=progress_step or state.onboarding_progress_step,
+            )
         await self._smart_contextual(
             ctx,
             state,
@@ -2050,6 +2083,8 @@ class OnboardingWorkflow(WorkflowDefinition):
                 )
         if not sent_as_button:
             await self._send(ctx, state, "onboarding.payment.request", variables)
+        # Step 6 — Madad score + payment gate sent to user.
+        await self._update_progress(state, ctx, step=6)
         await self._reminders.schedule(
             "payment_pending",
             channel=_channel(ctx),
@@ -2106,6 +2141,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
+            # Step 7 — payment received, application forwarded to banks.
+            await self._update_progress(state, ctx, step=7)
         return self._step("payment_await", ctx, paid=paid)
 
     # -- Step 8: lender + offers + terminals ----------------------------------
@@ -2190,7 +2227,14 @@ class OnboardingWorkflow(WorkflowDefinition):
                 raw = info.get("offers")
                 if isinstance(raw, list):
                     offers = list(raw)
-        return self._step("offers_fetch", ctx, offers=offers)
+        # Step 8 — offers ready, handing off to platform.
+        progress_step = await self._update_progress(state, ctx, step=8)
+        return self._step(
+            "offers_fetch",
+            ctx,
+            offers=offers,
+            onboarding_progress_step=progress_step or state.onboarding_progress_step,
+        )
 
     async def _offer_view_send(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -2489,6 +2533,49 @@ class OnboardingWorkflow(WorkflowDefinition):
             variables=variables or {},
             locale=locale or state.locale,
         )
+
+    async def _update_progress(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        step: int,
+    ) -> int | None:
+        """Send the canonical conversational step to Madad backend.
+
+        Per Ishan (2026-06-07): WhatsApp leads must have their conversational
+        step tracked via ``madad_mcp_update_onboarding_progress``. The backend
+        hard-gates the pre-qualified document checklist on ``step >= 3``.
+
+        Skips when:
+          * the channel isn't WhatsApp (Email leads aren't tracked this way);
+          * the step is <= the last recorded step (don't regress on retries);
+          * the backend call fails (logged as warning, workflow continues).
+
+        Returns the recorded step on success (caller writes it back to state)
+        or None when skipped.
+        """
+
+        if ctx.channel is not Channel.WHATSAPP:
+            return None
+        if state.onboarding_progress_step is not None and step <= state.onboarding_progress_step:
+            return None
+        try:
+            await self._identity.update_onboarding_progress(
+                user_id=state.madad_user_id,
+                channel=ctx.channel,
+                identifier=ctx.identity,
+                step=step,
+                touch_inbound=False,
+            )
+            return step
+        except Exception as exc:  # noqa: BLE001 — degrade in staging
+            ctx.logger.warning(
+                "update_onboarding_progress.failed",
+                step=step,
+                error=str(exc)[:200],
+                note="staging-tolerant: continuing (will retry on next progression)",
+            )
+            return None
 
     @staticmethod
     def _step(name: str, ctx: WorkflowContext, **fields: Any) -> dict[str, Any]:

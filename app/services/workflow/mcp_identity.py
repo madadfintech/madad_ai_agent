@@ -274,3 +274,45 @@ class McpMadadIdentityClient:
         await self._tools.call_tool(
             Tools.AUTH_LOGOUT, {"access_token": access_token}
         )
+
+    async def update_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+        step: int | None = None,
+        touch_inbound: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if user_id is not None:
+            payload["user_id"] = user_id
+        if channel is not None:
+            payload["channel"] = _channel_value(channel)
+        if identifier is not None:
+            payload["identifier"] = identifier
+        if step is not None:
+            payload["step"] = step
+        if touch_inbound:
+            payload["touch_inbound"] = True
+        return await self._tools.call_tool(
+            Tools.MCP_UPDATE_ONBOARDING_PROGRESS, payload
+        )
+
+    async def get_onboarding_progress(
+        self,
+        *,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if user_id is not None:
+            payload["user_id"] = user_id
+        if channel is not None:
+            payload["channel"] = _channel_value(channel)
+        if identifier is not None:
+            payload["identifier"] = identifier
+        return await self._tools.call_tool(
+            Tools.MCP_GET_ONBOARDING_PROGRESS, payload
+        )

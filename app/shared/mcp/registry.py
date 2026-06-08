@@ -57,6 +57,12 @@ class Tools:
     MCP_CREATE_CHANNEL_SESSION = "madad_mcp_create_channel_session"
     MCP_GET_WEBHOOK_EVENTS = "madad_mcp_get_webhook_events"
     MCP_EMIT_WEBHOOK = "madad_mcp_emit_webhook"
+    # Per Ishan (2026-06-07): WhatsApp lead onboarding-step tracking. Backend
+    # hard-gates the pre-qualified document checklist on step >= 3 — we MUST
+    # call ``update_onboarding_progress(step=3)`` after the audited financial
+    # report upload + account.created message. ``get`` is the resume read.
+    MCP_UPDATE_ONBOARDING_PROGRESS = "madad_mcp_update_onboarding_progress"
+    MCP_GET_ONBOARDING_PROGRESS = "madad_mcp_get_onboarding_progress"
 
     # -- KYC (28; ``madad_kyc_complete_stage`` deliberately omitted) ---------
     KYC_UPDATE_ELIGIBILITY = "madad_kyc_update_eligibility"

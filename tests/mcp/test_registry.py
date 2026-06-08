@@ -5,12 +5,12 @@ from __future__ import annotations
 from app.shared.mcp import Tools
 
 
-def test_registry_has_68_constants_grouped_by_module() -> None:
+def test_registry_has_70_constants_grouped_by_module() -> None:
     names = Tools.all()
-    # 13 + 6 + 3 + 28 + 4 + 5 + 9 = 68. The +1 vs the prior count came from
-    # `EXT_SEND_WHATSAPP_INTERACTIVE` (added 2026-06-07 by Ishan to support
-    # the PDF Step 5 "Pay QAR 6,000 →" CTA button).
-    assert len(names) == 68
+    # 13 + 6 + 5 + 28 + 4 + 5 + 9 = 70. +2 vs the prior count came from
+    # MCP_UPDATE_ONBOARDING_PROGRESS + MCP_GET_ONBOARDING_PROGRESS (added
+    # 2026-06-07 by Ishan to support WhatsApp lead step tracking).
+    assert len(names) == 70
 
     by_prefix: dict[str, int] = {}
     for value in names.values():
@@ -19,7 +19,7 @@ def test_registry_has_68_constants_grouped_by_module() -> None:
 
     assert by_prefix["auth"] == 13
     assert by_prefix["external"] == 6
-    assert by_prefix["mcp"] == 3
+    assert by_prefix["mcp"] == 5
     assert by_prefix["kyc"] == 28
     assert by_prefix["offers"] == 4
     assert by_prefix["payments"] == 5

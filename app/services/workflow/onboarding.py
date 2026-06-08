@@ -906,7 +906,25 @@ class OnboardingWorkflow(WorkflowDefinition):
 
     async def _campaign_send(self, state: OnboardingState, ctx: WorkflowContext) -> dict[str, Any]:
         locale = str(state.data.get("locale") or state.locale)
-        await self._send(ctx, state, "onboarding.campaign.intro", locale=locale)
+        # Step 0 reach-out. This is the FIRST outbound to the contact, so there
+        # is no open 24h window — Meta rejects free text. It MUST be the
+        # approved "initiate" WhatsApp template. Fall back to the CMS free-text
+        # intro only for non-WhatsApp channels (or if the template send fails),
+        # mirroring the CTA-button fallback pattern.
+        sent_as_template = False
+        if ctx.channel is Channel.WHATSAPP:
+            try:
+                sent_as_template = await self._msg.send_template(
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    template_name="initiate",
+                    template_key="onboarding.campaign.intro",
+                    language_code="en",
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back to free text
+                ctx.logger.warning("campaign_send.template_failed", error=str(exc)[:200])
+        if not sent_as_template:
+            await self._send(ctx, state, "onboarding.campaign.intro", locale=locale)
         return self._step("campaign_send", ctx, locale=locale)
 
     async def _campaign_await(self, state: OnboardingState, ctx: WorkflowContext) -> dict[str, Any]:

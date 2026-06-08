@@ -82,6 +82,33 @@ class McpCommunicationGateway(CommunicationGateway):
         self._tools = tool_caller
 
     async def send(self, message: Message) -> OutboundDispatchResult:
+        # Approved WhatsApp TEMPLATE (e.g. the "initiate" reach-out): the FIRST
+        # outbound to a contact (and any message outside Meta's 24h
+        # customer-service window) MUST be a pre-approved template, not free
+        # text. Selected when the outbound carries a ``whatsapp_template`` block
+        # in its metadata. Free-text would be silently rejected by Meta.
+        wat = (message.metadata or {}).get("whatsapp_template") if message.metadata else None
+        if message.channel is Channel.WHATSAPP and isinstance(wat, dict) and wat.get("name"):
+            tool = Tools.EXT_SEND_WHATSAPP_TEMPLATE
+            tpl_payload: dict[str, Any] = {
+                "to": message.identity,
+                "template_name": wat["name"],
+                "language_code": wat.get("language") or "en",
+            }
+            if wat.get("components"):
+                tpl_payload["components"] = wat["components"]
+            try:
+                response = await self._tools.call_tool(tool, tpl_payload)
+            except Exception as exc:  # noqa: BLE001 - normalize transport errors
+                raise GatewayError(
+                    f"MCP tool {tool!r} failed: {exc}", details={"tool": tool}
+                ) from exc
+            return OutboundDispatchResult(
+                accepted=bool(response.get("accepted", True)),
+                provider_message_id=response.get("provider_message_id"),
+                raw=response,
+            )
+
         # Interactive CTA-URL button (WhatsApp): a tappable "Pay QAR 6,000 →"
         # button instead of a raw link. Selected when the outbound message
         # carries a ``cta`` block in its metadata.

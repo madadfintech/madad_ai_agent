@@ -64,6 +64,27 @@ class Messenger(ABC):
 
         return False
 
+    async def send_template(
+        self,
+        *,
+        channel: Channel,
+        identity: str,
+        template_name: str,
+        template_key: str,
+        language_code: str = "en",
+        variables: dict[str, Any] | None = None,
+        components: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Send a pre-approved WhatsApp TEMPLATE by name (e.g. the "initiate"
+        reach-out). Required for the FIRST outbound to a contact and any
+        message outside Meta's 24h window, where free text is rejected.
+        ``template_key`` is the CMS key mirroring the template body (for the
+        comms record). Returns ``True`` if dispatched. Default declines; real
+        messengers override.
+        """
+
+        return False
+
 
 class RecordingMessenger(Messenger):
     """Records outbound sends (no rendering needed) for tests."""
@@ -113,8 +134,34 @@ class RecordingMessenger(Messenger):
         )
         return True
 
+    async def send_template(
+        self,
+        *,
+        channel: Channel,
+        identity: str,
+        template_name: str,
+        template_key: str,
+        language_code: str = "en",
+        variables: dict[str, Any] | None = None,
+        components: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        self.sent.append(
+            {
+                "channel": channel,
+                "identity": identity,
+                "template_key": template_key,
+                "variables": variables or {},
+                "whatsapp_template": {
+                    "name": template_name,
+                    "language": language_code,
+                    "components": components or [],
+                },
+            }
+        )
+        return True
+
     def templates(self) -> list[str]:
-        return [s["template_key"] for s in self.sent]
+        return [s["template_key"] for s in self.sent if "template_key" in s]
 
 
 # -- Models for identity / channel session responses --------------------------

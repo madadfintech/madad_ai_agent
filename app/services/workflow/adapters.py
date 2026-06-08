@@ -76,6 +76,38 @@ class CommunicationMessenger(Messenger):
         # backend interactive endpoint / MCP tool is not yet live).
         return getattr(message, "status", None) == MessageStatus.SENT
 
+    async def send_template(
+        self,
+        *,
+        channel: Channel,
+        identity: str,
+        template_name: str,
+        template_key: str,
+        language_code: str = "en",
+        variables: dict[str, Any] | None = None,
+        components: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        from app.services.communication.models import MessageStatus  # type: ignore[attr-defined]
+        from app.shared.i18n import Locale
+
+        message = await self._comms.send(
+            OutboundMessageRequest(
+                channel=channel,
+                identity=identity,
+                template_key=template_key,
+                variables=variables or {},
+                locale=Locale(language_code if len(language_code) == 2 else "en"),
+                metadata={
+                    "whatsapp_template": {
+                        "name": template_name,
+                        "language": language_code,
+                        **({"components": components} if components else {}),
+                    }
+                },
+            )
+        )
+        return getattr(message, "status", None) == MessageStatus.SENT
+
 
 class NudgeReminders(Reminders):
     """Schedules/suppresses reminder sequences through the Nudge service."""

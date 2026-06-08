@@ -202,6 +202,16 @@ _TEMPLATE_BODIES = {
         "QAR 6,000 onboarding and assessment fee payment using the link shared above.\n\n"
         "Once payment is received, your application will be forwarded immediately."
     ),
+    # PDF Step 6 — fires from _payment_await on paid=True. Bank list comes from
+    # BusinessDetails.banksToSend (admin sets this when forwarding to lenders).
+    "onboarding.payment.confirmed": (
+        "🎉 Thank you — payment received!\n\n"
+        "Your application has been forwarded to our banking partners in Qatar: "
+        "{{ banks }}.\n\n"
+        "We will update you as soon as financing offers are received — typically "
+        "within 3–5 business days. 📲\n\n"
+        "Track your status at madadfintech.com (Ref: {{ ref }})"
+    ),
     "onboarding.not_qualified": (
         "Unfortunately your application wasn't accepted by our lender "
         "partners this time. Please reach out to our team."
@@ -254,9 +264,15 @@ _TEMPLATE_BODIES = {
         "finalise your offer — this is where you'll also manage your invoices "
         "going forward."
     ),
+    # PDF Step 9 — credit line activated, surfaces the accepted offer details
+    # (bank, limit, rate, tenure) inline so the SME has the key numbers in
+    # hand without opening the platform.
     "onboarding.activated": (
-        "Your credit line is now active! You can start submitting invoices "
-        "for financing."
+        "🎊 Your financing line is ACTIVE!\n\n"
+        "🏦 {{ lender }} · 💰 {{ limit }} · 📈 {{ rate }} · ⏱ {{ tenure }}\n\n"
+        "You can now submit invoices for financing right here — send a single "
+        "PDF or multiple invoices at once. 📄\n\n"
+        "Track at madadfintech.com (Ref: {{ ref }})"
     ),
 }
 

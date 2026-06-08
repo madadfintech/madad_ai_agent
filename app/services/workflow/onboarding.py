@@ -125,6 +125,7 @@ TEMPLATE_KEYS = [
     "onboarding.upload.required",
     "onboarding.status.pending",
     "onboarding.payment.awaiting",
+    "onboarding.payment.confirmed",
     "onboarding.not_qualified",
     "onboarding.payment.request",
     "onboarding.payment.request.button",
@@ -544,6 +545,21 @@ def _format_documents(documents: list[str]) -> str:
         return "required documents"
     labels = [DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title()) for doc in documents]
     return "\n".join(f"{idx}. {label}" for idx, label in enumerate(labels, start=1))
+
+
+def _format_banks_list(banks: list[str]) -> str:
+    """Render the assigned-banks list as natural prose ('A and B', 'A, B and
+    C') for the Step 6 payment-confirmed message. Empty list → 'our banking
+    partners' so the sentence still reads correctly."""
+
+    cleaned = [b for b in banks if b]
+    if not cleaned:
+        return "our banking partners"
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
 
 
 def _format_offer_cards(offers: list[dict[str, Any]]) -> str:
@@ -2269,7 +2285,69 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             # Step 7 — payment received, application forwarded to banks.
             await self._update_progress(state, ctx, step=7)
+            # A8a: PDF Step 6 — "Thank you — payment received! Forwarded to
+            # <banks>". Read the assigned banks from BusinessDetails.banksToSend
+            # (per Ishan 2026-06-07: populates when admin sets QUALIFIED /
+            # forwards). Fail-safe to the empty list so the message still goes
+            # out — minus the bank-list line.
+            banks = await self._fetch_banks_to_send(state, ctx)
+            await self._send(
+                ctx,
+                state,
+                "onboarding.payment.confirmed",
+                {
+                    "banks":     _format_banks_list(banks),
+                    "ref":       state.application_ref or "",
+                    "bank_count": len(banks),
+                },
+            )
         return self._step("payment_await", ctx, paid=paid)
+
+    async def _fetch_banks_to_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> list[str]:
+        """Read \`BusinessDetails.banksToSend\` for the current SME — the list of
+        banks the admin marked as targets when forwarding the application.
+        Tolerates camelCase / snake_case / list-or-string shapes."""
+        if not state.access_token:
+            return []
+        try:
+            # MonetizationPaymentClient also wraps madad_kyc_get_business_details
+            # (it needs business_details_id for payment writes); reusing that
+            # avoids adding a parallel method on KycClient.
+            result = await self._pay.get_business_details(access_token=state.access_token)
+        except Exception as exc:  # noqa: BLE001 — degrade in staging
+            ctx.logger.warning(
+                "business_details.banks_fetch_failed",
+                error=str(exc)[:200],
+                note="continuing without bank list",
+            )
+            return []
+        if not isinstance(result, dict):
+            return []
+        # The cluster adapter unwraps to ``business_details_id`` flat dict;
+        # main also stashes the raw camelCase response so look both places.
+        candidates: list[Any] = []
+        raw = result.get("banksToSend") or result.get("banks_to_send")
+        if raw is not None:
+            candidates.append(raw)
+        for key in ("businessDetails", "business_details"):
+            nested = result.get(key)
+            if isinstance(nested, dict):
+                inner = nested.get("banksToSend") or nested.get("banks_to_send")
+                if inner is not None:
+                    candidates.append(inner)
+        banks: list[str] = []
+        for value in candidates:
+            if isinstance(value, list):
+                banks.extend(str(b) for b in value if b)
+                break
+            if isinstance(value, str) and value.strip():
+                # The backend JSONB column might come back as a comma-separated
+                # string in some edge cases — split it.
+                banks.extend([s.strip() for s in value.split(",") if s.strip()])
+                break
+        return banks
 
     # -- Step 8: lender + offers + terminals ----------------------------------
 
@@ -2412,7 +2490,72 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _activated(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        await self._send(ctx, state, "onboarding.activated")
+        # A8b: PDF Step 9 — render the accepted offer's lender / limit / rate /
+        # tenure on the activation message. Prefer state.selected_offer if set
+        # (offer-handoff flow); otherwise look at state.offers (offers_fetch
+        # may have populated it from auth_me); otherwise call auth_me directly
+        # for the latest offer set.
+        offer = state.selected_offer or {}
+        offers = list(state.offers)
+        if not offer and not offers and state.access_token:
+            try:
+                info = await self._identity.me(access_token=state.access_token)
+                if isinstance(info, dict):
+                    raw = info.get("offers")
+                    if isinstance(raw, list):
+                        offers = raw
+            except Exception as exc:  # noqa: BLE001 — degrade in staging
+                ctx.logger.warning(
+                    "activated.offers_fetch_failed",
+                    error=str(exc)[:200],
+                    note="continuing with generic activation message",
+                )
+        if not offer and offers:
+            # Look for an explicitly-accepted offer; fall back to the first.
+            for cand in offers:
+                if isinstance(cand, dict):
+                    status = str(
+                        cand.get("status") or cand.get("offerStatus") or ""
+                    ).upper()
+                    if "ACCEPT" in status:
+                        offer = cand
+                        break
+            if not offer:
+                first = offers[0] if offers else {}
+                offer = first if isinstance(first, dict) else {}
+
+        def _g(key_camel: str, key_snake: str) -> Any:
+            value = offer.get(key_camel)
+            if value is None:
+                value = offer.get(key_snake)
+            return value
+
+        lender = _g("lender", "lender") or "your bank"
+        try:
+            limit = f"QAR {int(_g('creditLimit', 'credit_limit') or 0):,}"
+        except (TypeError, ValueError):
+            limit = "QAR —"
+        try:
+            rate = f"{float(_g('interestRate', 'interest_rate') or 0):g}%"
+        except (TypeError, ValueError):
+            rate = "—"
+        try:
+            tenure = f"{int(_g('tenureDays', 'tenure_days') or 0)} days"
+        except (TypeError, ValueError):
+            tenure = "—"
+
+        await self._send(
+            ctx,
+            state,
+            "onboarding.activated",
+            {
+                "lender": lender,
+                "limit": limit,
+                "rate": rate,
+                "tenure": tenure,
+                "ref": state.application_ref or "",
+            },
+        )
         return self._step("activated", ctx, outcome="completed")
 
     # -- routers --------------------------------------------------------------

@@ -71,6 +71,11 @@ _TEMPLATE_BODIES = {
         "assess eligibility and use the document for financing purposes. That's all.\n\n"
         "You can verify us at madadfintech.com or call 72773652."
     ),
+    "onboarding.help.contextual": (
+        "{{ answer }}\n\n"
+        "{{ next_step }}\n\n"
+        "For any query call 72773652."
+    ),
     "onboarding.declined": (
         "No problem at all! If you ever need working capital support in the future, "
         "we're here. Reach us at madadfintech.com or call 72773652. Have a great day! 👋"
@@ -95,9 +100,8 @@ _TEMPLATE_BODIES = {
         "We need your Commercial Registration (CR) to verify this.\n\n"
         "Before you share, please note:\n"
         "✅ We are a regulated entity under Qatar Central Bank\n"
-        "🔗 Privacy Policy\n"
-        "🔒 Terms & Conditions\n"
-        "📊 Data & Credit Bureau Consent\n\n"
+        "🔗 Privacy Policy: https://www.madadfintech.com/en/privacy-policy\n"
+        "🔒 Terms & Conditions: https://www.madadfintech.com/en/terms-and-conditions\n\n"
         "By sharing your CR you agree to the above. Please go ahead and share "
         "your CR document as a PDF or photo in this chat.\n\n"
         "Any questions? Reply here or call us on 72773652."
@@ -123,32 +127,58 @@ _TEMPLATE_BODIES = {
         "Please share your last Audited Financial Statement.\n\n"
         "For any query call us on 72773652."
     ),
-    "onboarding.financials.acknowledged": (
-        "Perfect! 🙌\n\n"
-        "You will receive your pre-qualification result within 24 hours.\n\n"
-        "Meanwhile, your account has been created on Madad with reference "
-        "number {{ application_ref }}. You can log in at madadfintech.com "
-        "and track your status anytime."
-    ),
     "onboarding.buyers.request": (
         "Please share your main buyer's details (name, country, contact)."
     ),
     "onboarding.shareholders.request": (
         "Please share your shareholders' details (name, percentage)."
     ),
+    "onboarding.account.created": (
+        "Perfect! 🙌\n\n"
+        "You will receive your pre-qualification result within 24 hours.\n\n"
+        "Meanwhile, your account has been created on Madad with reference number "
+        "#{{ ref }}. You can login at madadfintech.com and track your status anytime."
+    ),
     "onboarding.documents.checklist": (
         "🎉 Congratulations! Your business is pre-qualified for financing.\n\n"
-        "You can have cash in your account within 5 working days "
-        "of completing your application!\n\n"
-        "We now need the following documents to complete your application:\n"
-        "{{ documents }}\n\n"
-        "📤 Share the documents here as individual PDFs/photos or as a ZIP file."
+        "You can have cash in your account within 5 working days of completing "
+        "your application!\n\n"
+        "We now need the following documents to complete your application:\n\n"
+        "📁 Business Documents\n"
+        "1. National Address Certificate\n"
+        "2. Article of Association\n"
+        "3. Establishment Card\n\n"
+        "🏦 Financial Documents\n"
+        "✅ Audited Report 2025 — already received\n"
+        "4. Audited Report 2023\n"
+        "5. Audited Report 2022\n"
+        "6. Qatar Credit Bureau Report\n"
+        "7. Payable Ageing Schedule\n"
+        "8. Receivable Ageing Schedule\n"
+        "9. Interim Financial Statement\n"
+        "10. Bank Statement (last 6 months)\n\n"
+        "👤 Shareholder Documents (per shareholder from CR)\n"
+        "11. QID   12. Passport   13. Proof of Address\n\n"
+        "📤 Share the documents here or login at madadfintech.com to complete "
+        "your application.\n\n"
+        "Please share your documents to move forward!"
     ),
     "onboarding.documents.missing": (
-        "We've processed what you sent. ✅\n\n"
-        "⚠️ Still needed:\n"
+        "✅ Got it — {{ received }} of {{ total }} documents received! 🙌\n\n"
+        "⏳ Still needed:\n"
         "{{ documents }}\n\n"
-        "Please send the missing items and I'll update the checklist."
+        "No rush — send them one at a time or all together."
+    ),
+    # Acknowledgement when the SME sends everything in one ZIP — header + the
+    # per-document "Received & Validated" checklist built by the workflow.
+    "onboarding.documents.zip_received": (
+        "📦 ZIP received! Extracting your documents...\n\n"
+        "{{ results }}"
+    ),
+    # Acknowledgement when one (or a few) loose files are sent — just the
+    # per-document "Received & Validated" lines.
+    "onboarding.documents.single_received": (
+        "{{ results }}"
     ),
     "onboarding.documents.complete": (
         "🎊 Great — all documents received!\n\n"
@@ -158,8 +188,9 @@ _TEMPLATE_BODIES = {
         "For any query call 72773652 or visit madadfintech.com"
     ),
     "onboarding.upload.required": (
-        "Please attach {{ document }} to continue. Text alone is not enough for this step.\n\n"
-        "For any query call 72773652."
+        "Whenever you're ready, please share {{ document }} as a PDF or photo here "
+        "and I'll take it from there. 🙂\n\n"
+        "Have a question? Just ask — happy to help. For any query call 72773652."
     ),
     "onboarding.status.pending": (
         "Hi! Your application is currently under review with Madad. 👍\n\n"
@@ -175,21 +206,33 @@ _TEMPLATE_BODIES = {
         "Unfortunately your application wasn't accepted by our lender "
         "partners this time. Please reach out to our team."
     ),
-    "onboarding.payment.request": (
+    # Body shown ABOVE the "Pay QAR … →" CTA button (no raw link — the button
+    # carries it). Used for the interactive WhatsApp send.
+    "onboarding.payment.request.button": (
         "Hello! 👋\n\n"
         "Your application has been reviewed by our team. Here is your result:\n\n"
-        "📊 Madad Score\n"
-        "{{ madad_score }} / 100 · {{ score_band }}\n\n"
+        "📊 Madad Score: {{ score }}/100 · Strong\n\n"
         "Based on this score, we believe you have high chances of getting approval "
         "from our banking partners. 💪\n\n"
         "Your application is ready to be forwarded.\n"
-        "To submit your application to the banks, a one-time onboarding and "
-        "assessment fee of QAR {{ amount }} is required.\n\n"
+        "To submit your application to the banks, a one-time onboarding and assessment "
+        "fee of QAR {{ amount }} is required.\n\n"
+        "Once payment is received, your application will be forwarded immediately."
+    ),
+    # Plain-text fallback (when interactive buttons are unavailable) — keeps the
+    # tappable link inline.
+    "onboarding.payment.request": (
+        "Hello! 👋\n\n"
+        "Your application has been reviewed by our team. Here is your result:\n\n"
+        "📊 Madad Score: {{ score }}/100 · Strong\n\n"
+        "Based on this score, we believe you have high chances of getting approval "
+        "from our banking partners. 💪\n\n"
+        "Your application is ready to be forwarded.\n"
+        "To submit your application to the banks, a one-time onboarding and assessment "
+        "fee of QAR {{ amount }} is required.\n\n"
         "Pay QAR {{ amount }} →\n"
         "{{ payment_link }}\n\n"
-        "To know more about our pricing, visit madadfintech.com/pricing.\n\n"
-        "Once payment is received, your application will be forwarded immediately.\n\n"
-        "Reference: {{ provider_ref }}"
+        "Once payment is received, your application will be forwarded immediately."
     ),
     "onboarding.offers.preview": (
         "🎉 Exciting news — your financing offers are ready!\n\n"

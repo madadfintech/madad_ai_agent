@@ -8,6 +8,7 @@ from app.shared.workflow import Channel, RunStatus
 
 WA = Channel.WHATSAPP
 IDENTITY = "+97455500003"
+DOC = "ZHVtbXk="
 
 
 async def test_inbound_starts_then_resumes_same_run(harness):
@@ -40,12 +41,16 @@ async def test_resume_external_status_update(harness):
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     await dispatcher.inbound(WA, IDENTITY, text="YES")
     await dispatcher.inbound(WA, IDENTITY, text="Aisha Karim")
-    await dispatcher.inbound(WA, IDENTITY, attachments=[{"filename": "CR.pdf"}])
+    await dispatcher.inbound(
+        WA, IDENTITY, attachments=[{"filename": "CR.pdf", "content_base64": DOC}]
+    )
     # Eligibility form payload (no attachments / text — pure dict).
     await dispatcher.resume_external(
         WA, IDENTITY, {"annual_revenue_qar": 1000}
     )
-    await dispatcher.inbound(WA, IDENTITY, attachments=[{"filename": "Audited.pdf"}])
+    await dispatcher.inbound(
+        WA, IDENTITY, attachments=[{"filename": "Audited.pdf", "content_base64": DOC}]
+    )
     await dispatcher.resume_external(WA, IDENTITY, {"name": "ACME"})
     await dispatcher.resume_external(
         WA, IDENTITY, {"shareholders": [{"name": "A", "phoneNumber": "+97455500001"}]}
@@ -53,7 +58,10 @@ async def test_resume_external_status_update(harness):
     await dispatcher.inbound(
         WA,
         IDENTITY,
-        attachments=[{"filename": "Trade_License.pdf"}, {"filename": "Tax_Card.pdf"}],
+        attachments=[
+            {"filename": "Trade_License.pdf", "content_base64": DOC},
+            {"filename": "Tax_Card.pdf", "content_base64": DOC},
+        ],
     )
 
     # Webhook-driven status update advances the journey out of journey_wait.

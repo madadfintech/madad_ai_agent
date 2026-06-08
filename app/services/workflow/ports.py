@@ -34,6 +34,26 @@ class Messenger(ABC):
         locale: str = "en",
     ) -> None: ...
 
+    async def send_cta_url(
+        self,
+        *,
+        channel: Channel,
+        identity: str,
+        template_key: str,
+        button_text: str,
+        button_url: str,
+        variables: dict[str, Any] | None = None,
+        locale: str = "en",
+    ) -> bool:
+        """Send an interactive CTA-URL button (body rendered from
+        ``template_key``). Returns ``True`` if it was dispatched as a button.
+
+        Default implementation declines (``False``) so callers fall back to a
+        plain-text send; real messengers override this.
+        """
+
+        return False
+
 
 class RecordingMessenger(Messenger):
     """Records outbound sends (no rendering needed) for tests."""
@@ -59,6 +79,29 @@ class RecordingMessenger(Messenger):
                 "locale": locale,
             }
         )
+
+    async def send_cta_url(
+        self,
+        *,
+        channel: Channel,
+        identity: str,
+        template_key: str,
+        button_text: str,
+        button_url: str,
+        variables: dict[str, Any] | None = None,
+        locale: str = "en",
+    ) -> bool:
+        self.sent.append(
+            {
+                "channel": channel,
+                "identity": identity,
+                "template_key": template_key,
+                "variables": variables or {},
+                "locale": locale,
+                "cta": {"button_text": button_text, "button_url": button_url},
+            }
+        )
+        return True
 
     def templates(self) -> list[str]:
         return [s["template_key"] for s in self.sent]

@@ -82,12 +82,41 @@ class McpCommunicationGateway(CommunicationGateway):
         self._tools = tool_caller
 
     async def send(self, message: Message) -> OutboundDispatchResult:
-        tool = _TOOL_BY_CHANNEL.get(message.channel)
-        if tool is None:
+        # Interactive CTA-URL button (WhatsApp): a tappable "Pay QAR 6,000 →"
+        # button instead of a raw link. Selected when the outbound message
+        # carries a ``cta`` block in its metadata.
+        cta = (message.metadata or {}).get("cta") if message.metadata else None
+        if message.channel is Channel.WHATSAPP and isinstance(cta, dict) and cta.get("button_url"):
+            tool = Tools.EXT_SEND_WHATSAPP_INTERACTIVE
+            payload: dict[str, Any] = {
+                "to": message.identity,
+                "body": message.text or "",
+                "buttonText": str(cta.get("button_text") or "Open")[:20],
+                "buttonUrl": cta.get("button_url"),
+            }
+            if cta.get("header"):
+                payload["header"] = cta["header"]
+            if cta.get("footer"):
+                payload["footer"] = cta["footer"]
+            try:
+                response = await self._tools.call_tool(tool, payload)
+            except Exception as exc:  # noqa: BLE001 - normalize transport errors
+                raise GatewayError(
+                    f"MCP tool {tool!r} failed: {exc}", details={"tool": tool}
+                ) from exc
+            return OutboundDispatchResult(
+                accepted=bool(response.get("accepted", True)),
+                provider_message_id=response.get("provider_message_id"),
+                raw=response,
+            )
+
+        mapped = _TOOL_BY_CHANNEL.get(message.channel)
+        if mapped is None:
             raise GatewayError(
                 f"No MCP tool mapped for channel {message.channel}",
                 details={"channel": str(message.channel)},
             )
+        tool = mapped
         payload = _build_outbound_payload(message.channel, message)
         try:
             response = await self._tools.call_tool(tool, payload)

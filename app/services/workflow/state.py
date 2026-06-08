@@ -12,7 +12,7 @@ from app.shared.workflow.state import WorkflowState
 
 from .ports import ChannelSession, ContactCheckResult, SessionType
 
-StatusSource = Literal["webhook", "poll"]
+StatusSource = Literal["webhook", "poll", "chat"]
 
 
 class JourneyStatus(StrEnum):
@@ -82,12 +82,6 @@ class OnboardingState(WorkflowState):
     journey_status: JourneyStatus | None = None
     last_polled_at: datetime | None = None
     last_status_source: StatusSource | None = None
-    # Madad Score (0-100) — populated from the `prequalification.completed`
-    # webhook payload (per Ishan 2026-06-07, the only auto-emitted event today
-    # carries `{ madadScore }`). Surfaced to the SME on the Step 5 payment
-    # gate message (PDF: "Madad Score 78 / 100 · Strong").
-    madad_score: int | None = None
-
     # Step 1: new-lead onboarding-details capture (precedes complete_onboarding).
     # ALL 9 fields the cluster's AUTH_COMPLETE_ONBOARDING tool requires for a
     # fresh signup; email/phone are normally derived from the channel identity
@@ -123,6 +117,13 @@ class OnboardingState(WorkflowState):
     documents_received: bool = False
     buyers: list[dict[str, Any]] = []
     shareholders: list[dict[str, Any]] = []
+
+    # Postman-triggered gates (demo): the pre-qualification result (after the
+    # audited report) and the payment step (after the coffee message) are each
+    # released by an external trigger rather than auto-advancing.
+    prequalified: bool = False
+    payment_ready: bool = False
+    madad_score: int | None = None
 
     # Step 7–8: payment + offers.
     paid: bool = False

@@ -23,7 +23,9 @@ materialising :class:`ChannelSession`, :class:`ContactCheckResult` and
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from datetime import datetime
 from typing import Any
 
@@ -73,17 +75,37 @@ def _is_backend_checkable_phone(phone: str) -> bool:
     return (digits.startswith("974") and len(digits) == 11) or len(digits) == 8
 
 
-def _non_qatar_whatsapp_auth_email() -> str | None:
-    """Optional staging bridge from non-Qatar WhatsApp test numbers to a real
-    Madad email identity.
+def _placeholder_email_for_phone(phone: str) -> str:
+    """Deterministic, UNIQUE placeholder email for a WhatsApp identity that the
+    backend cannot validate as a Qatar phone number.
 
-    The conversation still uses WhatsApp for outbound messages, but auth/session
-    resolution can use an existing UAT MSME email. This is intentionally env
-    gated so production Qatar WhatsApp identities keep the normal phone path.
+    Every distinct phone gets its OWN fresh Madad application: the same phone
+    always maps to the same email (so repeat messages resume the same user),
+    and two different phones never collide. This replaces the previous single
+    shared test account (``tech.external1@…`` via
+    ``WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL``) that collapsed every non-Qatar
+    WhatsApp lead into one user — obviously wrong once many users onboard.
+
+    The placeholder domain is configurable; the local part encodes the phone so
+    it is unique and reproducible.
     """
 
-    value = os.getenv("WORKFLOW__NON_QATAR_WHATSAPP_AUTH_EMAIL", "").strip().lower()
-    return value or None
+    digits = re.sub(r"\D", "", phone or "") or "unknown"
+    # Parent domain (overridable). Each phone gets its OWN unique SUBDOMAIN under
+    # it. The backend guards signup/login per email DOMAIN — it blocks when any
+    # user already has ``email endsWith '@' + domain`` (auth.service.ts) — so a
+    # SHARED placeholder domain made every WhatsApp lead after the first fail with
+    # "domain already registered". The subdomain here is a deterministic hash of
+    # the phone: same phone → same email (so check_contact / open_session resume
+    # the SAME user and repeat messages don't fork a new account), while two
+    # different phones get different, collision-free, random-looking domains.
+    # Valid e-mail syntax, and NO backend change required.
+    base = (
+        os.getenv("WORKFLOW__WHATSAPP_PLACEHOLDER_EMAIL_DOMAIN", "").strip()
+        or "madadfintech.com"
+    )
+    token = hashlib.sha256(digits.encode("utf-8")).hexdigest()[:20]
+    return f"wa{digits}@wa{token}.{base}"
 
 
 class McpMadadIdentityClient:
@@ -103,7 +125,7 @@ class McpMadadIdentityClient:
         create_onboarding_token: bool = True,
     ) -> ChannelSession:
         auth_email = (
-            _non_qatar_whatsapp_auth_email()
+            _placeholder_email_for_phone(phone or identifier)
             if channel is Channel.WHATSAPP and not _is_backend_checkable_phone(identifier)
             else None
         )
@@ -148,20 +170,11 @@ class McpMadadIdentityClient:
         self, *, phone: str | None = None, email: str | None = None
     ) -> ContactCheckResult:
         if phone is not None and email is None and not _is_backend_checkable_phone(phone):
-            auth_email = _non_qatar_whatsapp_auth_email()
-            if auth_email:
-                email = auth_email
-                phone = None
-            else:
-                return ContactCheckResult(
-                    exists=False,
-                    domain_exists=False,
-                    raw={
-                        "skipped": True,
-                        "reason": "non_qatar_whatsapp_phone",
-                        "phone": phone,
-                    },
-                )
+            # Non-Qatar WhatsApp phone: check the per-phone placeholder identity
+            # so a returning lead resolves to its own existing user (and a first
+            # contact reads as new) — instead of a shared test account.
+            email = _placeholder_email_for_phone(phone)
+            phone = None
 
         payload: dict[str, Any] = {}
         if phone is not None:

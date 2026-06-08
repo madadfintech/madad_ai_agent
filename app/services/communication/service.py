@@ -215,6 +215,7 @@ class CommunicationService:
             in_reply_to=request.in_reply_to,
             session_id=conversation.session_id,
             correlation_id=request.correlation_id,
+            metadata=request.metadata or {},
         )
         await self._messages.create(message)
         await self._touch_conversation(conversation)

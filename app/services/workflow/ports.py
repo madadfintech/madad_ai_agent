@@ -397,6 +397,23 @@ class KycClient(Protocol):
         mime_type: str | None = None,
     ) -> dict[str, Any]: ...
 
+    async def classify_and_upload_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def classify_and_upload_zip_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+    ) -> dict[str, Any]: ...
+
     async def add_buyer(
         self, *, access_token: str, data: dict[str, Any]
     ) -> dict[str, Any]: ...
@@ -510,6 +527,65 @@ class InMemoryKycClient:
             "mime_type": mime_type,
         }
         return {"document_id": new_id("doc"), "document_type": document_type}
+
+    async def classify_and_upload_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        self._record(
+            "classify_and_upload_document_base64",
+            access_token=access_token,
+            filename=filename,
+            mime_type=mime_type,
+        )
+        key = filename or new_id("doc")
+        self.uploaded_documents[key] = {
+            "filename": filename,
+            "content_base64": content_base64,
+            "mime_type": mime_type,
+        }
+        return {
+            "classified": True,
+            "document_type": "additional_document",
+            "classification_label": filename or "Document",
+            "document_id": new_id("doc"),
+        }
+
+    async def classify_and_upload_zip_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+    ) -> dict[str, Any]:
+        self._record(
+            "classify_and_upload_zip_base64",
+            access_token=access_token,
+            filename=filename,
+        )
+        key = filename or new_id("zip")
+        self.uploaded_documents[key] = {
+            "filename": filename,
+            "content_base64": content_base64,
+        }
+        return {
+            "success": True,
+            "uploaded_count": 1,
+            "error_count": 0,
+            "documents": [
+                {
+                    "file_name": filename,
+                    "classified": True,
+                    "document_type": "additional_document",
+                    "classification_label": filename or "Document",
+                }
+            ],
+            "errors": [],
+        }
 
     async def add_buyer(
         self, *, access_token: str, data: dict[str, Any]

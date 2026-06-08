@@ -184,6 +184,47 @@ class McpKycClient:
             },
         )
 
+    async def classify_and_upload_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        # Portal-parity upload: the cluster runs the SAME classifier the MSME
+        # complete-onboarding page uses, routes the doc to the correct slot, and
+        # uploads it so backend extraction runs identically — no caller-supplied
+        # document_type. Args are top-level (not nested in metadata).
+        return await self._tools.call_tool(
+            Tools.KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64,
+            {
+                "file_name": filename,
+                "base64": content_base64,
+                "access_token": access_token,
+                "mime_type": mime_type or _infer_mime_type(filename),
+            },
+        )
+
+    async def classify_and_upload_zip_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+    ) -> dict[str, Any]:
+        # Expand + classify + upload every member of a ZIP through the portal
+        # pipeline; returns a per-file checklist (file_name / document_type /
+        # classified) for the WhatsApp acknowledgement.
+        return await self._tools.call_tool(
+            Tools.KYC_CLASSIFY_AND_UPLOAD_ZIP_BASE64,
+            {
+                "file_name": filename,
+                "base64": content_base64,
+                "access_token": access_token,
+            },
+        )
+
     async def add_buyer(
         self, *, access_token: str, data: dict[str, Any]
     ) -> dict[str, Any]:

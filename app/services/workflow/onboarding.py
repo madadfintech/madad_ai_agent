@@ -1620,64 +1620,81 @@ class OnboardingWorkflow(WorkflowDefinition):
                 missing_documents=list(state.missing_documents),
                 documents_received=False,
             )
-        # A single ZIP ("send everything in one file") expands into one synthetic
-        # attachment per member document — each then runs the same classify +
-        # upload pipeline as an individually-sent file (matching the msme-portal
-        # complete-onboarding behaviour, where every doc lands on the backend KYC
-        # endpoint that drives classification + extraction).
-        attachments, saw_zip = _expand_zip_attachments(attachments)
-        # Track remaining required docs locally. WhatsApp media almost always
-        # arrives with a generic filename (IMG-xxxx.jpg), so _infer_doc_type
-        # returns None and the upload used to be skipped entirely — the checklist
-        # never cleared and the flow looped forever on "still needed". FAILSAFE:
-        # assign each uploaded file to the next still-missing required doc so the
-        # user's uploads actually satisfy the checklist and advance to completion.
-        # Mint a live backend token from the verified WhatsApp identity. The run
-        # may be parked with no/expired token in state — relying on the cached
-        # state.access_token here was silently dropping EVERY upload (no token →
-        # block skipped → docs marked "received" but never sent). NO document a
-        # user uploads may be lost, so we always obtain a fresh token first.
+        # Upload EXACTLY like the MSME portal /complete-onboarding drag-and-drop:
+        # whether the user dumps a ZIP ("everything in one file") or sends files
+        # one by one, each document is run through the SAME classifier the portal
+        # uses, routed to the correct slot (business / financial / shareholder),
+        # uploaded, and extracted by the backend identically. We do NOT guess the
+        # type here — the classifier decides; anything unrecognised is stored as
+        # an additional document so a user's file is never lost.
+        #
+        # First mint a live backend token from the verified WhatsApp identity. A
+        # parked run can resume with no/expired token in state — relying on the
+        # cached state.access_token here was silently dropping EVERY upload (no
+        # token → block skipped → docs marked "received" but never sent).
         token, refresh, expires = await self._live_token(state, ctx)
+        saw_zip = any(_is_zip_attachment(att) for att in attachments)
         pending: list[str] = list(state.missing_documents)
-        validated: list[str] = []  # uploaded + accepted by backend → ✅
-        unprocessed: list[str] = []  # backend rejected / no token → ⏳ honest
+        validated: list[str] = []  # confidently classified + uploaded → ✅
+        unprocessed: list[str] = []  # uploaded but unclassified / failed → ⏳ honest
+        uploaded_count = 0
         for att in attachments:
-            doc_type = att.get("document_type") or _infer_doc_type(att.get("filename") or "")
-            if not doc_type and pending:
-                doc_type = pending[0]
-            if not doc_type:
+            content = att.get("content_base64") or ""
+            filename = att.get("filename") or ""
+            if not content or not token:
+                if filename:
+                    unprocessed.append(filename)
                 continue
-            # Only acknowledge "Received & Validated" if the backend actually
-            # accepted the upload — never claim success on a swallowed error.
-            uploaded_ok = False
-            if token:
-                try:
-                    await self._kyc.upload_document_base64(
+            try:
+                if _is_zip_attachment(att):
+                    # The ZIP tool expands + classifies + uploads every member
+                    # through the portal pipeline and returns a per-file checklist.
+                    result = await self._kyc.classify_and_upload_zip_base64(
                         access_token=token,
-                        content_base64=att.get("content_base64") or "",
-                        filename=att.get("filename") or "",
-                        document_type=doc_type,
+                        content_base64=content,
+                        filename=filename,
+                    )
+                    for doc in (result or {}).get("documents", []):
+                        label = (
+                            doc.get("classification_label")
+                            or doc.get("document_type")
+                            or doc.get("file_name")
+                            or "Document"
+                        )
+                        uploaded_count += 1
+                        (validated if doc.get("classified") else unprocessed).append(label)
+                    for err in (result or {}).get("errors", []):
+                        name = err.get("file_name") if isinstance(err, dict) else str(err)
+                        unprocessed.append(name or "Document")
+                else:
+                    result = await self._kyc.classify_and_upload_document_base64(
+                        access_token=token,
+                        content_base64=content,
+                        filename=filename,
                         mime_type=att.get("mime_type"),
                     )
-                    uploaded_ok = True
-                except Exception as exc:  # noqa: BLE001 — degrade in staging
-                    ctx.logger.warning(
-                        "document_upload.failed",
-                        document_type=doc_type,
-                        error=str(exc)[:200],
-                        note="staging-tolerant: continuing without this doc",
+                    label = (
+                        (result or {}).get("classification_label")
+                        or (result or {}).get("document_type")
+                        or filename
                     )
-            if uploaded_ok:
-                if doc_type in pending:
-                    pending.remove(doc_type)
-                if doc_type not in validated:
-                    validated.append(doc_type)
-            elif doc_type not in unprocessed and doc_type not in validated:
-                unprocessed.append(doc_type)
-        # Acknowledge exactly what landed: ✅ per accepted document, ⏳ per one we
-        # received but couldn't auto-validate (kept honest — no false ✅). A ZIP
-        # gets the "📦 Extracting…" header; loose files just get their lines. The
-        # lenient coffee message follows in documents_complete.
+                    uploaded_count += 1
+                    (validated if (result or {}).get("classified") else unprocessed).append(label)
+            except Exception as exc:  # noqa: BLE001 — never crash the run on an upload hiccup
+                ctx.logger.warning(
+                    "document_upload.failed", filename=filename, error=str(exc)[:200]
+                )
+                unprocessed.append(filename or "Document")
+        # Advance the local checklist positionally by however many landed. The
+        # classifier knows the true type backend-side; we keep the lightweight
+        # local counter the flow relies on to reach completion (we do NOT re-query
+        # the backend's requested-docs list, which kept returning just-uploaded
+        # docs as still-missing and caused the loop).
+        for _ in range(min(uploaded_count, len(pending))):
+            pending.pop(0)
+        # Acknowledge exactly what landed: ✅ per confidently-classified document,
+        # ⏳ per one received but not auto-classified (kept honest — no false ✅).
+        # A ZIP gets the "📦 Extracting…" header; loose files just get their lines.
         await self._acknowledge_uploads(
             ctx, state, validated, unprocessed, saw_zip=saw_zip
         )

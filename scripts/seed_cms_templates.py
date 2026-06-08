@@ -236,7 +236,8 @@ _TEMPLATE_BODIES = {
     ),
     "onboarding.offers.preview": (
         "🎉 Exciting news — your financing offers are ready!\n\n"
-        "You have {{ count }} financing offer(s) ready to review."
+        "{{ offer_cards }}\n\n"
+        "💬 Feel free to ask me anything about these offers right here!"
     ),
     "onboarding.offer.handoff": (
         "💬 Feel free to ask me anything about these offers right here!\n\n"

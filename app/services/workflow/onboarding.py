@@ -546,6 +546,60 @@ def _format_documents(documents: list[str]) -> str:
     return "\n".join(f"{idx}. {label}" for idx, label in enumerate(labels, start=1))
 
 
+def _format_offer_cards(offers: list[dict[str, Any]]) -> str:
+    """Render the offer set as PDF Step 8-style cards (one block per offer).
+
+    Per Ishan's confirmed schema (2026-06-07): each offer carries
+    ``lender, creditLimit, interestRate, tenureDays, processingFee,
+    expiryDate``. Fields are camelCase but snake_case copies are tolerated
+    so test fixtures with shorthand shapes don't crash.
+
+    Returns the empty string when there are no offers so the template
+    placeholder substitutes cleanly to nothing.
+    """
+
+    if not offers:
+        return ""
+
+    def _g(offer: dict[str, Any], *keys: str) -> Any:
+        for k in keys:
+            if k in offer and offer[k] is not None:
+                return offer[k]
+        return None
+
+    def _fmt_qar(value: Any) -> str:
+        try:
+            return f"QAR {int(value):,}"
+        except (TypeError, ValueError):
+            return f"QAR {value}" if value is not None else "QAR —"
+
+    def _fmt_pct(value: Any) -> str:
+        try:
+            return f"{float(value):g}% p.a."
+        except (TypeError, ValueError):
+            return f"{value} p.a." if value is not None else "—"
+
+    def _fmt_days(value: Any) -> str:
+        try:
+            return f"{int(value)} days"
+        except (TypeError, ValueError):
+            return f"{value}" if value is not None else "—"
+
+    lines: list[str] = []
+    for idx, offer in enumerate(offers, start=1):
+        lender = _g(offer, "lender", "bank_name", "bankName") or "Lender"
+        limit = _fmt_qar(_g(offer, "creditLimit", "credit_limit", "limit"))
+        rate = _fmt_pct(_g(offer, "interestRate", "interest_rate", "rate"))
+        tenure = _fmt_days(_g(offer, "tenureDays", "tenure_days", "tenure"))
+        fee_value = _g(offer, "processingFee", "processing_fee", "fee")
+        fee = _fmt_qar(fee_value) + " fee" if fee_value is not None else "no fee"
+        lines.append(
+            f"🏦 Offer {idx} — {lender}\n"
+            f"💰 {limit} · 📈 {rate} · ⏱ {tenure} · 💳 {fee}"
+        )
+    return "\n━━━━━━━━━━━━━\n".join(lines)
+
+
 def _next_step_hint(state: OnboardingState) -> str:
     step = state.history[-1].step if state.history else ""
     if step in {"campaign_send", "campaign_await"}:
@@ -2311,8 +2365,18 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _offer_view_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
+        # A6 (Ishan 2026-06-07): render PDF Step 8 structured offer cards —
+        # one block per offer with lender + credit limit + interest rate +
+        # tenure + processing fee. Falls back to a count-only line if the
+        # offer list is empty (auth_me hasn't surfaced offers yet).
         await self._send(
-            ctx, state, "onboarding.offers.preview", {"count": len(state.offers)}
+            ctx,
+            state,
+            "onboarding.offers.preview",
+            {
+                "count": len(state.offers),
+                "offer_cards": _format_offer_cards(state.offers),
+            },
         )
         return self._step("offer_view_send", ctx)
 

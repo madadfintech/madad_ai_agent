@@ -952,6 +952,10 @@ class RecordingReminders(Reminders):
     def __init__(self) -> None:
         self.scheduled: list[str] = []
         self.suppressed: list[str | None] = []
+        # Full call log: ``(reason, {channel, identity, target_ref, variables})``.
+        # Tests inspect ``variables`` to verify A9 (payment-link + missing-docs
+        # threading).
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def schedule(
         self,
@@ -963,6 +967,15 @@ class RecordingReminders(Reminders):
         variables: dict[str, Any] | None = None,
     ) -> None:
         self.scheduled.append(reason)
+        self.calls.append((
+            reason,
+            {
+                "channel": channel,
+                "identity": identity,
+                "target_ref": target_ref,
+                "variables": variables or {},
+            },
+        ))
 
     async def suppress(self, *, target_ref: str | None) -> None:
         self.suppressed.append(target_ref)

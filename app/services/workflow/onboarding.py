@@ -1712,11 +1712,17 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "total": total,
             },
         )
+        # A9: nudge.incomplete_docs.{1,2,3} bodies reference {{ documents }}
+        # so the missing-list shows up in each scheduled reminder. Reuse the
+        # already-formatted list rather than re-rendering at dispatch time.
         await self._reminders.schedule(
             "incomplete_docs",
             channel=_channel(ctx),
             identity=ctx.identity,
             target_ref=state.madad_user_id or ctx.session_id,
+            variables={
+                "documents": _format_documents(state.missing_documents),
+            },
         )
         return self._step("documents_upload_loop_send", ctx)
 
@@ -2227,11 +2233,20 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._send(ctx, state, "onboarding.payment.request", variables)
         # Step 6 — Madad score + payment gate sent to user.
         await self._update_progress(state, ctx, step=6)
+        # A9 (Ishan 2026-06-07): per the PDF Step 5 nudge spec, every payment-
+        # pending nudge re-sends the payment link. The nudge templates
+        # (nudge.payment_pending.{1,2,3}) substitute {{ amount }} and
+        # {{ payment_link }} at dispatch time; thread the live values
+        # through to the scheduler so each scheduled step renders correctly.
         await self._reminders.schedule(
             "payment_pending",
             channel=_channel(ctx),
             identity=ctx.identity,
             target_ref=state.madad_user_id or ctx.session_id,
+            variables={
+                "amount":       amount,
+                "payment_link": state.payment_link or "",
+            },
         )
         # ALSO fire the backend's notification trigger as a side-channel —
         # if it succeeds the SME gets a Madad-branded copy of the link too,

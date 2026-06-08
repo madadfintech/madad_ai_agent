@@ -1688,22 +1688,73 @@ class OnboardingWorkflow(WorkflowDefinition):
                 missing_documents=list(state.missing_documents),
                 documents_received=False,
             )
-        # A single ZIP ("send everything in one file") expands into one synthetic
-        # attachment per member document — each then runs the same classify +
-        # upload pipeline as an individually-sent file (matching the msme-portal
-        # complete-onboarding behaviour, where every doc lands on the backend KYC
-        # endpoint that drives classification + extraction).
-        attachments, saw_zip = _expand_zip_attachments(attachments)
-        # Track remaining required docs locally. WhatsApp media almost always
-        # arrives with a generic filename (IMG-xxxx.jpg), so _infer_doc_type
-        # returns None and the upload used to be skipped entirely — the checklist
-        # never cleared and the flow looped forever on "still needed". FAILSAFE:
-        # assign each uploaded file to the next still-missing required doc so the
-        # user's uploads actually satisfy the checklist and advance to completion.
+        # A7 (Ishan 2026-06-07): ZIP attachments now route through the
+        # backend's ``classify_and_upload_zip_base64`` tool. The backend
+        # unzips server-side, classifies every member, and returns the
+        # per-file checklist (file_name, resolved document_type,
+        # confidently_classified). This is one round-trip instead of N
+        # (one per member) and matches the msme-portal pipeline exactly.
+        # The previous local-unzipping path stays as a fallback for when
+        # the backend tool errors.
         pending: list[str] = list(state.missing_documents)
         validated: list[str] = []  # uploaded + accepted by backend → ✅
         unprocessed: list[str] = []  # backend rejected / no token → ⏳ honest
+        saw_zip = False
+
+        # Pass 1 — process ZIPs server-side. Anything that isn't a ZIP or
+        # whose server-side classify fails falls through to pass 2.
+        non_zip: list[dict[str, Any]] = []
         for att in attachments:
+            if not _is_zip_attachment(att):
+                non_zip.append(att)
+                continue
+            if not state.access_token:
+                non_zip.append(att)
+                continue
+            try:
+                zip_response = await self._kyc.classify_and_upload_zip_base64(
+                    access_token=state.access_token,
+                    content_base64=att.get("content_base64") or "",
+                    filename=att.get("filename") or "",
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back to local unzip
+                ctx.logger.warning(
+                    "classify_and_upload_zip.failed",
+                    error=str(exc)[:200],
+                    note="falling back to local unzip + per-file classify",
+                )
+                expanded, _ = _expand_zip_attachments([att])
+                non_zip.extend(expanded)
+                continue
+            saw_zip = True
+            # Per-file checklist shape per Ishan's docstring:
+            # ``[{file_name, document_type, confidently_classified}, ...]``.
+            # camelCase + snake_case + body-envelope all tolerated.
+            checklist: list[Any] = []
+            if isinstance(zip_response, dict):
+                body = zip_response.get("body")
+                inner = body if isinstance(body, dict) else zip_response
+                raw = inner.get("checklist") or inner.get("files") or []
+                if isinstance(raw, list):
+                    checklist = raw
+            for entry in checklist:
+                if not isinstance(entry, dict):
+                    continue
+                backend_type = (
+                    entry.get("document_type")
+                    or entry.get("documentType")
+                    or entry.get("resolved_document_type")
+                )
+                if not isinstance(backend_type, str) or not backend_type:
+                    continue
+                zip_doc_type = _workflow_doc_type(backend_type)
+                if zip_doc_type in pending:
+                    pending.remove(zip_doc_type)
+                if zip_doc_type not in validated:
+                    validated.append(zip_doc_type)
+
+        # Pass 2 — non-ZIP attachments (and any ZIP that fell back to local).
+        for att in non_zip:
             filename = att.get("filename") or ""
             # A5 (Ishan 2026-06-07): prefer the classify-and-upload tool
             # over our own filename-keyword inference + manual doc_type
@@ -1741,7 +1792,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             # classifier didn't return a usable type (rare — happens when
             # the backend stores as ADDITIONAL_DOCUMENT). This keeps the
             # missing-docs accounting honest without dropping the file.
-            doc_type = resolved_doc_type
+            doc_type: str | None = resolved_doc_type
             if not doc_type:
                 doc_type = att.get("document_type") or _infer_doc_type(filename)
             if not doc_type and pending:

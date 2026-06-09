@@ -490,6 +490,15 @@ def _parse_shareholder_text(text: str, fallback_phone: str | None) -> list[dict[
 # buffer; anything older is treated as a fresh batch and re-fires the ack.
 DOCS_PROCESSING_ACK_TTL_SECONDS = 30.0
 
+# Bug #15 (UAT 2026-06-09): same debounce shape but for the full
+# "📋 Application checklist" body. Per-file POSTs land as separate
+# inbounds; without the debounce the SME got the 15-line ✅/⚠️
+# checklist after EVERY file upload. 60s is longer than the processing
+# ack so the SME sees one full checklist per upload session — the
+# per-file brief receipt (✅ X — Received & Validated) still fires
+# every time so progress is visible.
+DOCS_CHECKLIST_TTL_SECONDS = 60.0
+
 
 def _parse_iso_or_none(value: str | None) -> datetime | None:
     if not value:
@@ -2082,12 +2091,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         # received but couldn't auto-validate (kept honest — no false ✅). A ZIP
         # gets the "📦 Extracting…" header; loose files just get their lines.
         # The full cumulative checklist (Bug #14, UAT 2026-06-09) is rendered
-        # right after so the SME always sees what's done and what's still
-        # needed — never just the latest batch in isolation.
-        await self._acknowledge_uploads(
+        # alongside — and now debounced (Bug #15) so a per-file POST burst
+        # doesn't spam the SME with the 15-line body per file.
+        new_checklist_at = await self._acknowledge_uploads(
             ctx, state, validated, unprocessed,
             saw_zip=saw_zip,
             missing_after=list(pending),
+            last_checklist_at=state.documents_checklist_sent_at,
         )
         # Remaining = required docs this batch did not land. Tracked locally so
         # generic-filename uploads reliably complete the checklist (we do not
@@ -2107,6 +2117,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             refresh_token=refresh,
             token_expires_at=expires,
             documents_processing_ack_at=processing_ack_at,
+            documents_checklist_sent_at=new_checklist_at,
         )
 
     async def _acknowledge_uploads(
@@ -2118,42 +2129,37 @@ class OnboardingWorkflow(WorkflowDefinition):
         *,
         saw_zip: bool,
         missing_after: list[str],
-    ) -> None:
-        """Send the per-document receipt for this batch + the FULL cumulative
-        checklist state.
+        last_checklist_at: str | None,
+    ) -> str | None:
+        """Send the per-document receipt for this batch + (sometimes) the
+        FULL cumulative checklist state.
 
-        Bug #14 (UAT 2026-06-09): per the spec (page 3-4, Sample Checklist
-        State + ZIP-received example), after every upload the SME must see
-        BOTH what landed in this batch AND the running list of what's still
-        needed — never just the latest receipts in isolation. Prior to this
-        an SME who uploaded everything except QID had no way to know QID
-        was still missing.
+        Returns the ISO timestamp the full checklist was last rendered —
+        the caller writes it back into state so a follow-up upload within
+        the debounce window only sees the brief receipt.
 
-        Layout:
-          {batch receipts — ✅/⏳ for this turn}
-          📋 Application checklist:
-            ✅ <every cumulatively validated doc>
-            ⚠️ <every still-needed doc>
-          📤 Please share the remaining N document(s) to move forward.
-
-        When the checklist becomes empty the footer is suppressed — the
-        ``documents_complete`` node fires the coffee message right after.
+        Behaviour shape:
+          - Per upload: ✅/⏳ receipts always fire (brief, 1 line per doc).
+          - Full checklist body + footer: debounced via
+            DOCS_CHECKLIST_TTL_SECONDS (Bug #15, UAT 2026-06-09). Madad's
+            bridge POSTs each file as a separate inbound; without the
+            debounce the SME saw the 15-line ✅/⚠️ body after every
+            single file. Now it fires once per upload session and the
+            interim uploads show just the receipts.
+          - Genuine end-to-end upload failure (nothing ever validated):
+            ``documents.upload_failed`` instead of the empty body.
         """
 
         def _label(doc: str) -> str:
             return DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title())
 
-        # Cumulative state derived from the post-update pending list and
-        # the canonical required set. Order preserved from the required
-        # list so the SME sees the same order every turn.
         all_required = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
         still_missing = list(missing_after)
         already_validated = [d for d in all_required if d not in still_missing]
 
         # Bug #1b (2026-06-09): if literally NOTHING has ever validated
         # AND this batch produced nothing either, the upload genuinely
-        # failed end-to-end — send the honest "couldn't process" fallback
-        # so the SME knows to retry.
+        # failed end-to-end — send the honest "couldn't process" fallback.
         if not validated and not unprocessed and not already_validated:
             try:
                 await self._send(ctx, state, "onboarding.documents.upload_failed")
@@ -2161,10 +2167,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                 ctx.logger.warning(
                     "documents_upload_failed_ack.failed", error=str(exc)[:200]
                 )
-            return
+            return last_checklist_at
 
-        # Batch receipts (this turn only) — keep concise so the SME sees
-        # what just landed before the broader status view.
+        # Batch receipts (this turn only) — concise so the SME sees
+        # what just landed.
         batch_rows = [f"✅ {_label(d)} — Received & Validated" for d in validated]
         batch_rows += [
             f"⏳ {_label(d)} — received, our team will review it"
@@ -2172,30 +2178,63 @@ class OnboardingWorkflow(WorkflowDefinition):
         ]
         batch_summary = "\n".join(batch_rows)
 
-        # Cumulative checklist body — every required doc with its current
-        # status. ✅ for done, ⚠️ for still needed.
-        checklist_rows = [f"✅ {_label(d)}" for d in already_validated]
-        checklist_rows += [f"⚠️ {_label(d)} — still needed" for d in still_missing]
-        checklist_body = "📋 Application checklist:\n" + "\n".join(checklist_rows)
+        # Decide whether to include the FULL checklist on this turn or
+        # just the brief receipts (Bug #15 debounce).
+        now = ctx.clock.now()
+        prior = _parse_iso_or_none(last_checklist_at)
+        checklist_age = (now - prior).total_seconds() if prior else None
+        include_full_checklist = (
+            checklist_age is None
+            or checklist_age >= DOCS_CHECKLIST_TTL_SECONDS
+            # Always show the FULL view on the final upload that
+            # exhausts the list — the SME gets the all-✅ snapshot
+            # before the coffee message.
+            or not still_missing
+        )
 
-        # Footer — only when something is still missing. The coffee
-        # message in documents_complete handles the all-done case.
-        if still_missing:
-            noun = "document" if len(still_missing) == 1 else "documents"
-            footer = (
-                f"\n\n📤 Please share the remaining {len(still_missing)} "
-                f"{noun} to move forward."
+        if include_full_checklist:
+            checklist_rows = [f"✅ {_label(d)}" for d in already_validated]
+            checklist_rows += [
+                f"⚠️ {_label(d)} — still needed" for d in still_missing
+            ]
+            checklist_body = (
+                "📋 Application checklist:\n" + "\n".join(checklist_rows)
             )
+            # Footer only when there's still work — coffee message handles
+            # the all-done case from documents_complete.
+            if still_missing:
+                noun = "document" if len(still_missing) == 1 else "documents"
+                footer = (
+                    f"\n\n📤 Please share the remaining {len(still_missing)} "
+                    f"{noun} to move forward."
+                )
+            else:
+                footer = ""
+            if batch_summary:
+                body = f"{batch_summary}\n\n{checklist_body}{footer}"
+            else:
+                body = f"{checklist_body}{footer}"
+            new_checklist_at: str | None = now.isoformat()
         else:
-            footer = ""
-
-        if batch_summary:
-            body = f"{batch_summary}\n\n{checklist_body}{footer}"
-        else:
-            # Edge: every upload in this batch was a duplicate of an
-            # already-validated doc → no new batch_summary. Still show
-            # the checklist state so the SME isn't left wondering.
-            body = f"{checklist_body}{footer}"
+            # Debounced — brief receipts only.
+            if batch_summary:
+                body = batch_summary
+            else:
+                # Edge: every upload in this batch was a duplicate. With
+                # no batch summary and the checklist debounced, force
+                # the full body once so the SME isn't left silent.
+                checklist_rows = [f"✅ {_label(d)}" for d in already_validated]
+                checklist_rows += [
+                    f"⚠️ {_label(d)} — still needed" for d in still_missing
+                ]
+                checklist_body = (
+                    "📋 Application checklist:\n" + "\n".join(checklist_rows)
+                )
+                body = checklist_body
+                # Mark the full body as just rendered so the next inbound
+                # in the burst still gets the debounced view.
+                return now.isoformat()
+            new_checklist_at = last_checklist_at
 
         template_key = (
             "onboarding.documents.zip_received"
@@ -2203,6 +2242,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             else "onboarding.documents.single_received"
         )
         await self._send(ctx, state, template_key, {"results": body})
+        return new_checklist_at
 
     async def _documents_complete(
         self, state: OnboardingState, ctx: WorkflowContext

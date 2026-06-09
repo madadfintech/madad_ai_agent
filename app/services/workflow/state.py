@@ -131,6 +131,13 @@ class OnboardingState(WorkflowState):
     # timestamp of the last processing ack; the docs node only re-fires
     # the ack when the previous one is older than DOCS_PROCESSING_ACK_TTL.
     documents_processing_ack_at: str | None = None
+    # Bug #15 (UAT 2026-06-09): same shape as the processing-ack debounce
+    # but for the full "📋 Application checklist" body. Per-upload still
+    # sends a brief ✅ receipt; the full ✅/⚠️ checklist + footer only
+    # re-fires after the previous one is older than
+    # DOCS_CHECKLIST_TTL_SECONDS so the SME isn't shown a 15-line wall of
+    # text for every single file the bridge fans out as a separate POST.
+    documents_checklist_sent_at: str | None = None
 
     # Postman-triggered gates (demo): the pre-qualification result (after the
     # audited report) and the payment step (after the coffee message) are each

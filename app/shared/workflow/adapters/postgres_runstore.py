@@ -116,25 +116,27 @@ class PostgresWorkflowRunStore(WorkflowRunStore):
 
     async def delete_by_session(self, session_id: str) -> list[str]:
         async with self._db.session() as session:
-            # Pull every run row for this session, capture their thread ids
-            # so the caller can purge LangGraph checkpoints, then delete the
+            # Load all rows + filter in Python — the JSON column isn't
+            # mapped as JSONB so a `data["session_id"].astext` predicate
+            # is rejected by SQLAlchemy. Admin reset is one-shot, so a
+            # full scan is fine; pulls the matching subset, captures
+            # their thread ids for checkpoint cleanup, then deletes the
             # rows + their audit trail in the same transaction.
-            rows = (
-                await session.execute(
-                    select(WorkflowRunRow).where(
-                        WorkflowRunRow.data["session_id"].astext == session_id
-                    )
-                )
+            all_rows = (
+                await session.execute(select(WorkflowRunRow))
             ).scalars().all()
-            if not rows:
-                return []
-            thread_ids: list[str] = []
             run_ids: list[str] = []
-            for row in rows:
+            thread_ids: list[str] = []
+            for row in all_rows:
+                data = row.data if isinstance(row.data, dict) else {}
+                if data.get("session_id") != session_id:
+                    continue
                 run_ids.append(row.run_id)
-                tid = row.data.get("thread_id") if isinstance(row.data, dict) else None
+                tid = data.get("thread_id")
                 if isinstance(tid, str) and tid:
                     thread_ids.append(tid)
+            if not run_ids:
+                return []
             await session.execute(
                 delete(WorkflowRunAuditRow).where(
                     WorkflowRunAuditRow.run_id.in_(run_ids)

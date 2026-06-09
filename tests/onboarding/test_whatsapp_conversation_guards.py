@@ -158,32 +158,37 @@ async def test_cr_upload_asks_for_financials_not_questionnaire(harness):
     assert "onboarding.eligibility.intake.request" not in templates
 
 
-async def test_payment_gate_waits_for_trigger(harness):
-    """After the coffee message the run PARKS — payment only fires on the
-    external trigger (Postman in the demo), carrying the Madad score."""
+async def test_qualify_mid_docs_fast_forwards_through_payment_wait(harness):
+    """Bug #12 (UAT 2026-06-09, Ishan diagnosis): backend only fires
+    ``madad_score.ready`` once. When it arrives mid-docs-loop, the SAME
+    event must:
+      (a) exit the docs loop (Bug #10a escape hatch),
+      (b) trigger the payment chain on the same resume — not park at
+          payment_wait waiting for a second event that won't come.
+
+    Without (b), the run sat at payment_wait until the admin re-fired
+    qualify, by which point the access token was stale → 401 → run
+    failed → no payment link reached the SME."""
 
     runtime = harness.platform.runtime
     await _drive_to_documents(harness, runtime)
-    # Bug #10a (2026-06-09): fast-forward past the (now-strict) docs loop
-    # via a forward-status webhook — same admin advance flow production
-    # uses when docs are reviewed off-band.
+
+    # One ``madad_score.ready`` event (mapped to QUALIFIED by the
+    # dispatcher's translator) must produce the payment template in
+    # the SAME resume — no second trigger needed.
     await runtime.resume(
         WA,
         IDENTITY,
-        message={"event": "documents.reviewed", "journey_status": "QUALIFIED"},
+        message={
+            "event": "madad_score.ready",
+            "journey_status": "QUALIFIED",
+            "madadScore": 78,
+        },
     )
 
-    # Parked after coffee — a chat message must NOT trigger payment.
-    result = await runtime.resume(WA, IDENTITY, message={"text": "when do I pay?"})
-    assert result.prompt == {"waiting_for": "payment_ready", "step": "payment_wait"}
-    assert "onboarding.payment.request" not in harness.messenger.templates()
-    assert "onboarding.payment.request.button" not in harness.messenger.templates()
-
-    # Postman payment trigger → payment step fires.
-    await runtime.resume(
-        WA, IDENTITY, message={"event": "madad_score.ready", "payload": {"madadScore": 78}}
-    )
     templates = harness.messenger.templates()
+    # Either the interactive CTA-URL button or the plain-text payment
+    # template fired — both are valid end-states for the chain.
     assert (
         "onboarding.payment.request.button" in templates
         or "onboarding.payment.request" in templates

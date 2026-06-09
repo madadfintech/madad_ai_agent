@@ -1823,14 +1823,30 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-            return self._step(
-                "documents_upload_loop_await",
-                ctx,
-                missing_documents=list(state.missing_documents),
-                documents_received=True,
-                journey_status=forced_status,
-                last_status_source=_extract_status_source(reply),
-            )
+            # Bug #12 (UAT 2026-06-09, Ishan diagnosis): when QUALIFIED+
+            # arrives mid-docs-loop, the SAME event must fast-forward
+            # through ``payment_wait_await`` too — backend only fires
+            # ``madad_score.ready`` once, so requiring a second trigger
+            # left the run stuck at payment_wait until the admin re-fired.
+            # Capture payment_ready + madad_score on the same resume.
+            fast_forward = forced_status in {
+                JourneyStatus.QUALIFIED,
+                JourneyStatus.ACCEPTED,
+                JourneyStatus.OFFER_ACCEPTED,
+                JourneyStatus.ACTIVATED,
+            }
+            score = _extract_madad_score(reply)
+            fields: dict[str, Any] = {
+                "missing_documents": list(state.missing_documents),
+                "documents_received": True,
+                "journey_status": forced_status,
+                "last_status_source": _extract_status_source(reply),
+            }
+            if fast_forward:
+                fields["payment_ready"] = True
+                if score is not None:
+                    fields["madad_score"] = score
+            return self._step("documents_upload_loop_await", ctx, **fields)
         attachments = _valid_upload_attachments(reply)
         if not attachments:
             # No file — it's a question, a "no", or chit-chat. Answer it in
@@ -2188,6 +2204,16 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _payment_wait_await(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
+        # Bug #12 (UAT 2026-06-09, Ishan diagnosis): when QUALIFIED+
+        # arrived mid-docs-loop, the upstream docs-loop handler set
+        # ``payment_ready=True`` on the SAME resume — but this node
+        # used to call ``await_input`` unconditionally, parking until
+        # a second event that backend never fires. Short-circuit when
+        # we already have the trigger so the same event continues
+        # straight into the payment chain (business_details_fetch →
+        # products_list_fetch → payment_create → payment_send_link).
+        if state.payment_ready:
+            return self._step("payment_wait_await", ctx, payment_ready=True)
         # PARK after the coffee message until the payment step is triggered
         # (Postman in the demo). Capture the Madad score from the trigger payload.
         payload = await_input({"waiting_for": "payment_ready", "step": "payment_wait"})
@@ -2306,24 +2332,40 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _business_details_fetch(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        if not state.access_token:
-            return self._step("business_details_fetch", ctx)
-        result = await self._pay.get_business_details(access_token=state.access_token)
+        # Bug #13 (UAT 2026-06-09, Ishan diagnosis): the payment branch
+        # used to read ``state.access_token`` directly, which is the same
+        # token minted ~15 minutes earlier at the doc-upload phase. After
+        # the docs review + admin qualify window the token had expired,
+        # the backend returned HTTP 401, retries exhausted, the run
+        # died, no payment link reached the SME. Mint on demand here
+        # (and in every other payment-branch node) so the credentials
+        # are always live by the time we hit Madad's APIs.
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not token:
+            return self._step(
+                "business_details_fetch", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+        result = await self._pay.get_business_details(access_token=token)
         business_id = (
             result.get("business_details_id") if isinstance(result, dict) else None
         )
         return self._step(
-            "business_details_fetch", ctx, business_details_id=business_id
+            "business_details_fetch", ctx,
+            business_details_id=business_id,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
         )
 
     async def _products_list_fetch(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        if not state.access_token:
-            return self._step("products_list_fetch", ctx)
-        result = await self._pay.list_monetization_products(
-            access_token=state.access_token
-        )
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not token:
+            return self._step(
+                "products_list_fetch", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+        result = await self._pay.list_monetization_products(access_token=token)
         products = (
             list(result.get("products", [])) if isinstance(result, dict) else []
         )
@@ -2332,20 +2374,21 @@ class OnboardingWorkflow(WorkflowDefinition):
             "products_list_fetch",
             ctx,
             payment_product_id=product.get("product_id"),
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
         )
 
     async def _payment_create(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        if not (
-            state.access_token
-            and state.business_details_id
-            and state.payment_product_id
-        ):
-            return self._step("payment_create", ctx)
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not (token and state.business_details_id and state.payment_product_id):
+            return self._step(
+                "payment_create", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
         key = f"{ctx.run_id}:create_monetization_payment"
         result = await self._pay.create_monetization_payment(
-            access_token=state.access_token,
+            access_token=token,
             business_details_id=state.business_details_id,
             product_id=state.payment_product_id,
             amount_qar=ONBOARDING_FEE_QAR,
@@ -2372,6 +2415,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             payment_status=payment_status,
             payment_link=payment_link,
             payment_provider_ref=provider_ref,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
             idempotency_keys={
                 **state.idempotency_keys,
                 "create_monetization_payment": key,
@@ -2438,11 +2482,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         # ALSO fire the backend's notification trigger as a side-channel —
         # if it succeeds the SME gets a Madad-branded copy of the link too,
         # if it fails (502 in current UAT) we already sent our own.
-        if state.access_token and state.payment_id:
+        # Bug #13 (UAT 2026-06-09): mint a fresh token first — the cached
+        # token may be ~15 minutes old by now.
+        token, refresh, expires = await self._live_token(state, ctx)
+        if token and state.payment_id:
             key = f"{ctx.run_id}:send_monetization_payment_link"
             try:
                 await self._pay.send_monetization_payment_link(
-                    access_token=state.access_token,
+                    access_token=token,
                     payment_id=state.payment_id,
                     channel=_channel(ctx),
                     identity=ctx.identity,
@@ -2450,6 +2497,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 )
                 return self._step(
                     "payment_send_link", ctx,
+                    access_token=token, refresh_token=refresh, token_expires_at=expires,
                     idempotency_keys={
                         **state.idempotency_keys,
                         "send_monetization_payment_link": key,
@@ -2461,7 +2509,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                     error=str(exc)[:200],
                     note="primary link already sent via messenger — continuing",
                 )
-        return self._step("payment_send_link", ctx)
+        return self._step(
+            "payment_send_link", ctx,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
 
     async def _payment_await(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -2920,7 +2971,25 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "go" if state.prequalified else "wait"
 
     def _route_payment_wait(self, state: OnboardingState) -> str:
-        return "go" if state.payment_ready else "wait"
+        # Bug #12 (UAT 2026-06-09): the payment trigger is the same
+        # ``madad_score.ready`` event that exits the docs loop. When it
+        # arrives mid-docs-loop, the docs-loop handler consumes it,
+        # parks here, and the SME used to be stuck until a second
+        # qualify fired. payment_ready is now set on that same
+        # transition (see _documents_upload_loop_await); the journey-
+        # status check below is a belt-and-braces safety net for any
+        # other arrival path that advanced the journey past pre-qual
+        # without explicitly toggling payment_ready.
+        if state.payment_ready:
+            return "go"
+        if state.journey_status in {
+            JourneyStatus.QUALIFIED,
+            JourneyStatus.ACCEPTED,
+            JourneyStatus.OFFER_ACCEPTED,
+            JourneyStatus.ACTIVATED,
+        }:
+            return "go"
+        return "wait"
 
     def _route_payment(self, state: OnboardingState) -> str:
         return "paid" if state.paid else "unpaid"

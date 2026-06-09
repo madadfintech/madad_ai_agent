@@ -24,19 +24,15 @@ async def _drive_to_payment_block(harness):
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
-    # Bug #10a (2026-06-09): docs loop is strict now — one valid upload,
-    # then admin-webhook fast-forward to exit. The pre-fix lenient route
-    # let any single upload exit, so payment_trigger could be combined
-    # with the docs exit in one event; we now need two.
+    # Bug #10a + Bug #12 (2026-06-09): one ``madad_score.ready`` event
+    # exits the strict docs loop AND fast-forwards through payment_wait
+    # into the payment chain — backend only fires it once.
     await resume(
         {
             "attachments": [
                 {"filename": "Establishment_Card.pdf", "content_base64": doc}
             ]
         }
-    )
-    await resume(
-        {"event": "documents.completed", "journey_status": "QUALIFIED"}
     )
     harness.identity.journey_status = "QUALIFIED"
     after_status = await resume(

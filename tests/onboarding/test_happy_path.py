@@ -48,22 +48,18 @@ async def _drive_to_completion(harness):
     )
     assert after_prequal.prompt == {"waiting_for": "upload", "step": "documents"}
 
-    # Bug #10a (2026-06-09): docs loop is strict — one valid upload (so
-    # the classify call is exercised), then admin-webhook fast-forward to
-    # exit, then madad_score.ready to trigger payment.
+    # Bug #10a + Bug #12 (2026-06-09): docs loop is strict, and a single
+    # ``madad_score.ready`` event (mapped to QUALIFIED by the translator)
+    # exits the docs loop AND fast-forwards through payment_wait into
+    # the payment chain on the SAME resume — backend only fires once.
     await resume(
         {"attachments": [{"filename": "Establishment_Card.pdf", "content_base64": "ZHVtbXk="}]}
     )
-    after_docs = await resume(
-        {"event": "documents.completed", "journey_status": "QUALIFIED"}
-    )
-    assert after_docs.prompt == {"waiting_for": "payment_ready", "step": "payment_wait"}
-
     harness.identity.journey_status = "QUALIFIED"
-    after_status1 = await resume(
+    after_docs = await resume(
         {"event": "madad_score.ready", "journey_status": "QUALIFIED", "madadScore": 78}
     )
-    assert after_status1.prompt == {"waiting_for": "payment", "step": "payment"}
+    assert after_docs.prompt == {"waiting_for": "payment", "step": "payment"}
 
     # Mark monetization fee paid → lender_wait.
     after_pay = await resume({"type": "payment", "paid": True})

@@ -61,8 +61,8 @@ async def test_resume_external_status_update(harness):
         WA, IDENTITY, {"event": "prequalification.completed", "madadScore": 78}
     )  # → documents
 
-    # Bug #10a (2026-06-09): strict docs loop — one valid upload, admin
-    # webhook to exit, then madad_score.ready triggers payment.
+    # Bug #10a + Bug #12 (2026-06-09): one madad_score.ready event exits
+    # docs AND fast-forwards through payment_wait into the payment chain.
     await dispatcher.inbound(
         WA,
         IDENTITY,
@@ -70,10 +70,6 @@ async def test_resume_external_status_update(harness):
             {"filename": "Establishment_Card.pdf", "content_base64": DOC},
         ],
     )
-    await dispatcher.resume_external(
-        WA, IDENTITY, {"event": "documents.completed", "journey_status": "QUALIFIED"}
-    )
-
     harness.identity.journey_status = "QUALIFIED"
     result = await dispatcher.resume_external(
         WA, IDENTITY, {"event": "madad_score.ready", "journey_status": "QUALIFIED"}

@@ -131,17 +131,25 @@ async def test_additional_document_gets_assigned_to_next_pending_slot(harness) -
 
 
 async def test_forward_status_webhook_exits_strict_loop(harness) -> None:
-    """Bug #10a escape hatch: a backend webhook flagging QUALIFIED+ still
-    completes the loop without all docs in (admin signed off off-band)."""
+    """Bug #10a escape hatch + Bug #12 fast-forward (2026-06-09): a
+    backend webhook flagging QUALIFIED+ exits the docs loop AND fast-
+    forwards through payment_wait into the payment chain on the same
+    resume — backend only fires ``madad_score.ready`` once, so a
+    second-event design left the run permanently parked."""
     await _drive_to_documents(harness)
 
     # No upload yet — just admin advancement.
     result = await harness.platform.runtime.resume(
         WA,
         IDENTITY,
-        message={"event": "documents.completed", "journey_status": "QUALIFIED"},
+        message={"event": "madad_score.ready", "journey_status": "QUALIFIED"},
     )
 
-    assert "onboarding.documents.complete" in harness.messenger.templates()
-    # Run moves on to payment_wait.
-    assert result.prompt == {"waiting_for": "payment_ready", "step": "payment_wait"}
+    templates = harness.messenger.templates()
+    assert "onboarding.documents.complete" in templates
+    # Bug #12: one event reaches the payment step, no second trigger.
+    assert result.prompt == {"waiting_for": "payment", "step": "payment"}
+    assert (
+        "onboarding.payment.request.button" in templates
+        or "onboarding.payment.request" in templates
+    )

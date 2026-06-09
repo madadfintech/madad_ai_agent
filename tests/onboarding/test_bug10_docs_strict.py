@@ -95,6 +95,41 @@ async def test_misclassified_doc_lands_as_unprocessed(harness) -> None:
     assert "✅ Commercial Registration" not in results_text
 
 
+async def test_additional_document_gets_assigned_to_next_pending_slot(harness) -> None:
+    """QA #3 refinement (2026-06-09): when the classifier returns
+    ``additional_document`` (truly unknown), don't block the SME — assign
+    to the next pending required slot. Madad's team re-buckets if needed.
+
+    Distinct from the misclassification case (passport→CR): a SPECIFIC
+    wrong type still lands as ⏳, but a 'don't know' falls through to
+    filename inference / next-pending fallback so the SME's checklist
+    keeps moving."""
+    await _drive_to_documents(harness)
+
+    # IMG-7651.jpg is a filename the keyword classifier won't match
+    # (the in-memory classifier returns "additional_document"), AND the
+    # filename keywords don't infer a doc type either. Should land in
+    # the first pending slot ("national_address_certificate") with ✅.
+    await harness.platform.runtime.resume(
+        WA,
+        IDENTITY,
+        message={
+            "attachments": [{"filename": "IMG-7651.jpg", "content_base64": DOC}]
+        },
+    )
+
+    sent = [
+        s for s in harness.messenger.sent
+        if s["template_key"] == "onboarding.documents.single_received"
+    ]
+    assert sent, "single_received should have fired"
+    results_text = sent[-1]["variables"]["results"]
+    # The first required slot earns ✅ — not ⏳ — so the SME's progress
+    # is reflected and the checklist advances.
+    assert "✅" in results_text
+    assert "National Address Certificate" in results_text
+
+
 async def test_forward_status_webhook_exits_strict_loop(harness) -> None:
     """Bug #10a escape hatch: a backend webhook flagging QUALIFIED+ still
     completes the loop without all docs in (admin signed off off-band)."""

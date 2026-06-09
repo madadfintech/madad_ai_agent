@@ -121,7 +121,12 @@ def test_state_serialises_round_trip_through_model_dump_and_model_validate() -> 
     restored = OnboardingState.model_validate(original.model_dump(mode="json"))
     assert restored.channel_identity == "+97455500001"
     assert restored.session_type == "new_lead"
-    assert restored.onboarding_token == "OT-1"
+    # QA #5 (2026-06-09): onboarding_token is now ``Field(exclude=True)``
+    # so it does NOT survive the dump→reload cycle (the whole point — we
+    # don't want tokens persisted in checkpoints). ``_live_token`` mints
+    # a fresh one on the next node entry from the verified channel
+    # identity, so workflow correctness is unchanged.
+    assert restored.onboarding_token is None
     assert restored.journey_status is JourneyStatus.SIGN_UP
     assert restored.idempotency_keys == {
         "madad_payments_create_monetization_payment": "k1"

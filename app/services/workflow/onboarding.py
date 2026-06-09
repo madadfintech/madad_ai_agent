@@ -1976,15 +1976,33 @@ class OnboardingWorkflow(WorkflowDefinition):
                         error=str(exc)[:200],
                         note="staging-tolerant: continuing without this doc",
                     )
-            # Fall back to filename inference when the classifier returns
-            # nothing (rare — happens when the backend stores as
-            # ADDITIONAL_DOCUMENT). The old code also did a pending[0]
-            # legitimization which Bug #10b proved dangerous (any file
-            # would claim the next checklist slot regardless of content),
-            # so that path is gone.
+            # QA #3 refinement (2026-06-09): two failure modes from the
+            # classifier need different handling:
+            #
+            #   * Classifier returned a SPECIFIC wrong type (e.g. backend
+            #     tagged a passport upload as "commercial_registration"):
+            #     resolved_doc_type is set, but it's not on the asked-for
+            #     list. Land as ⏳ "received, team will review" — never
+            #     ✅ a false validation.
+            #
+            #   * Classifier said "additional_document" / returned nothing:
+            #     we genuinely don't know what it is. Per QA: "don't block
+            #     the user — assign to a required slot, Madad's team can
+            #     re-assign later." Fall back to filename inference, then
+            #     to the next pending slot. The slot earns ✅ provisionally.
             doc_type: str | None = resolved_doc_type
-            if not doc_type:
-                doc_type = att.get("document_type") or _infer_doc_type(filename)
+            classifier_unknown = (
+                not doc_type or doc_type == "additional_document"
+            )
+            if classifier_unknown:
+                inferred = att.get("document_type") or _infer_doc_type(filename)
+                if inferred:
+                    doc_type = inferred
+                elif pending:
+                    # Last-resort hint per QA #3: take the next required
+                    # slot so the SME isn't stuck. Madad-side review will
+                    # re-bucket if needed.
+                    doc_type = pending[0]
             if not doc_type:
                 continue
             # Bug #10b: only docs on the asked-for list earn ✅. Backend

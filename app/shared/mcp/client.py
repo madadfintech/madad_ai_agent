@@ -247,6 +247,21 @@ class HttpMCPClient(MCPClient):
         self._stack = AsyncExitStack()
         self._client: fastmcp.Client[Any] | None = None
 
+    # QA #1 (2026-06-09): markers fastmcp raises when its context manager
+    # has exited / the underlying transport dropped. When seen, drop the
+    # stale client + stack and reconnect for one retry — the offending
+    # call didn't reach the server, so retrying is safe even for writes.
+    _DISCONNECT_MARKERS = (
+        "client is not connected",
+        "use the 'async with client:' context manager",
+        "connection closed",
+        "connection reset",
+        "stream closed",
+        "transport closed",
+        "broken pipe",
+        "remote disconnected",
+    )
+
     async def _ensure_connected(self) -> fastmcp.Client[Any]:
         if self._client is None:
             self._client = await self._stack.enter_async_context(
@@ -255,9 +270,42 @@ class HttpMCPClient(MCPClient):
         assert self._client is not None  # narrowing for mypy
         return self._client
 
+    async def _reset_connection(self) -> None:
+        """Drop the current client + stack so the next call mints fresh.
+
+        Used by the reconnect path after a disconnect — the stale stack
+        may itself raise on close (broken transport), so swallow that to
+        avoid masking the original disconnect error."""
+
+        try:
+            await self._stack.aclose()
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            self._log.warning("mcp.reconnect.stack_close_failed", error=str(exc)[:200])
+        self._stack = AsyncExitStack()
+        self._client = None
+
+    @classmethod
+    def _looks_like_disconnect(cls, exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return any(marker in msg for marker in cls._DISCONNECT_MARKERS)
+
     async def _invoke(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         client = await self._ensure_connected()
-        result = await client.call_tool(name, payload)
+        try:
+            result = await client.call_tool(name, payload)
+        except Exception as exc:
+            if not self._looks_like_disconnect(exc):
+                raise
+            # QA #1 blocker: the persistent client's transport dropped and
+            # every subsequent call would re-raise "Client is not
+            # connected" until the container restarts. Reconnect once and
+            # replay the call — the request never reached the server.
+            self._log.warning(
+                "mcp.reconnect.attempt", tool=name, error=str(exc)[:200],
+            )
+            await self._reset_connection()
+            client = await self._ensure_connected()
+            result = await client.call_tool(name, payload)
         if getattr(result, "is_error", False):
             raise MCPError(f"MCP tool {name!r} returned is_error", details={"tool": name})
         data = getattr(result, "data", None)

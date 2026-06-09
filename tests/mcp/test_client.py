@@ -199,6 +199,84 @@ async def test_http_client_is_error_raises_mcp_error():
     await client.aclose()
 
 
+async def test_http_client_reconnects_after_disconnect_marker() -> None:
+    """QA #1 (2026-06-09): after the persistent fastmcp client's
+    transport drops, the next call raised "Client is not connected" and
+    the bot stayed silent until container restart. The wrapper now
+    detects the disconnect marker, drops the stale client + AsyncExitStack,
+    mints a fresh client, and replays the call once."""
+
+    # Factory hands out two distinct fake clients. The first raises a
+    # "Client is not connected" error on its second call (simulating a
+    # mid-session transport drop); the second answers normally.
+    drop_marker = RuntimeError(
+        "Client is not connected. Use the 'async with client:' context manager first"
+    )
+    first = _FakeFastMcpClient(responses={"madad_auth_me": {"id": "u1"}})
+    second = _FakeFastMcpClient(responses={"madad_auth_me": {"id": "u2"}})
+    pool: list[_FakeFastMcpClient] = [first, second]
+
+    def factory(_s: McpSettings) -> _FakeFastMcpClient:
+        return pool.pop(0)
+
+    # Patch the first fake to raise the disconnect on the SECOND call.
+    original_call = first.call_tool
+
+    async def call_with_drop(name: str, arguments: dict[str, Any]) -> _FakeCallResult:
+        if first.calls and first.calls[-1][0] == "madad_auth_me":
+            raise drop_marker
+        return await original_call(name, arguments)
+
+    first.call_tool = call_with_drop  # type: ignore[method-assign]
+
+    client = HttpMCPClient(
+        McpSettings(
+            endpoint="https://mcp.example",
+            idempotent_tools={"madad_auth_me"},
+            retry_max_attempts=1,  # single-shot to prove reconnect runs WITHIN one attempt
+        ),
+        client_factory=factory,  # type: ignore[arg-type]
+    )
+
+    # First call lands cleanly via the first fake.
+    out1 = await client.call_tool("madad_auth_me", {"access_token": "tok"})
+    assert out1 == {"id": "u1"}
+    # Second call: first fake raises the disconnect marker; the wrapper
+    # drops the stack, mints the second fake, and serves the call.
+    out2 = await client.call_tool("madad_auth_me", {"access_token": "tok"})
+    assert out2 == {"id": "u2"}
+    assert second.entered == 1
+    await client.aclose()
+
+
+async def test_http_client_does_not_reconnect_on_unrelated_error() -> None:
+    """Reconnect must trigger ONLY on disconnect markers. A regular
+    application-level error (e.g. backend 403) propagates straight up
+    so the base client's retry / single-shot policy is unchanged."""
+
+    fake = _FakeFastMcpClient()
+
+    async def failing(name: str, arguments: dict[str, Any]) -> _FakeCallResult:
+        raise RuntimeError("Madad API returned HTTP 403")
+
+    fake.call_tool = failing  # type: ignore[method-assign]
+
+    client = HttpMCPClient(
+        McpSettings(
+            endpoint="https://mcp.example",
+            idempotent_tools={"madad_auth_me"},
+            retry_max_attempts=1,
+        ),
+        client_factory=lambda _s: fake,  # type: ignore[arg-type, return-value]
+    )
+
+    with pytest.raises(MCPError):
+        await client.call_tool("madad_auth_me", {"access_token": "tok"})
+    # The fake was entered exactly once — no reconnect attempt.
+    assert fake.entered == 1
+    await client.aclose()
+
+
 async def test_http_client_aclose_is_safe_when_never_connected():
     client = HttpMCPClient(
         McpSettings(endpoint="https://mcp.example"),

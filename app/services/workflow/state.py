@@ -68,10 +68,17 @@ class OnboardingState(WorkflowState):
     # Convenience fields the workflow router branches on; populated alongside
     # ``channel_session_response``.
     session_type: SessionType | None = None
-    access_token: str | None = None
-    onboarding_token: str | None = None
-    refresh_token: str | None = None
-    token_expires_at: int | None = None  # unix epoch seconds
+    # QA #5 security (2026-06-09): tokens are short-lived and SHOULD NOT
+    # land in LangGraph checkpoints. The fields stay (so the workflow
+    # can still pass them between nodes within one execution) but are
+    # marked exclude=True so ``model_dump()`` — which the checkpoint
+    # serializer goes through — strips them before persistence. On
+    # resume, _live_token mints a fresh one from the verified channel
+    # identity (no password, no login) so behaviour is unchanged.
+    access_token: str | None = Field(default=None, exclude=True)
+    onboarding_token: str | None = Field(default=None, exclude=True)
+    refresh_token: str | None = Field(default=None, exclude=True)
+    token_expires_at: int | None = Field(default=None, exclude=True)  # unix epoch seconds
     madad_user_id: str | None = None
     # Q8 three-way result on first contact (for the check_contact router).
     check_contact_result: ContactCheckResult | None = None

@@ -17,11 +17,24 @@ from __future__ import annotations
 from typing import Any
 
 from app.shared.workflow import Channel, ExecutionResult, WorkflowRuntime
-from app.shared.workflow.enums import TERMINAL_STATUSES
+from app.shared.workflow.enums import TERMINAL_STATUSES, RunStatus
+from app.shared.workflow.errors import WorkflowExecutionError
 
 from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
 
 DEFAULT_WORKFLOW = "onboarding"
+
+# QA #2 (2026-06-09): runs that died from a transient failure (network
+# blip, backend 403, MCP timeout) should be revived on the next user
+# message instead of starting from scratch. The LangGraph checkpoint
+# still holds the last parked-step state — we just need to re-transition
+# the run to RUNNING and let the executor replay the new inbound at the
+# pending interrupt. COMPLETED / CANCELLED / DEAD_LETTERED are intentionally
+# NOT in this set (the first is success, the other two are operator-set
+# kills that should not silently un-do themselves).
+REVIVABLE_TERMINAL_STATUSES: frozenset[RunStatus] = frozenset(
+    {RunStatus.FAILED, RunStatus.TIMED_OUT}
+)
 
 
 # -- Canonical backend event types -------------------------------------------
@@ -215,8 +228,24 @@ class OnboardingDispatcher:
         session = await self._runtime.sessions.get(channel, identity)
         if session is not None and session.active_run_id:
             run = await self._runtime.run_store.get_or_none(session.active_run_id)
-            if run is not None and run.status not in TERMINAL_STATUSES:
-                return await self._runtime.resume(channel, identity, message=payload)
+            if run is not None:
+                if run.status not in TERMINAL_STATUSES:
+                    return await self._runtime.resume(channel, identity, message=payload)
+                if run.status in REVIVABLE_TERMINAL_STATUSES:
+                    # QA #2: a transient failure left this run terminally
+                    # dead in the store, but the LangGraph checkpoint at
+                    # the last successful interrupt is still intact. Flip
+                    # the run record back to RUNNING and replay the new
+                    # inbound — if the resume itself errors (genuinely
+                    # broken state), fall through to a fresh start so the
+                    # SME is never stuck.
+                    try:
+                        await self._runtime.revive_failed_run(run)
+                        return await self._runtime.resume(
+                            channel, identity, message=payload
+                        )
+                    except (WorkflowExecutionError, Exception):  # noqa: BLE001
+                        pass
         return await self._runtime.start(self._workflow, channel, identity, input=payload)
 
 

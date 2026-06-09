@@ -737,6 +737,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "offer_view_send": self._offer_view_send,
             "offer_handoff_to_madad": self._offer_handoff_to_madad,
             "activated": self._activated,
+            "invoice_collect_await": self._invoice_collect_await,
         }
         for node_name, fn in nodes.items():
             graph.add_node(node_name, fn)
@@ -892,13 +893,23 @@ class OnboardingWorkflow(WorkflowDefinition):
         graph.add_edge("offers_fetch", "offer_view_send")
         graph.add_edge("offer_view_send", "offer_handoff_to_madad")
 
+        # Step 9 → 10-13: after the credit-line activation message, the run no
+        # longer terminates — it parks to collect invoices for financing. Each
+        # uploaded invoice is submitted immediately; the node loops to accept
+        # more. (Agent-only graph; portal/other flows are unaffected.)
+        graph.add_edge("activated", "invoice_collect_await")
+        graph.add_conditional_edges(
+            "invoice_collect_await",
+            self._route_invoice_collect,
+            {"loop": "invoice_collect_await"},
+        )
+
         for terminal in (
             "declined",
             "domain_blocked",
             "not_eligible",
             "not_qualified",
             "offer_handoff_to_madad",
-            "activated",
         ):
             graph.set_finish(terminal)
 
@@ -2606,6 +2617,79 @@ class OnboardingWorkflow(WorkflowDefinition):
         )
         return self._step("activated", ctx, outcome="completed")
 
+    async def _invoice_collect_await(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        # Steps 10-13: once the credit line is ACTIVE, the SME can send invoices
+        # over WhatsApp. Each uploaded PDF/photo is submitted for financing
+        # immediately — same extraction + submission path as the portal — and
+        # the run stays parked here to accept more. Disbursement / repayment
+        # alerts then arrive via the backend webhooks (transaction.disbursed,
+        # repayment.*). Non-file chat is answered in context; we never drop it.
+        reply = await_input({"waiting_for": "invoice", "step": "invoice_collect"})
+        attachments = _valid_upload_attachments(reply)
+        if not attachments:
+            await self._smart_contextual(
+                ctx,
+                state,
+                reply,
+                "Whenever you have an invoice to finance, just send it here as a "
+                "PDF or photo and I'll submit it for financing right away. 🙂",
+            )
+            return self._step("invoice_collect_await", ctx)
+
+        # Mint a live token from the verified identity (a long-active user can
+        # resume with an empty/expired cached token — same fix as doc uploads).
+        token, refresh, expires = await self._live_token(state, ctx)
+        submitted = 0
+        failed = 0
+        for att in attachments:
+            content = att.get("content_base64") or ""
+            filename = att.get("filename") or "invoice.pdf"
+            if not content or not token:
+                failed += 1
+                continue
+            try:
+                await self._kyc.upload_invoice_base64(
+                    access_token=token,
+                    content_base64=content,
+                    filename=filename,
+                    mime_type=att.get("mime_type"),
+                )
+                submitted += 1
+            except Exception as exc:  # noqa: BLE001 — never crash the run
+                ctx.logger.warning(
+                    "invoice_upload.failed",
+                    filename=filename,
+                    error=str(exc)[:200],
+                )
+                failed += 1
+
+        if submitted:
+            noun = "your invoice has" if submitted == 1 else f"{submitted} invoices have"
+            answer = (
+                f"✅ Got it — {noun} been submitted for financing. Our team will "
+                "review and you'll get an update here once it's disbursed. Send "
+                "another invoice anytime. 🙂"
+            )
+        else:
+            answer = (
+                "I couldn't read that file just now — please resend the invoice as "
+                "a clear PDF or photo and I'll submit it for financing."
+            )
+        # Send the confirmation directly via the existing contextual template
+        # (no new CMS template needed; no LLM round-trip for a confirmation).
+        await self._send(
+            ctx, state, "onboarding.help.contextual", {"answer": answer, "next_step": ""}
+        )
+        return self._step(
+            "invoice_collect_await",
+            ctx,
+            access_token=token,
+            refresh_token=refresh,
+            token_expires_at=expires,
+        )
+
     # -- routers --------------------------------------------------------------
 
     def _route_entry(self, state: OnboardingState) -> str:
@@ -2699,6 +2783,11 @@ class OnboardingWorkflow(WorkflowDefinition):
 
     def _route_status_resume(self, state: OnboardingState) -> str:
         return "await_again" if state.last_status_source == "chat" else "poll"
+
+    def _route_invoice_collect(self, state: OnboardingState) -> str:
+        # ACTIVE users stay parked collecting invoices: always loop back to the
+        # await node so each new invoice (or chat) is handled in turn.
+        return "loop"
 
     # -- helpers --------------------------------------------------------------
 

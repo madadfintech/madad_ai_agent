@@ -131,11 +131,12 @@ async def test_additional_document_gets_assigned_to_next_pending_slot(harness) -
 
 
 async def test_forward_status_webhook_exits_strict_loop(harness) -> None:
-    """Bug #10a escape hatch + Bug #12 fast-forward (2026-06-09): a
-    backend webhook flagging QUALIFIED+ exits the docs loop AND fast-
-    forwards through payment_wait into the payment chain on the same
-    resume — backend only fires ``madad_score.ready`` once, so a
-    second-event design left the run permanently parked."""
+    """Bug #10a escape hatch + Bug #12 fast-forward + Ishan refinement
+    (2026-06-09): a backend webhook flagging QUALIFIED+ jumps STRAIGHT
+    to the payment chain. The "🎊 all documents received" coffee
+    message is intentionally skipped — the checklist isn't actually
+    complete, admin overrode it, and sending the coffee message would
+    misrepresent the SME's state."""
     await _drive_to_documents(harness)
 
     # No upload yet — just admin advancement.
@@ -146,7 +147,8 @@ async def test_forward_status_webhook_exits_strict_loop(harness) -> None:
     )
 
     templates = harness.messenger.templates()
-    assert "onboarding.documents.complete" in templates
+    # Ishan refinement: coffee message must NOT fire on admin override.
+    assert "onboarding.documents.complete" not in templates
     # Bug #12: one event reaches the payment step, no second trigger.
     assert result.prompt == {"waiting_for": "payment", "step": "payment"}
     assert (

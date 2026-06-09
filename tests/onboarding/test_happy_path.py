@@ -93,19 +93,24 @@ async def test_messages_sent_once_in_order(harness):
     # fires after audited upload; documents.complete fires before payment_wait.
     # Main uses `payment.request.button` (interactive CTA) instead of plain
     # `payment.request`, and `documents.single_received` is sent per upload.
+    # Ishan refinement (2026-06-09): ``documents.complete`` is intentionally
+    # skipped on the QUALIFY-mid-docs path the helper drives — the
+    # checklist isn't naturally complete, admin overrode it, and the
+    # coffee message would misrepresent the SME's state.
     expected_subset = [
         "onboarding.campaign.intro",
         "onboarding.consent.request",
         "onboarding.financials.request",
         "onboarding.account.created",
         "onboarding.documents.checklist",
-        "onboarding.documents.complete",
         "onboarding.payment.request.button",
         "onboarding.offers.preview",
         "onboarding.offer.handoff.button",
     ]
     for tpl in expected_subset:
         assert tpl in templates, f"expected {tpl} in {templates}"
+    # Coffee message must NOT fire on admin override.
+    assert "onboarding.documents.complete" not in templates
 
 
 async def test_mcp_tool_calls_happen_in_order(harness):

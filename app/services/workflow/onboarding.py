@@ -864,6 +864,12 @@ class OnboardingWorkflow(WorkflowDefinition):
             self._route_documents,
             {
                 "complete": "documents_complete",
+                # Refinement per Ishan (2026-06-09): when admin QUALIFIES
+                # mid-docs-loop, jump STRAIGHT to the payment chain —
+                # bypass the misleading "all documents received" coffee
+                # message (the checklist isn't actually complete) and
+                # the now-redundant payment_wait_await stop.
+                "payment": "business_details_fetch",
                 "missing": "documents_upload_loop_send",
                 "await_again": "documents_upload_loop_await",
             },
@@ -1846,6 +1852,14 @@ class OnboardingWorkflow(WorkflowDefinition):
                 fields["payment_ready"] = True
                 if score is not None:
                     fields["madad_score"] = score
+                # Refinement (2026-06-09): when admin overrides the
+                # checklist, the natural ``documents_complete`` node is
+                # skipped — so its progress=5 marker would never fire on
+                # this path. Fire it here so the backend gets the full
+                # ordered sequence regardless of route.
+                progress_step = await self._update_progress(state, ctx, step=5)
+                if progress_step is not None:
+                    fields["onboarding_progress_step"] = progress_step
             return self._step("documents_upload_loop_await", ctx, **fields)
         attachments = _valid_upload_attachments(reply)
         if not attachments:
@@ -2948,22 +2962,26 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "received" if state.shareholders else "missing"
 
     def _route_documents(self, state: OnboardingState) -> str:
-        # Bug #10a (2026-06-09): the prior "any upload completes the loop"
-        # mode marked the SME done after a single (and often misclassified)
-        # upload — QA screenshot 2026-06-09 showed a passport→CR mislabel
-        # fast-forwarding past 11 still-missing docs into "🎊 all
-        # documents received". Strict gating now: stay parked until either
-        # (a) the asked-for checklist is exhausted, or (b) the backend
-        # explicitly advanced the journey past pre-qualification (admin
-        # waived the rest via webhook).
-        if not state.missing_documents:
-            return "complete"
-        if state.journey_status in {
+        # Refinement per Ishan (UAT 2026-06-09): when admin QUALIFIES
+        # mid-docs-loop, jump STRAIGHT to the payment chain. The
+        # ``documents_complete`` coffee message ("🎊 all documents
+        # received") is misleading in that case — the checklist isn't
+        # actually complete; admin overrode it. ``payment_ready`` is
+        # set on the same forced-status branch in
+        # _documents_upload_loop_await, so this route catches the
+        # override and bypasses both ``documents_complete`` and the
+        # short-circuited ``payment_wait_await`` stop.
+        if state.payment_ready or state.journey_status in {
             JourneyStatus.QUALIFIED,
             JourneyStatus.ACCEPTED,
             JourneyStatus.OFFER_ACCEPTED,
             JourneyStatus.ACTIVATED,
         }:
+            return "payment"
+        # Natural completion path: the SME uploaded every required doc.
+        # The coffee message IS accurate here, so the original flow
+        # (documents_complete → payment_wait_await → trigger) stays.
+        if not state.missing_documents:
             return "complete"
         return "await_again"
 

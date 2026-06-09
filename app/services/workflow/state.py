@@ -124,6 +124,13 @@ class OnboardingState(WorkflowState):
     documents_received: bool = False
     buyers: list[dict[str, Any]] = []
     shareholders: list[dict[str, Any]] = []
+    # Bug #11 (UAT 2026-06-09): debounce the ``documents.processing`` ack
+    # so the bridge's per-file POST burst (one inbound per ZIP-member,
+    # 8+ messages in a few seconds) doesn't spam the user with 8 copies
+    # of "📦 Got it — processing your documents now…". Stores the ISO
+    # timestamp of the last processing ack; the docs node only re-fires
+    # the ack when the previous one is older than DOCS_PROCESSING_ACK_TTL.
+    documents_processing_ack_at: str | None = None
 
     # Postman-triggered gates (demo): the pre-qualification result (after the
     # audited report) and the payment step (after the coffee message) are each

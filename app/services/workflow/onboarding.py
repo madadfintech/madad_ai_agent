@@ -74,6 +74,7 @@ import io
 import os
 import re
 import zipfile
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -480,6 +481,23 @@ def _parse_shareholder_text(text: str, fallback_phone: str | None) -> list[dict[
     if not name:
         name = first_line
     return [{"name": name, "phoneNumber": fallback_phone or "+97400000000"}]
+
+
+# Bug #11 (UAT 2026-06-09): debounce window for the documents.processing
+# ack. Madad's bridge POSTs each ZIP-member as a separate inbound; without
+# the debounce we sent 8 "📦 Got it — processing your documents now…"
+# messages in 3 seconds. 30s covers a typical multi-file burst plus a small
+# buffer; anything older is treated as a fresh batch and re-fires the ack.
+DOCS_PROCESSING_ACK_TTL_SECONDS = 30.0
+
+
+def _parse_iso_or_none(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
 
 DEFAULT_WHATSAPP_REQUIRED_DOCS = [
@@ -1835,10 +1853,24 @@ class OnboardingWorkflow(WorkflowDefinition):
         # tens of seconds; mirrors the CR ack so the SME never sits in
         # silence. The ack itself is wrapped — its failure must not regress
         # the upload pipeline below.
-        try:
-            await self._send(ctx, state, "onboarding.documents.processing")
-        except Exception as exc:  # noqa: BLE001
-            ctx.logger.warning("documents_processing_ack.failed", error=str(exc)[:200])
+        #
+        # Bug #11 (UAT 2026-06-09): debounce — Madad's bridge POSTs each
+        # ZIP-member as a SEPARATE inbound (8+ messages in a few seconds
+        # for a typical doc batch). Without the debounce the SME saw the
+        # ack 8 times in a row. Re-fire only if the previous ack is older
+        # than DOCS_PROCESSING_ACK_TTL_SECONDS.
+        now = ctx.clock.now()
+        prior_ack = _parse_iso_or_none(state.documents_processing_ack_at)
+        ack_age = (now - prior_ack).total_seconds() if prior_ack else None
+        processing_ack_at: str | None = state.documents_processing_ack_at
+        if ack_age is None or ack_age >= DOCS_PROCESSING_ACK_TTL_SECONDS:
+            try:
+                await self._send(ctx, state, "onboarding.documents.processing")
+                processing_ack_at = now.isoformat()
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "documents_processing_ack.failed", error=str(exc)[:200]
+                )
         # A7 (Ishan 2026-06-07): ZIP attachments now route through the
         # backend's ``classify_and_upload_zip_base64`` tool. The backend
         # unzips server-side, classifies every member, and returns the
@@ -2040,6 +2072,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             access_token=token,
             refresh_token=refresh,
             token_expires_at=expires,
+            documents_processing_ack_at=processing_ack_at,
         )
 
     async def _acknowledge_uploads(

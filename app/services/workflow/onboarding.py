@@ -2080,10 +2080,14 @@ class OnboardingWorkflow(WorkflowDefinition):
                 unprocessed.append(doc_type)
         # Acknowledge exactly what landed: ✅ per accepted document, ⏳ per one we
         # received but couldn't auto-validate (kept honest — no false ✅). A ZIP
-        # gets the "📦 Extracting…" header; loose files just get their lines. The
-        # lenient coffee message follows in documents_complete.
+        # gets the "📦 Extracting…" header; loose files just get their lines.
+        # The full cumulative checklist (Bug #14, UAT 2026-06-09) is rendered
+        # right after so the SME always sees what's done and what's still
+        # needed — never just the latest batch in isolation.
         await self._acknowledge_uploads(
-            ctx, state, validated, unprocessed, saw_zip=saw_zip
+            ctx, state, validated, unprocessed,
+            saw_zip=saw_zip,
+            missing_after=list(pending),
         )
         # Remaining = required docs this batch did not land. Tracked locally so
         # generic-filename uploads reliably complete the checklist (we do not
@@ -2113,17 +2117,44 @@ class OnboardingWorkflow(WorkflowDefinition):
         unprocessed: list[str],
         *,
         saw_zip: bool,
+        missing_after: list[str],
     ) -> None:
-        """Send the per-document checklist for this upload batch.
+        """Send the per-document receipt for this batch + the FULL cumulative
+        checklist state.
 
-        ✅ for docs the backend accepted; ⏳ for ones we received but couldn't
-        auto-validate — honest, never a false ✅.
+        Bug #14 (UAT 2026-06-09): per the spec (page 3-4, Sample Checklist
+        State + ZIP-received example), after every upload the SME must see
+        BOTH what landed in this batch AND the running list of what's still
+        needed — never just the latest receipts in isolation. Prior to this
+        an SME who uploaded everything except QID had no way to know QID
+        was still missing.
+
+        Layout:
+          {batch receipts — ✅/⏳ for this turn}
+          📋 Application checklist:
+            ✅ <every cumulatively validated doc>
+            ⚠️ <every still-needed doc>
+          📤 Please share the remaining N document(s) to move forward.
+
+        When the checklist becomes empty the footer is suppressed — the
+        ``documents_complete`` node fires the coffee message right after.
         """
 
-        if not validated and not unprocessed:
-            # Bug #1b (2026-06-09): we received an attachment but nothing
-            # made it past the classifier — send an honest fallback so
-            # the SME knows to retry, never silently drop.
+        def _label(doc: str) -> str:
+            return DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title())
+
+        # Cumulative state derived from the post-update pending list and
+        # the canonical required set. Order preserved from the required
+        # list so the SME sees the same order every turn.
+        all_required = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+        still_missing = list(missing_after)
+        already_validated = [d for d in all_required if d not in still_missing]
+
+        # Bug #1b (2026-06-09): if literally NOTHING has ever validated
+        # AND this batch produced nothing either, the upload genuinely
+        # failed end-to-end — send the honest "couldn't process" fallback
+        # so the SME knows to retry.
+        if not validated and not unprocessed and not already_validated:
             try:
                 await self._send(ctx, state, "onboarding.documents.upload_failed")
             except Exception as exc:  # noqa: BLE001
@@ -2132,21 +2163,46 @@ class OnboardingWorkflow(WorkflowDefinition):
                 )
             return
 
-        def _label(doc: str) -> str:
-            return DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title())
-
-        rows = [f"✅ {_label(doc)} — Received & Validated" for doc in validated]
-        rows += [
-            f"⏳ {_label(doc)} — received, our team will review it"
-            for doc in unprocessed
+        # Batch receipts (this turn only) — keep concise so the SME sees
+        # what just landed before the broader status view.
+        batch_rows = [f"✅ {_label(d)} — Received & Validated" for d in validated]
+        batch_rows += [
+            f"⏳ {_label(d)} — received, our team will review it"
+            for d in unprocessed
         ]
-        lines = "\n".join(rows)
+        batch_summary = "\n".join(batch_rows)
+
+        # Cumulative checklist body — every required doc with its current
+        # status. ✅ for done, ⚠️ for still needed.
+        checklist_rows = [f"✅ {_label(d)}" for d in already_validated]
+        checklist_rows += [f"⚠️ {_label(d)} — still needed" for d in still_missing]
+        checklist_body = "📋 Application checklist:\n" + "\n".join(checklist_rows)
+
+        # Footer — only when something is still missing. The coffee
+        # message in documents_complete handles the all-done case.
+        if still_missing:
+            noun = "document" if len(still_missing) == 1 else "documents"
+            footer = (
+                f"\n\n📤 Please share the remaining {len(still_missing)} "
+                f"{noun} to move forward."
+            )
+        else:
+            footer = ""
+
+        if batch_summary:
+            body = f"{batch_summary}\n\n{checklist_body}{footer}"
+        else:
+            # Edge: every upload in this batch was a duplicate of an
+            # already-validated doc → no new batch_summary. Still show
+            # the checklist state so the SME isn't left wondering.
+            body = f"{checklist_body}{footer}"
+
         template_key = (
             "onboarding.documents.zip_received"
             if saw_zip
             else "onboarding.documents.single_received"
         )
-        await self._send(ctx, state, template_key, {"results": lines})
+        await self._send(ctx, state, template_key, {"results": body})
 
     async def _documents_complete(
         self, state: OnboardingState, ctx: WorkflowContext

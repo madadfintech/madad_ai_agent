@@ -198,13 +198,12 @@ _TEMPLATE_BODIES = {
     "onboarding.cr.received": (
         "📄 Got your CR — processing it now…"
     ),
-    # Immediate ack on any document upload in the post-prequal docs loop —
-    # mirrors onboarding.cr.received so a slow ZIP / classify call never
-    # leaves the SME staring at silence (QA blocker, same shape as Bug #1).
+    # Immediate ack on any document upload in the post-prequal docs loop.
+    # Rewritten 2026-06-09 (UAT feedback): the previous copy assumed the
+    # SME sent a ZIP and was wordy / unprofessional. Now generic, short,
+    # and channel-agnostic so it fits both single-file and ZIP uploads.
     "onboarding.documents.processing": (
-        "📦 Got it — processing your documents now. This can take a moment "
-        "for a ZIP. I'll send you the per-document checklist as soon as "
-        "it's ready."
+        "📄 Got it — validating your document(s) now…"
     ),
     # Final fallback sent at the end of the docs loop when neither the
     # classifier nor the local-unzip pipeline could land a single file the

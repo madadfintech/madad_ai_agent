@@ -74,12 +74,18 @@ def test_full_flow_over_http() -> None:
     )
     assert advanced.json()["prompt"]["step"] == "documents"
 
-    docs = _inbound(
+    # Bug #10a (2026-06-09): the docs loop is strict — one upload is the
+    # SME's contribution, the admin-reviewed webhook then advances the
+    # journey. Mirrors the production "admin signed off" path.
+    _inbound(
         attachments=[
-            {"filename": "Trade_License.pdf", "content_base64": DOC},
-            {"filename": "Tax_Card.pdf", "content_base64": DOC},
-            {"filename": "Bank_Statement.pdf", "content_base64": DOC},
+            {"filename": "Establishment_Card.pdf", "content_base64": DOC}
         ]
+    )
+    docs = _backend_event(
+        "documents.completed",
+        payload={"journey_status": "QUALIFIED"},
+        event_id="evt-docs-reviewed",
     )
     # After docs the workflow PARKs at payment_wait (not journey_wait — main
     # restructured the flow so payment gate fires off madad_score.ready /

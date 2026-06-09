@@ -166,9 +166,36 @@ def reply_attachments(value: Any) -> list[dict[str, Any]]:
     return []
 
 
+_YES_TOKENS = frozenset(
+    {
+        # English
+        "YES", "Y", "YEAH", "YEP", "YUP", "YA", "YEAHH",
+        "YESS", "YESSS", "YES!", "YES PLEASE", "YES PLS",
+        "OK", "OKAY", "OKEY", "K", "KK", "KAY",
+        "SURE", "SURELY", "ABSOLUTELY", "DEFINITELY", "OFCOURSE",
+        "OF COURSE", "FINE", "ALRIGHT", "ALRITE", "AGREED", "AGREE",
+        "DO IT", "GO AHEAD", "GO ON", "LET'S GO", "LETS GO",
+        "PROCEED", "CONTINUE", "I AGREE", "SOUNDS GOOD", "GOOD",
+        "👍", "✅", "👌",
+        # Arabic — kept from the original set
+        "نعم", "اوكي", "حسنا",
+    }
+)
+
+_NO_TOKENS = frozenset(
+    {
+        "NO", "N", "NOPE", "NOPES", "NAH", "NA",
+        "NOT NOW", "NOT INTERESTED", "NEVER MIND", "NEVERMIND",
+        "DON'T", "DONT", "STOP", "CANCEL", "DECLINE", "REJECT",
+        "DISAGREE", "I DISAGREE", "👎", "❌",
+        "لا",
+    }
+)
+
+
 def is_yes(value: Any) -> bool:
-    return reply_text(value).upper() in {"YES", "Y", "نعم"}
+    return reply_text(value).upper() in _YES_TOKENS
 
 
 def is_no(value: Any) -> bool:
-    return reply_text(value).upper() in {"NO", "N", "لا"}
+    return reply_text(value).upper() in _NO_TOKENS

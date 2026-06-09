@@ -191,6 +191,20 @@ PORTAL_KEYWORDS = (
     "madad id",
     "application id",
     "reference",
+    # Bug #7+#8 (2026-06-09): natural portal queries the QA testers
+    # actually wrote ("how do I login to madadfintech?") were falling
+    # through to the generic fallback because none of the original
+    # keywords matched. Widen the net.
+    "login",
+    "log in",
+    "logging in",
+    "sign in",
+    "signin",
+    "website",
+    "madadfintech",
+    "madad fintech",
+    "madad.com",
+    "madadfintech.com",
 )
 
 CASUAL_KEYWORDS = (
@@ -1834,8 +1848,15 @@ class OnboardingWorkflow(WorkflowDefinition):
         # The previous local-unzipping path stays as a fallback for when
         # the backend tool errors.
         pending: list[str] = list(state.missing_documents)
-        validated: list[str] = []  # uploaded + accepted by backend → ✅
-        unprocessed: list[str] = []  # backend rejected / no token → ⏳ honest
+        # Bug #10b (2026-06-09): snapshot the set we ASKED the SME for so a
+        # classifier mis-label (e.g. backend tagged a passport as CR — Madad
+        # QA screenshot 2026-06-09) cannot legitimize an unrelated upload
+        # as a ✅ validated entry. Only docs that were on this batch's
+        # pending list earn the ✅; anything else lands as ⏳ "received,
+        # team will review" — honest, never a false validation.
+        expected: set[str] = set(pending)
+        validated: list[str] = []  # uploaded + classified into expected → ✅
+        unprocessed: list[str] = []  # uploaded but off-checklist / failed → ⏳
         saw_zip = False
 
         # Mint a live backend token from the verified WhatsApp identity. A run
@@ -1903,10 +1924,16 @@ class OnboardingWorkflow(WorkflowDefinition):
                 if not isinstance(backend_type, str) or not backend_type:
                     continue
                 zip_doc_type = _workflow_doc_type(backend_type)
-                if zip_doc_type in pending:
-                    pending.remove(zip_doc_type)
-                if zip_doc_type not in validated:
-                    validated.append(zip_doc_type)
+                # Bug #10b: only docs that match the asked-for list earn ✅;
+                # otherwise show ⏳ so a classifier mislabel never claims a
+                # checklist slot the SME hasn't actually filled.
+                if zip_doc_type in expected:
+                    if zip_doc_type in pending:
+                        pending.remove(zip_doc_type)
+                    if zip_doc_type not in validated:
+                        validated.append(zip_doc_type)
+                elif zip_doc_type not in unprocessed:
+                    unprocessed.append(zip_doc_type)
 
         # Pass 2 — non-ZIP attachments (and any ZIP that fell back to local).
         for att in non_zip:
@@ -1949,18 +1976,22 @@ class OnboardingWorkflow(WorkflowDefinition):
                         error=str(exc)[:200],
                         note="staging-tolerant: continuing without this doc",
                     )
-            # Fall back to the filename inference / pending hint when the
-            # classifier didn't return a usable type (rare — happens when
-            # the backend stores as ADDITIONAL_DOCUMENT). This keeps the
-            # missing-docs accounting honest without dropping the file.
+            # Fall back to filename inference when the classifier returns
+            # nothing (rare — happens when the backend stores as
+            # ADDITIONAL_DOCUMENT). The old code also did a pending[0]
+            # legitimization which Bug #10b proved dangerous (any file
+            # would claim the next checklist slot regardless of content),
+            # so that path is gone.
             doc_type: str | None = resolved_doc_type
             if not doc_type:
                 doc_type = att.get("document_type") or _infer_doc_type(filename)
-            if not doc_type and pending:
-                doc_type = pending[0]
             if not doc_type:
                 continue
-            if uploaded_ok:
+            # Bug #10b: only docs on the asked-for list earn ✅. Backend
+            # picked a wrong type? → land as ⏳ "received, team will
+            # review". The SME sees an honest receipt, never a false
+            # validation that fast-forwards the checklist.
+            if uploaded_ok and doc_type in expected:
                 if doc_type in pending:
                     pending.remove(doc_type)
                 if doc_type not in validated:
@@ -2088,12 +2119,18 @@ class OnboardingWorkflow(WorkflowDefinition):
                 prequalified=True,
                 onboarding_progress_step=progress_step or state.onboarding_progress_step,
             )
-        await self._smart_contextual(
+        # Bug #7+#8 (2026-06-09): intent-route every off-script reply so each
+        # type of question gets a meaningful answer instead of the same
+        # canned "still pending" fallback every time the LLM is unavailable
+        # (OpenAI 401 in QA showed this clearly).
+        await self._contextual_off_script(
             ctx,
             state,
             payload,
-            "Thanks! 🙌 Your pre-qualification result will be ready soon — I’ll "
-            "share your document checklist here the moment it’s confirmed.",
+            default_answer=(
+                "Thanks! 🙌 Your pre-qualification result will be ready soon — "
+                "I’ll share your document checklist here the moment it’s confirmed."
+            ),
         )
         return self._step("prequalify_wait_await", ctx, prequalified=False)
 
@@ -2111,12 +2148,14 @@ class OnboardingWorkflow(WorkflowDefinition):
                 payment_ready=True,
                 **({"madad_score": score} if score is not None else {}),
             )
-        await self._smart_contextual(
+        await self._contextual_off_script(
             ctx,
             state,
             payload,
-            "You’re all set — our team is finalising your assessment. I’ll share "
-            "your Madad score and the next step here shortly. 🙂",
+            default_answer=(
+                "You’re all set — our team is finalising your assessment. I’ll "
+                "share your Madad score and the next step here shortly. 🙂"
+            ),
         )
         return self._step("payment_wait_await", ctx, payment_ready=False)
 
@@ -2807,9 +2846,24 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "received" if state.shareholders else "missing"
 
     def _route_documents(self, state: OnboardingState) -> str:
-        # Lenient: SMEs send many docs at once and won't upload every item, so as
-        # soon as ANY document arrives we move on ("our team will review them").
-        return "complete" if state.documents_received else "await_again"
+        # Bug #10a (2026-06-09): the prior "any upload completes the loop"
+        # mode marked the SME done after a single (and often misclassified)
+        # upload — QA screenshot 2026-06-09 showed a passport→CR mislabel
+        # fast-forwarding past 11 still-missing docs into "🎊 all
+        # documents received". Strict gating now: stay parked until either
+        # (a) the asked-for checklist is exhausted, or (b) the backend
+        # explicitly advanced the journey past pre-qualification (admin
+        # waived the rest via webhook).
+        if not state.missing_documents:
+            return "complete"
+        if state.journey_status in {
+            JourneyStatus.QUALIFIED,
+            JourneyStatus.ACCEPTED,
+            JourneyStatus.OFFER_ACCEPTED,
+            JourneyStatus.ACTIVATED,
+        }:
+            return "complete"
+        return "await_again"
 
     def _route_prequalify_wait(self, state: OnboardingState) -> str:
         return "go" if state.prequalified else "wait"
@@ -2987,6 +3041,62 @@ class OnboardingWorkflow(WorkflowDefinition):
         if parts:
             return parts[0], ""
         return "", ""
+
+    async def _contextual_off_script(
+        self,
+        ctx: WorkflowContext,
+        state: OnboardingState,
+        reply: Any,
+        *,
+        default_answer: str,
+    ) -> None:
+        """Bug #7+#8 (2026-06-09): route off-script chat by intent BEFORE
+        falling back to the LLM/canned line.
+
+        QA reported every question while parked at prequal_wait /
+        payment_wait got the SAME generic reply (the OpenAI key was 401-ing
+        so the canned fallback fired every time). The wait nodes already
+        own typed answers (``_safe_status_answer`` / ``_safe_portal_answer``
+        / off-script help templates) — wire them in first so a status
+        question gets a status answer even with the LLM offline."""
+
+        help_template = _off_script_template(reply)
+        if help_template is not None:
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": self._answer_for(help_template),
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return
+        if _is_portal_query(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": await self._safe_portal_answer(state),
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return
+        if _is_status_query(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": await self._safe_status_answer(state),
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return
+        # Fall through to the smart/LLM path with the wait-node-specific
+        # canned line; preserves the existing UX when intent isn't typed.
+        await self._smart_contextual(ctx, state, reply, default_answer)
 
     async def _smart_contextual(
         self,

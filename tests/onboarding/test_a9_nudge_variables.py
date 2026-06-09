@@ -21,17 +21,15 @@ async def _drive_to_payment_send(harness, identity: str):
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
+    # Bug #10a (2026-06-09): strict docs loop — one upload + admin webhook
+    # to exit, then a separate event to trigger the payment chain.
     await resume(
-        {
-            "attachments": [
-                {"filename": "Trade_License.pdf", "content_base64": doc},
-                {"filename": "Tax_Card.pdf", "content_base64": doc},
-            ]
-        }
+        {"attachments": [{"filename": "Establishment_Card.pdf", "content_base64": doc}]}
     )
-    harness.identity.journey_status = "PRE_QUALIFIED"
+    await resume({"event": "documents.completed", "journey_status": "QUALIFIED"})
+    harness.identity.journey_status = "QUALIFIED"
     return await resume(
-        {"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"}
+        {"event": "madad_score.ready", "journey_status": "QUALIFIED"}
     )
 
 

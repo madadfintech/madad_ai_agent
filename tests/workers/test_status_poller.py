@@ -139,18 +139,14 @@ async def _drive_to_journey_wait(platform, identity: str) -> None:
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
+    # Bug #10a (2026-06-09): docs loop is strict — one valid upload +
+    # admin-webhook exit, then madad_score.ready triggers payment.
     await resume(
-        {
-            "attachments": [
-                {"filename": "Trade_License.pdf", "content_base64": doc},
-                {"filename": "Tax_Card.pdf", "content_base64": doc},
-            ]
-        }
+        {"attachments": [{"filename": "Establishment_Card.pdf", "content_base64": doc}]}
     )
-    # Release the payment gate so the workflow advances through the payment
-    # chain to lender_wait_await — that's where last_polled_at is set.
-    platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
-    await resume({"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"})
+    await resume({"event": "documents.completed", "journey_status": "QUALIFIED"})
+    platform.workflow._identity.journey_status = "QUALIFIED"  # type: ignore[union-attr]
+    await resume({"event": "madad_score.ready", "journey_status": "QUALIFIED"})
     await resume({"type": "payment", "paid": True})
 
 

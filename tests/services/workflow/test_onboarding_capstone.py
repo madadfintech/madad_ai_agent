@@ -214,20 +214,24 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": "QkE="}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": "QkE="}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
-    docs_done = await resume(
+    # Bug #10a (2026-06-09): docs loop is strict — one valid upload, then
+    # admin-webhook exit, then madad_score.ready triggers payment chain.
+    await resume(
         {
             "attachments": [
-                {"filename": "Trade_License.pdf", "content_base64": "QkE="},
-                {"filename": "Tax_Card.pdf", "content_base64": "QkE="},
+                {"filename": "Establishment_Card.pdf", "content_base64": "QkE="},
             ]
         }
+    )
+    docs_done = await resume(
+        {"event": "documents.completed", "journey_status": "QUALIFIED"}
     )
     assert docs_done.prompt == {"waiting_for": "payment_ready", "step": "payment_wait"}
 
     # Backend fires the payment-gate trigger → payment chain → payment_await.
-    backend_state["journey_status"] = "PRE_QUALIFIED"
+    backend_state["journey_status"] = "QUALIFIED"
     pay_prompt = await resume(
-        {"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"}
+        {"event": "madad_score.ready", "journey_status": "QUALIFIED"}
     )
     assert pay_prompt.prompt == {"waiting_for": "payment", "step": "payment"}
 

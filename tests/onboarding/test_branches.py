@@ -39,11 +39,10 @@ async def test_domain_blocked_terminal_for_corporate_email(make_harness):
 # happens inline via consent_await without surfacing an explicit
 # "ineligible" terminal.
 
-# NOTE: test_missing_documents_loops_until_complete was deleted — main's
-# _route_documents is now LENIENT (returns "complete" as soon as ANY
-# attachment lands), per "fix(workflow): docs step is lenient — proceed
-# to coffee after any 1 upload" (commit d01a0e5). The missing-docs loop
-# behaviour no longer exists.
+# NOTE: test_missing_documents_loops_until_complete was reinstated by
+# Bug #10a (2026-06-09) — _route_documents is no longer lenient. A single
+# upload no longer completes the loop; tests that don't care about the
+# loop's per-doc behaviour fast-forward via a forward-status webhook.
 
 
 async def _drive_to_payment(harness):
@@ -59,18 +58,12 @@ async def _drive_to_payment(harness):
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
-    await resume(
-        {
-            "attachments": [
-                {"filename": "Trade_License.pdf", "content_base64": doc},
-                {"filename": "Tax_Card.pdf", "content_base64": doc},
-            ]
-        }
-    )
-    # Release payment gate
-    harness.identity.journey_status = "PRE_QUALIFIED"
+    # Bug #10a (2026-06-09): docs loop is strict — exit via admin-webhook
+    # fast-forward, then trigger payment with a separate event.
+    await resume({"event": "documents.completed", "journey_status": "QUALIFIED"})
+    harness.identity.journey_status = "QUALIFIED"
     return await resume(
-        {"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"}
+        {"event": "madad_score.ready", "journey_status": "QUALIFIED"}
     )
 
 

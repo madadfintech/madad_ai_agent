@@ -119,20 +119,25 @@ async def test_document_status_query_does_not_complete_or_reprompt_missing(harne
     assert "onboarding.documents.complete" not in templates
 
 
-async def test_single_document_upload_completes_lenient(harness):
+async def test_single_document_upload_parks_in_loop(harness):
+    """Bug #10a (2026-06-09): a single (typically misclassified) upload no
+    longer completes the docs loop. QA saw "🎊 all documents received"
+    fire after one passport upload that the backend tagged as CR — the
+    "lenient" route is gone; the loop now stays parked until the asked-
+    for checklist is exhausted OR a forward-status webhook lands."""
+
     runtime = harness.platform.runtime
     await _drive_to_documents(harness, runtime)
 
-    # Lenient: one uploaded file completes the document phase and sends the
-    # "documents complete" (coffee) message rather than re-listing what's left.
-    await runtime.resume(
+    result = await runtime.resume(
         WA,
         IDENTITY,
         message={"attachments": [{"filename": "IMG-001.jpg", "content_base64": DOC}]},
     )
 
+    assert result.prompt == {"waiting_for": "upload", "step": "documents"}
     templates = harness.messenger.templates()
-    assert "onboarding.documents.complete" in templates
+    assert "onboarding.documents.complete" not in templates
 
 
 async def test_cr_upload_asks_for_financials_not_questionnaire(harness):
@@ -159,10 +164,13 @@ async def test_payment_gate_waits_for_trigger(harness):
 
     runtime = harness.platform.runtime
     await _drive_to_documents(harness, runtime)
+    # Bug #10a (2026-06-09): fast-forward past the (now-strict) docs loop
+    # via a forward-status webhook — same admin advance flow production
+    # uses when docs are reviewed off-band.
     await runtime.resume(
         WA,
         IDENTITY,
-        message={"attachments": [{"filename": "IMG-001.jpg", "content_base64": DOC}]},
+        message={"event": "documents.reviewed", "journey_status": "QUALIFIED"},
     )
 
     # Parked after coffee — a chat message must NOT trigger payment.

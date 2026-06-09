@@ -58,18 +58,20 @@ async def test_onboarding_drives_real_communication_and_nudge():
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
+    # Bug #10a (2026-06-09): docs loop is strict — one upload + admin-
+    # webhook exit, then madad_score.ready triggers payment.
     await resume(
         {
             "attachments": [
-                {"filename": "Trade_License.pdf", "content_base64": doc},
-                {"filename": "Tax_Card.pdf", "content_base64": doc},
+                {"filename": "Establishment_Card.pdf", "content_base64": doc},
             ]
         }
     )
+    await resume({"event": "documents.completed", "journey_status": "QUALIFIED"})
 
     # Advance backend through payment_wait → payment → lender_wait → offers.
-    platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
-    await resume({"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"})
+    platform.workflow._identity.journey_status = "QUALIFIED"  # type: ignore[union-attr]
+    await resume({"event": "madad_score.ready", "journey_status": "QUALIFIED"})
     await resume({"type": "payment", "paid": True})
     platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
     result = await resume({"type": "status_update"})

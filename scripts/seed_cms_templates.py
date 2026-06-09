@@ -198,6 +198,22 @@ _TEMPLATE_BODIES = {
     "onboarding.cr.received": (
         "📄 Got your CR — processing it now…"
     ),
+    # Immediate ack on any document upload in the post-prequal docs loop —
+    # mirrors onboarding.cr.received so a slow ZIP / classify call never
+    # leaves the SME staring at silence (QA blocker, same shape as Bug #1).
+    "onboarding.documents.processing": (
+        "📦 Got it — processing your documents now. This can take a moment "
+        "for a ZIP. I'll send you the per-document checklist as soon as "
+        "it's ready."
+    ),
+    # Final fallback sent at the end of the docs loop when neither the
+    # classifier nor the local-unzip pipeline could land a single file the
+    # backend accepted. Keeps the SME informed instead of dropping silent.
+    "onboarding.documents.upload_failed": (
+        "I received your file(s) but couldn't process them right now. "
+        "Please resend any failed documents as separate PDF/photo uploads, "
+        "or call 72773652 if it keeps happening."
+    ),
     "onboarding.status.pending": (
         "Hi! Your application is currently under review with Madad. 👍\n\n"
         "I'll notify you as soon as the next update is available. You can also "

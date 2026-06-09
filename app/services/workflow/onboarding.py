@@ -67,6 +67,7 @@ between turns.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import io
@@ -124,6 +125,8 @@ TEMPLATE_KEYS = [
     "onboarding.documents.complete",
     "onboarding.upload.required",
     "onboarding.cr.received",
+    "onboarding.documents.processing",
+    "onboarding.documents.upload_failed",
     "onboarding.status.pending",
     "onboarding.payment.awaiting",
     "onboarding.payment.confirmed",
@@ -1813,6 +1816,15 @@ class OnboardingWorkflow(WorkflowDefinition):
                 missing_documents=list(state.missing_documents),
                 documents_received=False,
             )
+        # Bug #1b (2026-06-09): immediate ack the instant valid attachments
+        # land — large ZIPs can keep the classify+upload chain busy for
+        # tens of seconds; mirrors the CR ack so the SME never sits in
+        # silence. The ack itself is wrapped — its failure must not regress
+        # the upload pipeline below.
+        try:
+            await self._send(ctx, state, "onboarding.documents.processing")
+        except Exception as exc:  # noqa: BLE001
+            ctx.logger.warning("documents_processing_ack.failed", error=str(exc)[:200])
         # A7 (Ishan 2026-06-07): ZIP attachments now route through the
         # backend's ``classify_and_upload_zip_base64`` tool. The backend
         # unzips server-side, classifies every member, and returns the
@@ -1846,10 +1858,19 @@ class OnboardingWorkflow(WorkflowDefinition):
                 non_zip.append(att)
                 continue
             try:
-                zip_response = await self._kyc.classify_and_upload_zip_base64(
-                    access_token=token,
-                    content_base64=att.get("content_base64") or "",
-                    filename=att.get("filename") or "",
+                # Hard wall-clock cap so a hung Cloud-Run ZIP processor
+                # can't trap the node behind the workflow runtime's own
+                # 60s-per-attempt budget (Bug #1b 2026-06-09 forensic:
+                # one ZIP call hung 3 minutes before the run timed out
+                # silently). 25s is enough for normal traffic and falls
+                # back to the local-unzip + per-file path on overrun.
+                zip_response = await asyncio.wait_for(
+                    self._kyc.classify_and_upload_zip_base64(
+                        access_token=token,
+                        content_base64=att.get("content_base64") or "",
+                        filename=att.get("filename") or "",
+                    ),
+                    timeout=25.0,
                 )
             except Exception as exc:  # noqa: BLE001 — fall back to local unzip
                 ctx.logger.warning(
@@ -1900,11 +1921,17 @@ class OnboardingWorkflow(WorkflowDefinition):
             resolved_doc_type: str | None = None
             if token:
                 try:
-                    classify_response = await self._kyc.classify_and_upload_document_base64(
-                        access_token=token,
-                        content_base64=att.get("content_base64") or "",
-                        filename=filename,
-                        mime_type=att.get("mime_type"),
+                    # Same wall-clock cap as the ZIP path — a single hung
+                    # classify call must not be allowed to time out the
+                    # whole node (Bug #1b 2026-06-09).
+                    classify_response = await asyncio.wait_for(
+                        self._kyc.classify_and_upload_document_base64(
+                            access_token=token,
+                            content_base64=att.get("content_base64") or "",
+                            filename=filename,
+                            mime_type=att.get("mime_type"),
+                        ),
+                        timeout=25.0,
                     )
                     uploaded_ok = True
                     if isinstance(classify_response, dict):
@@ -1982,6 +2009,15 @@ class OnboardingWorkflow(WorkflowDefinition):
         """
 
         if not validated and not unprocessed:
+            # Bug #1b (2026-06-09): we received an attachment but nothing
+            # made it past the classifier — send an honest fallback so
+            # the SME knows to retry, never silently drop.
+            try:
+                await self._send(ctx, state, "onboarding.documents.upload_failed")
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "documents_upload_failed_ack.failed", error=str(exc)[:200]
+                )
             return
 
         def _label(doc: str) -> str:

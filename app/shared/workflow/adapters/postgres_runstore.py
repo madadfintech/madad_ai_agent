@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import String, select
+from sqlalchemy import String, delete, select
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.shared.db import Base, Database
@@ -113,6 +113,37 @@ class PostgresWorkflowRunStore(WorkflowRunStore):
                     data=entry.model_dump(mode="json"),
                 )
             )
+
+    async def delete_by_session(self, session_id: str) -> list[str]:
+        async with self._db.session() as session:
+            # Pull every run row for this session, capture their thread ids
+            # so the caller can purge LangGraph checkpoints, then delete the
+            # rows + their audit trail in the same transaction.
+            rows = (
+                await session.execute(
+                    select(WorkflowRunRow).where(
+                        WorkflowRunRow.data["session_id"].astext == session_id
+                    )
+                )
+            ).scalars().all()
+            if not rows:
+                return []
+            thread_ids: list[str] = []
+            run_ids: list[str] = []
+            for row in rows:
+                run_ids.append(row.run_id)
+                tid = row.data.get("thread_id") if isinstance(row.data, dict) else None
+                if isinstance(tid, str) and tid:
+                    thread_ids.append(tid)
+            await session.execute(
+                delete(WorkflowRunAuditRow).where(
+                    WorkflowRunAuditRow.run_id.in_(run_ids)
+                )
+            )
+            await session.execute(
+                delete(WorkflowRunRow).where(WorkflowRunRow.run_id.in_(run_ids))
+            )
+        return thread_ids
 
     async def list_audit(self, run_id: str) -> list[AuditEntry]:
         async with self._db.session() as session:

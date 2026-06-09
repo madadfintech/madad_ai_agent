@@ -146,3 +146,16 @@ class SessionManager:
     async def expire(self, session: Session) -> Session:
         session.status = SessionStatus.EXPIRED
         return await self._store.save(session)
+
+    async def forget(self, channel: Channel, identity: str) -> bool:
+        """Delete the session record for a channel-identity pair.
+
+        Returns True when a session existed and was removed, False when
+        nothing was stored — used by the admin reset endpoint so the SME
+        starts the next inbound from a clean slate.
+        """
+
+        session_id = derive_session_id(channel, identity)
+        existed = await self._store.get(session_id) is not None
+        await self._store.delete(session_id)
+        return existed

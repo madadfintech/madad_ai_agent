@@ -96,6 +96,15 @@ class WorkflowRunStore(ABC):
     @abstractmethod
     async def list_audit(self, run_id: str) -> list[AuditEntry]: ...
 
+    @abstractmethod
+    async def delete_by_session(self, session_id: str) -> list[str]:
+        """Delete every run (and its audit) for a given session.
+
+        Returns the list of LangGraph ``thread_id`` values that were
+        purged so the caller can clear their checkpoint state.
+        Idempotent — returns ``[]`` when no runs exist for the session.
+        """
+
 
 class InMemoryWorkflowRunStore(WorkflowRunStore):
     """Thread/async-safe in-memory implementation for tests and dev."""
@@ -167,3 +176,14 @@ class InMemoryWorkflowRunStore(WorkflowRunStore):
     async def list_audit(self, run_id: str) -> list[AuditEntry]:
         async with self._lock:
             return [e.model_copy(deep=True) for e in self._audit.get(run_id, [])]
+
+    async def delete_by_session(self, session_id: str) -> list[str]:
+        async with self._lock:
+            doomed = [
+                r for r in self._runs.values() if r.session_id == session_id
+            ]
+            thread_ids = [r.thread_id for r in doomed]
+            for r in doomed:
+                self._runs.pop(r.run_id, None)
+                self._audit.pop(r.run_id, None)
+        return thread_ids

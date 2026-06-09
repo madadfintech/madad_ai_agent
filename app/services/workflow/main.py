@@ -236,6 +236,60 @@ async def madad_event(
     return RunStatusDTO.from_result(result)
 
 
+class ForgetSessionRequest(BaseModel):
+    channel: Channel
+    identity: str
+
+
+class ForgetSessionResponse(BaseModel):
+    session_cleared: bool
+    deleted_runs: int
+    deleted_checkpoint_threads: int
+    thread_ids: list[str] = Field(default_factory=list)
+
+
+@app.post(
+    "/workflow/admin/forget-session",
+    response_model=ForgetSessionResponse,
+)
+async def forget_session(
+    req: ForgetSessionRequest, platform: Platform
+) -> ForgetSessionResponse:
+    """Clear all conversation state for a channel-identity.
+
+    Per Ishan's handover §10 (2026-06-09): the agent owns three stores
+    (``workflow.runs`` + LangGraph checkpoints + Redis session). Backend
+    DB wipes alone leave a parked run resuming stale, so this one-call
+    reset is required for clean QA re-runs.
+
+    Admin-token auth (the bearer used for every workflow API). Idempotent
+    — returns zeros when no state existed for the identity.
+    """
+
+    runtime = platform.runtime
+    from app.shared.workflow.utils import derive_session_id
+
+    session_id = derive_session_id(req.channel, req.identity)
+    thread_ids = await runtime.run_store.delete_by_session(session_id)
+
+    saver = runtime.checkpointer.get()
+    cleared_threads = 0
+    for tid in thread_ids:
+        try:
+            await saver.adelete_thread(tid)
+            cleared_threads += 1
+        except Exception:  # noqa: BLE001 — best-effort, runs already gone
+            continue
+
+    session_existed = await runtime.sessions.forget(req.channel, req.identity)
+    return ForgetSessionResponse(
+        session_cleared=session_existed,
+        deleted_runs=len(thread_ids),
+        deleted_checkpoint_threads=cleared_threads,
+        thread_ids=thread_ids,
+    )
+
+
 @app.get("/workflow/status", response_model=RunStatusDTO)
 async def status(channel: Channel, identity: str, platform: Platform) -> RunStatusDTO:
     session = await platform.runtime.sessions.get(channel, identity)

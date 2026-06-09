@@ -192,6 +192,12 @@ _TEMPLATE_BODIES = {
         "and I'll take it from there. 🙂\n\n"
         "Have a question? Just ask — happy to help. For any query call 72773652."
     ),
+    # Immediate ack the instant a valid CR attachment arrives — guarantees the
+    # user always sees a response even if the downstream upload + financials
+    # prompt fails (QA Bug #1 + Ishan handover §9 / 2026-06-09).
+    "onboarding.cr.received": (
+        "📄 Got your CR — processing it now…"
+    ),
     "onboarding.status.pending": (
         "Hi! Your application is currently under review with Madad. 👍\n\n"
         "I'll notify you as soon as the next update is available. You can also "

@@ -1251,6 +1251,12 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             return self._step("consent_await", ctx, consent=False)
         first = attachments[0]
+        # Immediate ack so the user always sees a response — even if the
+        # downstream cr_upload_base64 / financials_send chain hiccups (Bug #1).
+        try:
+            await self._send(ctx, state, "onboarding.cr.received")
+        except Exception as exc:  # noqa: BLE001 — ack failure must not kill the run
+            ctx.logger.warning("cr_received_ack.failed", error=str(exc)[:200])
         return self._step(
             "consent_await",
             ctx,
@@ -1416,13 +1422,23 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _financials_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        await self._send(ctx, state, "onboarding.financials.request")
-        await self._reminders.schedule(
-            "financials_pending",
-            channel=_channel(ctx),
-            identity=ctx.identity,
-            target_ref=state.madad_user_id or ctx.session_id,
-        )
+        # Bug #1 (2026-06-09): the financials prompt is the next user-facing
+        # message after CR upload. A transient messenger / reminder failure
+        # used to kill the run silently — guard so we always progress to
+        # financials_await and let the SME's next reply re-trigger the prompt.
+        try:
+            await self._send(ctx, state, "onboarding.financials.request")
+        except Exception as exc:  # noqa: BLE001 — degrade gracefully
+            ctx.logger.warning("financials_request.send_failed", error=str(exc)[:200])
+        try:
+            await self._reminders.schedule(
+                "financials_pending",
+                channel=_channel(ctx),
+                identity=ctx.identity,
+                target_ref=state.madad_user_id or ctx.session_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — nudges are non-critical
+            ctx.logger.warning("financials_pending.schedule_failed", error=str(exc)[:200])
         return self._step("financials_send", ctx)
 
     async def _financials_await(

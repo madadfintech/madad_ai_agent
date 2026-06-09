@@ -94,9 +94,10 @@ async def test_not_qualified_post_payment_via_lender_status(make_harness):
     assert "onboarding.not_qualified" in harness.messenger.templates()
 
 
-async def test_terminal_success_via_activated_status(harness):
+async def test_activated_parks_into_invoice_collect_loop(harness):
     """If the backend reaches ACTIVATED before we hit offers_fetch (race
-    between webhook + poll), the activated terminal completes the flow."""
+    between webhook + poll), the activated message still goes out and the run
+    parks in the invoice-collection loop (steps 10–13, per db9b4a0)."""
     runtime = harness.platform.runtime
 
     async def resume(message):
@@ -109,6 +110,6 @@ async def test_terminal_success_via_activated_status(harness):
     harness.identity.journey_status = "ACTIVATED"
     result = await resume({"type": "status_update"})
 
-    assert result.status == RunStatus.COMPLETED
-    assert result.values["outcome"] == "completed"
+    assert result.status == RunStatus.WAITING_FOR_INPUT
+    assert result.run.current_step == "invoice_collect_await"
     assert "onboarding.activated" in harness.messenger.templates()

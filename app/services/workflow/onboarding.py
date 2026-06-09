@@ -2079,46 +2079,58 @@ class OnboardingWorkflow(WorkflowDefinition):
                     unprocessed.append(zip_doc_type)
 
         # Pass 2 — non-ZIP attachments (and any ZIP that fell back to local).
-        for att in non_zip:
+        # A5 (Ishan 2026-06-07): prefer the classify-and-upload tool over our
+        # own filename-keyword inference. Bug #17 (UAT 2026-06-09): run all
+        # files CONCURRENTLY — sequential per-file processing accumulated
+        # to >60s when one file (AoA) timed out at the 25s cap, blowing
+        # past the workflow runtime's step_timeout and triggering a full
+        # node retry × 3 → RetryExhaustedError → run died with the rest of
+        # the batch unprocessed. With asyncio.gather the wall-clock is
+        # max(per-file) ≈ 25s regardless of how many files are in the batch.
+        async def _classify_one(att: dict[str, Any]) -> tuple[bool, str | None]:
+            if not token:
+                return False, None
             filename = att.get("filename") or ""
-            # A5 (Ishan 2026-06-07): prefer the classify-and-upload tool
-            # over our own filename-keyword inference + manual doc_type
-            # mapping. The backend classifier picks the type and routes to
-            # the right entity slot; the response carries the resolved
-            # ``document_type`` so we can track validated/missing without
-            # guessing on filenames like ``IMG_001.jpg``.
-            uploaded_ok = False
-            resolved_doc_type: str | None = None
-            if token:
-                try:
-                    # Same wall-clock cap as the ZIP path — a single hung
-                    # classify call must not be allowed to time out the
-                    # whole node (Bug #1b 2026-06-09).
-                    classify_response = await asyncio.wait_for(
-                        self._kyc.classify_and_upload_document_base64(
-                            access_token=token,
-                            content_base64=att.get("content_base64") or "",
-                            filename=filename,
-                            mime_type=att.get("mime_type"),
-                        ),
-                        timeout=25.0,
-                    )
-                    uploaded_ok = True
-                    if isinstance(classify_response, dict):
-                        backend_type = (
-                            classify_response.get("document_type")
-                            or classify_response.get("documentType")
-                            or classify_response.get("resolved_document_type")
-                        )
-                        if isinstance(backend_type, str):
-                            resolved_doc_type = _workflow_doc_type(backend_type)
-                except Exception as exc:  # noqa: BLE001 — degrade in staging
-                    ctx.logger.warning(
-                        "classify_and_upload.failed",
+            try:
+                classify_response = await asyncio.wait_for(
+                    self._kyc.classify_and_upload_document_base64(
+                        access_token=token,
+                        content_base64=att.get("content_base64") or "",
                         filename=filename,
-                        error=str(exc)[:200],
-                        note="staging-tolerant: continuing without this doc",
-                    )
+                        mime_type=att.get("mime_type"),
+                    ),
+                    timeout=25.0,
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade in staging
+                ctx.logger.warning(
+                    "classify_and_upload.failed",
+                    filename=filename,
+                    error=str(exc)[:200],
+                    note="staging-tolerant: continuing without this doc",
+                )
+                return False, None
+            resolved: str | None = None
+            if isinstance(classify_response, dict):
+                backend_type = (
+                    classify_response.get("document_type")
+                    or classify_response.get("documentType")
+                    or classify_response.get("resolved_document_type")
+                )
+                if isinstance(backend_type, str):
+                    resolved = _workflow_doc_type(backend_type)
+            return True, resolved
+
+        if non_zip:
+            classify_results = await asyncio.gather(
+                *[_classify_one(att) for att in non_zip]
+            )
+        else:
+            classify_results = []
+
+        for att, (uploaded_ok, resolved_doc_type) in zip(
+            non_zip, classify_results, strict=False
+        ):
+            filename = att.get("filename") or ""
             # QA #3 refinement (2026-06-09): two failure modes from the
             # classifier need different handling:
             #

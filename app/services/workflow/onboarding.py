@@ -123,6 +123,7 @@ TEMPLATE_KEYS = [
     "onboarding.documents.single_received",
     "onboarding.documents.complete",
     "onboarding.upload.required",
+    "onboarding.cr.received",
     "onboarding.status.pending",
     "onboarding.payment.awaiting",
     "onboarding.payment.confirmed",

@@ -185,6 +185,9 @@ class OnboardingState(WorkflowState):
     paid: bool = False
     offers: list[dict[str, Any]] = []
     selected_offer: dict[str, Any] | None = None
+    # One-time guard for the ✅ "offer selected" confirmation so a later
+    # background poll that still reports OFFER_ACCEPTED can't re-send it.
+    offer_confirmed_sent: bool = False
 
     # -- Step 5: monetization payment (Phase 3 will populate) ----------------
     business_details_id: str | None = None

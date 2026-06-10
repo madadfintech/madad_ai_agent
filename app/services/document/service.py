@@ -274,7 +274,39 @@ class DocumentIntelligenceService:
             for d in documents
             if d.document_type and d.status == DocumentStatus.REJECTED
         }
-        missing = [r.code for r in required if r.required and r.code not in validated]
+        # Match validated types to required codes case/punctuation-insensitively:
+        # a correctly-classified doc (e.g. AoA) was showing as still-missing only
+        # because the classifier's label differed from the checklist code by case
+        # or separators ("AOA" vs "aoa", "articles_of_association" vs "articles of
+        # association").
+        _norm = lambda c: "".join(ch for ch in (c or "").lower() if ch.isalnum())
+        validated_norm = {_norm(t) for t in validated}
+        missing = [
+            r.code for r in required
+            if r.required and _norm(r.code) not in validated_norm
+        ]
+
+        # Count-based unblock: the classifier can't always auto-assign a type to
+        # every upload (e.g. shareholder address proof, Articles of Association),
+        # which would otherwise leave those required codes "missing" forever and
+        # the lead stuck being asked for documents they already sent. So once the
+        # lead has uploaded at least as many documents as are required (rejected /
+        # failed excluded), treat the checklist as complete even if some uploads
+        # are still unclassified. GUARD: never report complete on fewer uploads
+        # than required — 1 upload against 5 required stays incomplete.
+        required_count = sum(1 for r in required if r.required)
+        uploaded = [
+            d for d in documents
+            if d.status not in (DocumentStatus.REJECTED, DocumentStatus.FAILED)
+        ]
+        if missing and required_count and len(uploaded) >= required_count:
+            self._log.info(
+                "checklist '%s': %d uploads >= %d required — unblocking despite "
+                "unclassified docs (was missing %s)",
+                checklist, len(uploaded), required_count, missing,
+            )
+            missing = []
+
         return ChecklistStatus(
             checklist=checklist,
             received=sorted(t for t in received if t),

@@ -188,6 +188,11 @@ class OnboardingState(WorkflowState):
     # One-time guard for the ✅ "offer selected" confirmation so a later
     # background poll that still reports OFFER_ACCEPTED can't re-send it.
     offer_confirmed_sent: bool = False
+    # Signature of the offer set last shown to the SME. While parked waiting for
+    # a portal selection the status poller re-enters the ACCEPTED→offers route
+    # every ~minute; this lets us re-send the offer cards ONLY when a new lender
+    # actually adds an offer, not on every routine poll.
+    offers_shown_sig: str | None = None
 
     # -- Step 5: monetization payment (Phase 3 will populate) ----------------
     business_details_id: str | None = None

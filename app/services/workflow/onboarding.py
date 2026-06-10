@@ -750,6 +750,20 @@ def _extract_credit_line_from_me(info: Any) -> dict[str, Any]:
     return {}
 
 
+def _offers_sig(offers: list[dict[str, Any]]) -> str:
+    """Stable signature of the offer set (lender + key terms), so we re-send the
+    offer cards only when a lender actually adds/changes an offer — not on every
+    routine status poll while the SME is deciding."""
+    parts = sorted(
+        f"{_lender_name(o) or '?'}|{o.get('creditLimit') or o.get('credit_limit')}"
+        f"|{o.get('interestRate') or o.get('interest_rate')}"
+        f"|{o.get('tenureDays') or o.get('tenure_days')}"
+        for o in (offers or [])
+        if isinstance(o, dict)
+    )
+    return ";".join(parts)
+
+
 def _selected_offer_from_payload(payload: Any) -> dict[str, Any] | None:
     """Pull the lender + terms off an offer.selected / credit_line.activated
     webhook payload so the confirmation/activation messages can name the bank."""
@@ -3341,6 +3355,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         # one block per offer with lender + credit limit + interest rate +
         # tenure + processing fee. Falls back to a count-only line if the
         # offer list is empty (auth_me hasn't surfaced offers yet).
+        #
+        # Re-send only when the offer SET changed (a new lender made an offer) —
+        # the fast status poller re-enters this route ~every minute while the SME
+        # is deciding, and we must not re-spam the same cards each tick.
+        if _offers_sig(state.offers) == state.offers_shown_sig:
+            return self._step("offer_view_send", ctx)
         await self._send(
             ctx,
             state,
@@ -3355,6 +3375,11 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _offer_handoff_to_madad(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
+        # Skip the whole handoff block on a routine poll where the offer set is
+        # unchanged (the run just passed through offer_view_send without
+        # re-sending). Only (re)send the button when new offers were just shown.
+        if _offers_sig(state.offers) == state.offers_shown_sig:
+            return self._step("offer_handoff_to_madad", ctx, outcome="offer_handoff")
         # PDF Step 8 — tappable "Login to Madad →" CTA-URL button on WhatsApp
         # (Meta caps the label at 20 chars). Falls back to the plain-text
         # template (with the URL inline) if the interactive path fails.
@@ -3379,7 +3404,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                 )
         if not sent_as_button:
             await self._send(ctx, state, "onboarding.offer.handoff")
-        return self._step("offer_handoff_to_madad", ctx, outcome="offer_handoff")
+        # Record the shown offer set so routine polls don't re-send these cards.
+        return self._step(
+            "offer_handoff_to_madad", ctx, outcome="offer_handoff",
+            offers_shown_sig=_offers_sig(state.offers),
+        )
 
     async def _offer_confirmed(
         self, state: OnboardingState, ctx: WorkflowContext

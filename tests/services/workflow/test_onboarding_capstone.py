@@ -211,6 +211,7 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
     # direct, audited → PARK(prequalify_wait), webhook → documents, doc upload
     # → PARK(payment_wait), score event → payment chain.
     await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})  # business_email
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": "QkE="}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": "QkE="}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})

@@ -55,6 +55,7 @@ async def test_onboarding_drives_real_communication_and_nudge():
 
     doc = "ZHVtbXk="
     await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})  # business_email
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})

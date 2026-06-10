@@ -290,6 +290,12 @@ _TEMPLATE_BODIES = {
         "{{ payment_link }}\n\n"
         "Once payment is received, your application will be forwarded immediately."
     ),
+    # Per user (UAT 2026-06-10): the offers preview + the handoff message
+    # used to fire as TWO separate WhatsApp bubbles and the offer cards
+    # rendered empty on top. Both are now folded into the single
+    # ``onboarding.offer.handoff.button`` CTA-URL message below, so this
+    # template stays as a back-compat fallback only — kept for tests + any
+    # email channel still rendering it standalone.
     "onboarding.offers.preview": (
         "🎉 Exciting news — your financing offers are ready!\n\n"
         "{{ offer_cards }}\n\n"
@@ -301,10 +307,17 @@ _TEMPLATE_BODIES = {
         "your offer — this is where you'll also manage your invoices going forward.\n\n"
         "Login to Madad Platform → madadfintech.com"
     ),
-    # Spec Step 8 button variant — body for the WhatsApp interactive CTA-URL
-    # message. The button label ("Login to Madad →") is supplied at send-time
-    # (capped at 20 chars by Meta); this body is what shows above the button.
+    # Spec Step 8 button variant + UAT 2026-06-10 combined-message fix.
+    # User saw the offers preview + the handoff message arriving as TWO
+    # separate WhatsApp bubbles with the offer cards rendered empty. Body
+    # now carries the FULL flow in one message: opening "Exciting news",
+    # the offer cards (populated from {{ offer_cards }}), the "ask me
+    # anything" invite, AND the handoff line — followed by the Meta
+    # "Login to Madad" CTA-URL button. Button URL is supplied at send-
+    # time (capped at 20 chars by Meta).
     "onboarding.offer.handoff.button": (
+        "🎉 Exciting news — your financing offers are ready!\n\n"
+        "{{ offer_cards }}\n\n"
         "💬 Feel free to ask me anything about these offers right here!\n\n"
         "When you're ready to select, please login to your Madad account to "
         "finalise your offer — this is where you'll also manage your invoices "

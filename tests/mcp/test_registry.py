@@ -5,12 +5,12 @@ from __future__ import annotations
 from app.shared.mcp import Tools
 
 
-def test_registry_has_75_constants_grouped_by_module() -> None:
+def test_registry_has_76_constants_grouped_by_module() -> None:
     names = Tools.all()
-    # 13 + 7 + 6 + 31 + 4 + 5 + 9 = 75. +1 vs prior added 2026-06-10 by Ishan:
-    # MCP_CHECK_REGISTRATION (read-only existing-user lookup; closes Bug #2 +
-    # Bug #6 by routing returning users instead of re-onboarding them).
-    assert len(names) == 75
+    # 13 + 7 + 7 + 31 + 4 + 5 + 9 = 76. +1 vs prior added 2026-06-10 by Ishan
+    # in PR #5: MCP_SET_BUSINESS_EMAIL — called right after YES to attach the
+    # business email; returns {ok, conflict, alreadyPortalUser}.
+    assert len(names) == 76
 
     by_prefix: dict[str, int] = {}
     for value in names.values():
@@ -19,7 +19,7 @@ def test_registry_has_75_constants_grouped_by_module() -> None:
 
     assert by_prefix["auth"] == 13
     assert by_prefix["external"] == 7
-    assert by_prefix["mcp"] == 6
+    assert by_prefix["mcp"] == 7
     assert by_prefix["kyc"] == 31
     assert by_prefix["offers"] == 4
     assert by_prefix["payments"] == 5

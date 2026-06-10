@@ -66,6 +66,7 @@ async def test_zip_upload_routes_through_classify_and_upload_zip(make_harness) -
 
     await runtime.start("onboarding", WA, identity, input={"trigger": "campaign"})
     await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})  # business_email
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
@@ -126,6 +127,7 @@ async def test_zip_fallback_when_backend_errors(make_harness) -> None:
 
     await runtime.start("onboarding", WA, identity, input={"trigger": "campaign"})
     await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})  # business_email
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})

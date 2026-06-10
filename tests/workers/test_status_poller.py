@@ -136,6 +136,8 @@ async def _drive_to_journey_wait(platform, identity: str) -> None:
         return await runtime.resume(WA, identity, message=msg)
 
     await resume({"text": "YES"})
+
+    await resume({"text": "biz@example.com"})  # business_email
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})

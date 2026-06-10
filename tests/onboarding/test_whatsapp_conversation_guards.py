@@ -32,6 +32,8 @@ async def test_upload_steps_require_attachments(make_harness):
     harness = make_harness(known_phones={IDENTITY: "user_42"})
     runtime = harness.platform.runtime
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
+    # Existing-user path (known_phone) goes channel_session_first →
+    # consent_send directly; no business-email step on this branch.
     await runtime.resume(WA, IDENTITY, message={"text": "YES"})
 
     result = await runtime.resume(WA, IDENTITY, message={"text": "Am I being scammed?"})
@@ -47,6 +49,7 @@ async def test_filename_only_upload_does_not_advance(make_harness):
     harness = make_harness(known_phones={IDENTITY: "user_42"})
     runtime = harness.platform.runtime
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
+    # Existing-user path skips the business-email step.
     await runtime.resume(WA, IDENTITY, message={"text": "YES"})
 
     result = await runtime.resume(
@@ -71,6 +74,7 @@ async def _drive_to_documents(harness, runtime):
 
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+    await runtime.resume(WA, IDENTITY, message={"text": "biz@example.com"})  # business_email
     # CR upload → financials request.
     await runtime.resume(
         WA, IDENTITY, message={"attachments": [{"filename": "CR.pdf", "content_base64": DOC}]}
@@ -147,6 +151,7 @@ async def test_cr_upload_asks_for_financials_not_questionnaire(harness):
     runtime = harness.platform.runtime
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+    await runtime.resume(WA, IDENTITY, message={"text": "biz@example.com"})  # business_email
 
     result = await runtime.resume(
         WA, IDENTITY, message={"attachments": [{"filename": "CR.pdf", "content_base64": DOC}]}

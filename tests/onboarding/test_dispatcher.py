@@ -19,12 +19,13 @@ async def test_inbound_starts_then_resumes_same_run(harness):
     assert first.prompt["step"] == "campaign"
     run_id = first.run.run_id
 
-    # YES → resume same run. Post-main-merge the new-lead branch uses
-    # create_user_if_missing=True so we land at consent_cr directly (no
-    # collect_details step anymore).
+    # YES → resume same run → business_email step (PR #5/#6, 2026-06-10).
     second = await dispatcher.inbound(WA, IDENTITY, text="YES")
     assert second.run.run_id == run_id
-    assert second.prompt["step"] == "consent_cr"
+    assert second.prompt["step"] == "business_email"
+    # And replying with an email advances to consent_cr.
+    third = await dispatcher.inbound(WA, IDENTITY, text="biz@example.com")
+    assert third.prompt["step"] == "consent_cr"
 
 
 async def test_on_inbound_with_message_object(harness):
@@ -47,7 +48,8 @@ async def test_resume_external_status_update(harness):
     runtime = harness.platform.runtime
 
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    await dispatcher.inbound(WA, IDENTITY, text="YES")  # → consent_cr
+    await dispatcher.inbound(WA, IDENTITY, text="YES")  # → business_email
+    await dispatcher.inbound(WA, IDENTITY, text="biz@example.com")  # → consent_cr
     await dispatcher.inbound(
         WA, IDENTITY, attachments=[{"filename": "CR.pdf", "content_base64": DOC}]
     )  # → financials

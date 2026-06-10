@@ -32,8 +32,10 @@ async def test_whatsapp_new_lead_uses_create_user_if_missing(harness) -> None:
         kwargs for name, kwargs in harness.identity.calls if name == "open_session"
     ]
     assert any(p.get("create_user_if_missing") is True for p in open_session_payloads)
-    # Workflow advanced to consent_cr (no collect_details prompt).
-    assert result.prompt == {"waiting_for": "upload", "step": "consent_cr"}
+    # PR #5/#6 (2026-06-10): create_user_if_missing fast-path now lands at
+    # the business-email step (NOT consent_cr); business_email_send fires
+    # and parks waiting for the email.
+    assert result.prompt == {"waiting_for": "email", "step": "business_email"}
 
 
 async def test_email_new_lead_still_uses_complete_onboarding(make_harness) -> None:

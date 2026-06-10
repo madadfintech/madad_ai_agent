@@ -54,11 +54,12 @@ def test_full_flow_over_http() -> None:
     assert started.json()["waiting"] is True
     assert started.json()["prompt"]["step"] == "campaign"
 
-    # Post-main spec-aligned flow: YES → consent_cr direct (no collect_details
-    # form), CR → financials direct (no 7-field eligibility form), audited →
-    # PARK(prequalify_wait), prequalification.completed → documents, doc upload
-    # → PARK(journey_wait or payment_wait depending on path), payment chain.
-    assert _inbound(text="YES").json()["prompt"]["step"] == "consent_cr"
+    # Post-main spec-aligned flow + PR #5/#6 (2026-06-10): YES →
+    # business_email → consent_cr, CR → financials, audited →
+    # PARK(prequalify_wait), prequalification.completed → documents,
+    # doc upload → payment chain.
+    assert _inbound(text="YES").json()["prompt"]["step"] == "business_email"
+    assert _inbound(text="biz@example.com").json()["prompt"]["step"] == "consent_cr"
     assert (
         _inbound(attachments=[{"filename": "CR.pdf", "content_base64": DOC}]).json()["prompt"]["step"]  # noqa: E501
         == "financials"

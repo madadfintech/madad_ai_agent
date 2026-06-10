@@ -29,7 +29,7 @@ IDENTITY = "+97455502601"
 @pytest.mark.parametrize(
     "route, must_contain",
     [
-        ("portal_login_required", "log in at madadfintech.com"),
+        ("portal_login_required", "log in at uat-portal.madadfintech.com"),
         ("invoice_discounting", "credit line is already active"),
         ("offer_accepted_confirmation", "already accepted an offer"),
         ("offers_available", "financing offers are ready"),
@@ -66,8 +66,12 @@ async def test_returning_user_routes_terminate_with_correct_message(
     }
 
     runtime = harness.platform.runtime
-    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    result = await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+    # Per Ishan (2026-06-10): cold-start entry_registration_check runs
+    # BEFORE campaign_send, so a returning user's run terminates at
+    # ``runtime.start`` itself — no YES needed.
+    result = await runtime.start(
+        "onboarding", WA, IDENTITY, input={"trigger": "campaign"}
+    )
 
     # Returning-user runs terminate — no further onboarding work.
     assert result.status == RunStatus.COMPLETED, (
@@ -93,10 +97,15 @@ async def test_unregistered_user_falls_through_to_signup(make_harness) -> None:
     harness = make_harness()  # nobody is known
     runtime = harness.platform.runtime
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    result = await runtime.resume(WA, IDENTITY, message={"text": "YES"})
-
-    # Lands at the consent step (the SIGN_UP path's next stop), NOT at
-    # the returning-user terminal.
+    after_yes = await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+    # PR #5/#6 (2026-06-10): new business-email step right after YES on
+    # the SIGN_UP path. Confirms the fallthrough lands there (not at the
+    # returning-user terminal).
+    assert after_yes.prompt == {"waiting_for": "email", "step": "business_email"}
+    result = await runtime.resume(
+        WA, IDENTITY, message={"text": "biz@example.com"}
+    )
+    # And then the consent step as before.
     assert result.prompt == {"waiting_for": "upload", "step": "consent_cr"}
     assert result.values.get("outcome") != "returning_user"
     # check_registration WAS called (registry contract) — it just
@@ -115,7 +124,9 @@ async def test_referenceNumber_threaded_into_state(make_harness) -> None:
         IDENTITY: {"route": "payment_link", "referenceNumber": "7388266"},
     }
     runtime = harness.platform.runtime
-    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    result = await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+    # Returning-user terminates at start (cold-start entry check).
+    result = await runtime.start(
+        "onboarding", WA, IDENTITY, input={"trigger": "campaign"}
+    )
 
     assert result.values["application_ref"] == "7388266"

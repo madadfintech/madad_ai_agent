@@ -18,6 +18,7 @@ async def _drive_to_payment_send(harness, identity: str):
 
     await runtime.start("onboarding", WA, identity, input={"trigger": "campaign"})
     await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})  # business_email
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
@@ -65,6 +66,7 @@ async def test_incomplete_docs_nudge_carries_missing_documents(harness) -> None:
 
     await runtime.start("onboarding", WA, identity, input={"trigger": "campaign"})
     await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})  # business_email
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})

@@ -578,6 +578,14 @@ DEFAULT_WHATSAPP_REQUIRED_DOCS = [
     # Shareholder documents
     "qid",
     "passport",
+]
+
+# Per user 2026-06-10: optional shareholder docs the SME MAY send but MUST NOT
+# block completion on. If uploaded the agent acknowledges + validates them like
+# any required doc; if never sent, the docs loop still naturally exhausts when
+# every entry in ``DEFAULT_WHATSAPP_REQUIRED_DOCS`` is in. See
+# [[project_optional_docs]].
+DEFAULT_WHATSAPP_OPTIONAL_DOCS = [
     "proof_of_address",
 ]
 
@@ -789,6 +797,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "check_contact_send": self._check_contact_send,
             "check_contact_await": self._check_contact_await,
             "domain_blocked": self._domain_blocked,
+            "registered_route_send": self._registered_route_send,
             "channel_session_first": self._channel_session_first,
             "channel_session_create_user": self._channel_session_create_user,
             "collect_onboarding_details_send": self._collect_onboarding_details_send,
@@ -864,6 +873,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                 # mints SIGN_UP + access_token in one round-trip.
                 "new_whatsapp": "channel_session_create_user",
                 "blocked": "domain_blocked",
+                # Per Ishan (cluster e6ea5d2, 2026-06-10): returning users
+                # routed by check_registration land here so the SME gets
+                # the route-appropriate message instead of being silently
+                # re-onboarded (Bug #2 + Bug #6).
+                "registered_routed": "registered_route_send",
             },
         )
 
@@ -1016,6 +1030,10 @@ class OnboardingWorkflow(WorkflowDefinition):
             "not_eligible",
             "not_qualified",
             "offer_handoff_to_madad",
+            # Returning-user route per Ishan's check_registration tool —
+            # the SME has been re-greeted with the right message, no
+            # further onboarding work is needed in this run.
+            "registered_route_send",
         ):
             graph.set_finish(terminal)
 
@@ -1079,11 +1097,36 @@ class OnboardingWorkflow(WorkflowDefinition):
             result = await self._identity.check_contact(phone=ctx.identity)
         else:
             result = await self._identity.check_contact(email=ctx.identity)
+        # Per Ishan (cluster commit e6ea5d2, 2026-06-10): also fire the
+        # read-only registration lookup — it returns the full registered
+        # shape (route hint, journey status, fee paid, credit line,
+        # offers…) so the dispatcher can skip SIGN_UP for returning
+        # users and re-send the appropriate message instead of
+        # silently re-onboarding (Bug #2 + Bug #6). Best-effort: a
+        # failure here must not break the SIGN_UP path.
+        route: str | None = None
+        payload: dict[str, Any] = {}
+        try:
+            reg = await self._identity.check_registration(
+                identifier=ctx.identity,
+                channel=_channel(ctx),
+            )
+            if isinstance(reg, dict) and reg.get("registered"):
+                payload = reg
+                raw_route = reg.get("route")
+                if isinstance(raw_route, str):
+                    route = raw_route
+        except Exception as exc:  # noqa: BLE001 — non-fatal, fall through
+            ctx.logger.warning(
+                "check_registration.failed", error=str(exc)[:200]
+            )
         return self._step(
             "check_contact_send",
             ctx,
             check_contact_result=result,
             channel_identity=ctx.identity,
+            registration_route=route,
+            registration_payload=payload,
         )
 
     async def _check_contact_await(
@@ -1105,6 +1148,80 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx,
             outcome="domain_blocked",
             domain_block_reason=domain,
+        )
+
+    async def _registered_route_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """Returning-user landing per Ishan's check_registration route.
+
+        Cluster commit ``e6ea5d2`` (2026-06-10): a single
+        ``madad_mcp_check_registration`` call before SIGN_UP returns a
+        ``route`` enum that says which message to send to a returning user
+        — portal login, payment link re-send, offers re-display, invoice
+        upload invite, etc. Closes Bug #2 (existing account not detected
+        at sign-up) and Bug #6 (portal login creating a duplicate).
+
+        This node picks a friendly route-specific answer and completes the
+        run — we don't restart onboarding for someone whose application is
+        already in flight on the portal / awaiting payment / has offers in
+        flight. The full payload remains on ``state.registration_payload``
+        for any downstream node that wants the credit-line / offer details.
+        """
+
+        route = state.registration_route or "continue_step"
+        payload = state.registration_payload or {}
+        ref = payload.get("referenceNumber") or ""
+
+        answer_by_route: dict[str, str] = {
+            "portal_login_required": (
+                "👋 Welcome back! Your application is being managed on the "
+                "Madad portal. Please log in at madadfintech.com to continue."
+                + (f" (Ref: {ref})" if ref else "")
+            ),
+            "invoice_discounting": (
+                "🎉 Welcome back! Your credit line is already active — "
+                "send any invoice you'd like to finance here as a PDF or "
+                "photo and I'll submit it right away."
+            ),
+            "offer_accepted_confirmation": (
+                "✅ Welcome back! You've already accepted an offer with us — "
+                "our team is coordinating the next steps and we'll be in "
+                "touch shortly."
+            ),
+            "offers_available": (
+                "🎉 Welcome back — your financing offers are ready to "
+                "review. Log in at madadfintech.com to compare them side "
+                "by side and pick the one you want."
+            ),
+            "payment_received": (
+                "💚 Welcome back! Your onboarding fee is already in and "
+                "your application is with our banking partners — we'll "
+                "ping you the moment they respond (typically 3–5 business "
+                "days)."
+            ),
+            "payment_link": (
+                "👋 Welcome back! You're qualified for financing — please "
+                "complete the QAR 6,000 onboarding fee to forward your "
+                "application to the banks. Log in at madadfintech.com to "
+                "pay or reply 'pay' and I'll re-send the link."
+            ),
+            "continue_step": (
+                "👋 Welcome back! Picking up where you left off — share "
+                "the next document we asked for whenever you're ready, "
+                "or reply 'list' to see what's still pending."
+            ),
+        }
+        answer = answer_by_route.get(route, answer_by_route["continue_step"])
+        await self._send(
+            ctx, state, "onboarding.help.contextual",
+            {"answer": answer, "next_step": ""},
+        )
+        return self._step(
+            "registered_route_send",
+            ctx,
+            outcome="returning_user",
+            application_ref=ref or state.application_ref,
         )
 
     async def _channel_session_first(
@@ -1997,7 +2114,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         # as a ✅ validated entry. Only docs that were on this batch's
         # pending list earn the ✅; anything else lands as ⏳ "received,
         # team will review" — honest, never a false validation.
-        expected: set[str] = set(pending)
+        #
+        # Optional shareholder docs (2026-06-10): include them in the
+        # ``expected`` set so an upload still earns ✅ when classified —
+        # but they're NOT in ``pending``, so they never count toward
+        # remaining-required and the loop can naturally exhaust without
+        # them. See [[project_optional_docs]].
+        expected: set[str] = set(pending) | set(DEFAULT_WHATSAPP_OPTIONAL_DOCS)
         validated: list[str] = []  # uploaded + classified into expected → ✅
         unprocessed: list[str] = []  # uploaded but off-checklist / failed → ⏳
         saw_zip = False
@@ -2247,6 +2370,18 @@ class OnboardingWorkflow(WorkflowDefinition):
             f"\n\n📤 Please share the remaining {len(still_missing)} "
             f"{noun} to move forward."
         )
+        # Per project_optional_docs (2026-06-10): surface optional docs as a
+        # separate "Optional" section so the SME knows they can send them but
+        # isn't pressured to. Validated optionals appear up in the ✅ list
+        # above (the expected set in the docs loop already includes them).
+        optional_unsent = [
+            d for d in DEFAULT_WHATSAPP_OPTIONAL_DOCS
+            if d not in already_validated
+        ]
+        if optional_unsent:
+            body += "\n\nℹ️ Optional (send if you have them):"
+            for d in optional_unsent:
+                body += f"\n• {_label(d)}"
         # Reuse the existing single_received template ({{ results }}) — it
         # already renders the body verbatim.
         await self._send(
@@ -3083,6 +3218,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "ask_again"
 
     def _route_check_contact(self, state: OnboardingState) -> str:
+        # Per Ishan (cluster e6ea5d2, 2026-06-10): if
+        # ``madad_mcp_check_registration`` returned a route hint, the lead
+        # is a returning user — re-send the appropriate message instead
+        # of silently re-onboarding them (Bug #2 + Bug #6).
+        if state.registration_route:
+            return "registered_routed"
         result: Any = state.check_contact_result
         if result is None:
             return self._new_lead_route(state)

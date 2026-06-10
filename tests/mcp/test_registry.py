@@ -5,14 +5,12 @@ from __future__ import annotations
 from app.shared.mcp import Tools
 
 
-def test_registry_has_74_constants_grouped_by_module() -> None:
+def test_registry_has_75_constants_grouped_by_module() -> None:
     names = Tools.all()
-    # 13 + 7 + 5 + 31 + 4 + 5 + 9 = 74. +2 vs prior added 2026-06-08 by Ishan:
-    # EXT_SEND_EMAIL_TEXT (arbitrary email content, replacing the OTP-only
-    # path for the email onboarding thread) and KYC_UPLOAD_INVOICE_BASE64
-    # (single-invoice base64 submission for the upload-an-invoice via
-    # WhatsApp/email flow).
-    assert len(names) == 74
+    # 13 + 7 + 6 + 31 + 4 + 5 + 9 = 75. +1 vs prior added 2026-06-10 by Ishan:
+    # MCP_CHECK_REGISTRATION (read-only existing-user lookup; closes Bug #2 +
+    # Bug #6 by routing returning users instead of re-onboarding them).
+    assert len(names) == 75
 
     by_prefix: dict[str, int] = {}
     for value in names.values():
@@ -21,7 +19,7 @@ def test_registry_has_74_constants_grouped_by_module() -> None:
 
     assert by_prefix["auth"] == 13
     assert by_prefix["external"] == 7
-    assert by_prefix["mcp"] == 5
+    assert by_prefix["mcp"] == 6
     assert by_prefix["kyc"] == 31
     assert by_prefix["offers"] == 4
     assert by_prefix["payments"] == 5

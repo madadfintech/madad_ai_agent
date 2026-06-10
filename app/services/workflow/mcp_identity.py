@@ -326,3 +326,23 @@ class McpMadadIdentityClient:
         return await self._tools.call_tool(
             Tools.MCP_GET_ONBOARDING_PROGRESS, payload
         )
+
+    async def check_registration(
+        self,
+        *,
+        identifier: str,
+        channel: Channel,
+        email: str | None = None,
+        phone: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "identifier": identifier,
+            "channel": _channel_value(channel),
+        }
+        if email is not None:
+            payload["email"] = email
+        if phone is not None:
+            payload["phone"] = phone
+        return await self._tools.call_tool(
+            Tools.MCP_CHECK_REGISTRATION, payload
+        )

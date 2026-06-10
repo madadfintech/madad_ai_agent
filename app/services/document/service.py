@@ -279,7 +279,9 @@ class DocumentIntelligenceService:
         # because the classifier's label differed from the checklist code by case
         # or separators ("AOA" vs "aoa", "articles_of_association" vs "articles of
         # association").
-        _norm = lambda c: "".join(ch for ch in (c or "").lower() if ch.isalnum())
+        def _norm(c: str | None) -> str:
+            return "".join(ch for ch in (c or "").lower() if ch.isalnum())
+
         validated_norm = {_norm(t) for t in validated}
         missing = [
             r.code for r in required

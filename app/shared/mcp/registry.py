@@ -64,6 +64,12 @@ class Tools:
     # report upload + account.created message. ``get`` is the resume read.
     MCP_UPDATE_ONBOARDING_PROGRESS = "madad_mcp_update_onboarding_progress"
     MCP_GET_ONBOARDING_PROGRESS = "madad_mcp_get_onboarding_progress"
+    # Per Ishan (cluster commit e6ea5d2, 2026-06-10): read-only existing-user
+    # lookup. Called BEFORE ``create_channel_session`` on the campaign-entry
+    # path so a returning user is routed (re-send offer, payment link,
+    # invoice prompt, portal login, etc.) instead of being silently re-
+    # onboarded. Closes Bug #2 + Bug #6.
+    MCP_CHECK_REGISTRATION = "madad_mcp_check_registration"
 
     # -- KYC (30; ``madad_kyc_complete_stage`` deliberately omitted) ---------
     KYC_UPDATE_ELIGIBILITY = "madad_kyc_update_eligibility"

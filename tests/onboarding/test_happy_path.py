@@ -162,9 +162,11 @@ async def test_existing_user_skips_collect_details_branch(make_harness):
     assert after_yes.prompt == {"waiting_for": "upload", "step": "consent_cr"}
 
     identity_calls = [name for name, _ in harness.identity.calls]
-    # check_contact + open_session (single bridge call for existing user, no
+    # check_contact + check_registration (read-only, returns
+    # registered=False by default — fall through to existing path) +
+    # open_session (single bridge call for existing user, no
     # complete_onboarding, no second session).
-    assert identity_calls == ["check_contact", "open_session"]
+    assert identity_calls == ["check_contact", "check_registration", "open_session"]
 
 
 async def test_locale_propagates(make_harness):

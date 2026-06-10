@@ -82,6 +82,15 @@ class OnboardingState(WorkflowState):
     madad_user_id: str | None = None
     # Q8 three-way result on first contact (for the check_contact router).
     check_contact_result: ContactCheckResult | None = None
+    # Per Ishan (cluster e6ea5d2, 2026-06-10): the read-only registration
+    # lookup runs alongside check_contact and returns the full registered-
+    # user shape (route hint, journey status, fee paid flag, credit line,
+    # offers...). The dispatcher uses ``registration_route`` to skip the
+    # SIGN_UP path for returning users (Bug #2 + #6). Raw payload stored
+    # so any field needed downstream — referenceNumber, offers list,
+    # credit line details — is accessible without a second call.
+    registration_route: str | None = None
+    registration_payload: dict[str, Any] = Field(default_factory=dict)
     # When the third branch fires; the domain the email belongs to.
     domain_block_reason: str | None = None
 

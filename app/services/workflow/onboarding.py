@@ -883,6 +883,10 @@ class OnboardingWorkflow(WorkflowDefinition):
             "collect_onboarding_details_await": self._collect_onboarding_details_await,
             "complete_onboarding_send": self._complete_onboarding_send,
             "channel_session_second": self._channel_session_second,
+            # Step 1b: business email (right after YES / account creation)
+            "business_email_send": self._business_email_send,
+            "business_email_await": self._business_email_await,
+            "business_email_conflict_send": self._business_email_conflict_send,
             # Step 2: consent + CR
             "consent_send": self._consent_send,
             "consent_await": self._consent_await,
@@ -972,19 +976,35 @@ class OnboardingWorkflow(WorkflowDefinition):
         # type their name/CR/role. The account is created up front with safe
         # placeholders (complete_onboarding fills sensible defaults) and the real
         # business details are extracted from the CR document they upload next.
+        # NEW: right after the account exists we collect the BUSINESS email
+        # (business_email_send) before consent/CR — this makes the lead a
+        # normal, portal-loginable user and catches a duplicate business early.
         graph.add_edge("complete_onboarding_send", "channel_session_second")
         graph.add_conditional_edges(
             "channel_session_second",
             self._route_channel_session,
-            {"consent": "consent_send"},
+            {"consent": "business_email_send"},
         )
-        # WhatsApp organic-entry converges at consent_send via the
-        # create_user_if_missing fast-path — no complete_onboarding hop.
+        # WhatsApp organic-entry: create_user_if_missing fast-path -> email step.
         graph.add_conditional_edges(
             "channel_session_create_user",
             self._route_channel_session,
-            {"consent": "consent_send"},
+            {"consent": "business_email_send"},
         )
+
+        # Business-email step. proceed -> consent/CR; conflict -> ask again;
+        # await_again -> keep waiting for a valid email.
+        graph.add_edge("business_email_send", "business_email_await")
+        graph.add_conditional_edges(
+            "business_email_await",
+            self._route_business_email,
+            {
+                "proceed": "consent_send",
+                "conflict": "business_email_conflict_send",
+                "await_again": "business_email_await",
+            },
+        )
+        graph.add_edge("business_email_conflict_send", "business_email_await")
 
         graph.add_edge("consent_send", "consent_await")
         graph.add_conditional_edges(
@@ -1272,7 +1292,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         answer_by_route: dict[str, str] = {
             "portal_login_required": (
                 "👋 Welcome back! Your application is being managed on the "
-                "Madad portal. Please log in at madadfintech.com to continue."
+                "Madad portal. Please log in at uat-portal.madadfintech.com to continue."
                 + (f" (Ref: {ref})" if ref else "")
             ),
             "invoice_discounting": (
@@ -1287,7 +1307,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             ),
             "offers_available": (
                 "🎉 Welcome back — your financing offers are ready to "
-                "review. Log in at madadfintech.com to compare them side "
+                "review. Log in at uat-portal.madadfintech.com to compare them side "
                 "by side and pick the one you want."
             ),
             "payment_received": (
@@ -1299,7 +1319,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "payment_link": (
                 "👋 Welcome back! You're qualified for financing — please "
                 "complete the QAR 6,000 onboarding fee to forward your "
-                "application to the banks. Log in at madadfintech.com to "
+                "application to the banks. Log in at uat-portal.madadfintech.com to "
                 "pay or reply 'pay' and I'll re-send the link."
             ),
             "continue_step": (
@@ -1521,6 +1541,67 @@ class OnboardingWorkflow(WorkflowDefinition):
         )
 
     # -- Step 2: consent + CR upload -----------------------------------------
+
+    async def _business_email_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """Right after the lead says YES and the account is created, ask for
+        their BUSINESS email. Capturing it makes the lead a normal,
+        portal-loginable user and lets us detect a duplicate business before
+        the CR step."""
+        await self._send(ctx, state, "onboarding.business_email.ask")
+        return self._step("business_email_send", ctx, business_email_status=None)
+
+    async def _business_email_await(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        reply = await_input({"waiting_for": "email", "step": "business_email"})
+        email = _extract_email(reply_text(reply))
+        if not email:
+            # Off-script / not an email — clarify in context and keep waiting.
+            await self._smart_contextual(
+                ctx, state, reply,
+                "Please reply with your business email (e.g. name@company.com) "
+                "so we can set up your account. 📧",
+            )
+            return self._step("business_email_await", ctx, business_email_status="await")
+        try:
+            result = await self._identity.set_business_email(
+                email=email,
+                user_id=state.madad_user_id,
+                channel=_channel(ctx),
+                identifier=ctx.identity,
+            )
+        except Exception as exc:  # noqa: BLE001 — transport error -> let them retry
+            ctx.logger.warning("business_email.set_failed", error=str(exc)[:200])
+            return self._step("business_email_await", ctx, business_email_status="await")
+        if result.get("conflict"):
+            return self._step(
+                "business_email_await", ctx,
+                business_email=email, business_email_status="conflict",
+            )
+        # ok (or the unlikely alreadyPortalUser) — proceed; record step 2.
+        await self._update_progress(state, ctx, step=2)
+        return self._step(
+            "business_email_await", ctx,
+            business_email=email, business_email_status="proceed",
+        )
+
+    def _route_business_email(self, state: OnboardingState) -> str:
+        status = (state.business_email_status or "").lower()
+        if status == "proceed":
+            return "proceed"
+        if status == "conflict":
+            return "conflict"
+        return "await_again"
+
+    async def _business_email_conflict_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """The email is already registered to another account — ask for a
+        different business email, or to contact support."""
+        await self._send(ctx, state, "onboarding.business_email.conflict")
+        return self._step("business_email_conflict_send", ctx, business_email_status=None)
 
     async def _consent_send(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -3220,7 +3301,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         # PDF Step 8 — tappable "Login to Madad →" CTA-URL button on WhatsApp
         # (Meta caps the label at 20 chars). Falls back to the plain-text
         # template (with the URL inline) if the interactive path fails.
-        portal_url = "https://madadfintech.com"
+        portal_url = "https://uat-portal.madadfintech.com"
         sent_as_button = False
         if ctx.channel is Channel.WHATSAPP:
             try:

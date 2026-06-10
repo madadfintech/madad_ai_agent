@@ -70,6 +70,11 @@ class Tools:
     # invoice prompt, portal login, etc.) instead of being silently re-
     # onboarded. Closes Bug #2 + Bug #6.
     MCP_CHECK_REGISTRATION = "madad_mcp_check_registration"
+    # Business-email capture step (right after YES). Backend returns
+    # {ok, conflict, alreadyPortalUser}: conflict -> ask for a different email /
+    # contact support; otherwise attach the email (also makes the lead a
+    # normal, portal-loginable user) and continue to the CR step.
+    MCP_SET_BUSINESS_EMAIL = "madad_mcp_set_business_email"
 
     # -- KYC (30; ``madad_kyc_complete_stage`` deliberately omitted) ---------
     KYC_UPDATE_ELIGIBILITY = "madad_kyc_update_eligibility"

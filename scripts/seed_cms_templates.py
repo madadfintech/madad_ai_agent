@@ -93,6 +93,18 @@ _TEMPLATE_BODIES = {
         "4) Is your business based in Qatar?\n"
         "5) Your role at the business (FOUNDER / DIRECTOR / SHAREHOLDER / ...)"
     ),
+    # Business-email step — asked right after YES / account creation, before
+    # the consent/CR step. Capturing it makes the lead portal-loginable.
+    "onboarding.business_email.ask": (
+        "Your Madad account is all set! 🎉\n\n"
+        "What's your business email? We'll use it for your account and to keep "
+        "you updated on your application. 📧"
+    ),
+    "onboarding.business_email.conflict": (
+        "Looks like a business is already registered with that email.\n\n"
+        "Please reply with a different business email, or contact our support "
+        "team at support@madadfintech.com and we'll help you out. 📧"
+    ),
     "onboarding.consent.request": (
         "Great to know! 🎉 We have financed many businesses like yours in Qatar.\n\n"
         "To start the journey we need to first verify that your business is in Qatar "

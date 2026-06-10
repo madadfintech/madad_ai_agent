@@ -113,6 +113,12 @@ class OnboardingState(WorkflowState):
 
     # Step 1–2: campaign + consent + CR.
     entry_reply: str = ""
+    # Business-email step (right after YES, before consent/CR). business_email
+    # holds the captured address; business_email_status drives the router:
+    # "ok" -> proceed to consent/CR, "conflict" -> ask for a different email,
+    # "portal" -> existing portal account (log in), None/"" -> still awaiting.
+    business_email: str | None = None
+    business_email_status: str | None = None
     consent: bool = False
     cr_ref: str | None = None
     cr_filename: str | None = None

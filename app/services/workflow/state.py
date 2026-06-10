@@ -133,6 +133,20 @@ class OnboardingState(WorkflowState):
     documents_received: bool = False
     buyers: list[dict[str, Any]] = []
     shareholders: list[dict[str, Any]] = []
+    # Per Ishan (UAT 2026-06-10): classifier hangs (notably AoA) cause
+    # individual classify calls to fail, leaving required codes "still
+    # needed" forever even after the SME has uploaded enough docs. Match
+    # the count-based unblock in ``DocumentIntelligenceService`` (PR #4,
+    # commit 6c05b1c) — total attachments the SME has actually sent in
+    # the post-prequal docs phase, regardless of classification outcome.
+    # When this hits ``len(DEFAULT_WHATSAPP_REQUIRED_DOCS)`` the docs
+    # loop unblocks even if some required slots are still pending.
+    docs_uploaded_count: int = 0
+    # Tracks the SME's reply to the "any more documents to upload?" prompt
+    # that fires once the docs phase has produced enough uploads. NO → the
+    # run advances to payment_wait. YES → the run loops back to the docs
+    # upload-await node so they can keep sending.
+    more_docs_decision: str | None = None  # "yes" | "no" | None (not asked yet)
     # Bug #11 (UAT 2026-06-09): debounce the ``documents.processing`` ack
     # so the bridge's per-file POST burst (one inbound per ZIP-member,
     # 8+ messages in a few seconds) doesn't spam the user with 8 copies

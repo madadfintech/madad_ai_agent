@@ -194,6 +194,17 @@ _TEMPLATE_BODIES = {
         "and I'll take it from there. 🙂\n\n"
         "Have a question? Just ask — happy to help. For any query call 72773652."
     ),
+    # Per user (UAT 2026-06-10): after the coffee message we explicitly ask
+    # the SME whether they have any more documents to send (classifier
+    # failures + the "I forgot one" case). Reply YES / NO; existing
+    # synonym set covers Ok / Sure / Nope / etc. WhatsApp interactive
+    # reply-button send is on the cluster's backlog; until that ships,
+    # this is plain-text + the synonym-aware matcher.
+    "onboarding.documents.more_docs_prompt": (
+        "📄 Do you have any more documents to upload?\n\n"
+        "Reply YES if you'd like to send more, or NO if you're done — "
+        "we'll proceed with the next step."
+    ),
     # Immediate ack the instant a valid CR attachment arrives — guarantees the
     # user always sees a response even if the downstream upload + financials
     # prompt fails (QA Bug #1 + Ishan handover §9 / 2026-06-09).

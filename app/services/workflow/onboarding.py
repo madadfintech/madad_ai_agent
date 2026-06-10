@@ -127,6 +127,7 @@ TEMPLATE_KEYS = [
     "onboarding.upload.required",
     "onboarding.cr.received",
     "onboarding.documents.processing",
+    "onboarding.documents.more_docs_prompt",
     "onboarding.documents.upload_failed",
     "onboarding.status.pending",
     "onboarding.payment.awaiting",
@@ -670,6 +671,84 @@ def _format_banks_list(banks: list[str]) -> str:
     return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
 
 
+def _extract_offers_from_me(info: Any) -> list[dict[str, Any]]:
+    """Read the offer list off an ``auth_me`` response.
+
+    Per Ishan's handover §8 (2026-06-09): the field on the enriched
+    ``/me`` payload is ``offersReceived``, not ``offers``. Earlier code
+    only checked ``info.get("offers")`` and silently rendered empty
+    offer cards in the WhatsApp "Exciting news — your financing offers
+    are ready!" template (UAT screenshot 2026-06-10). Try every shape
+    the backend is known to use so a one-off field rename can't drop
+    offers on the floor again.
+    """
+
+    if not isinstance(info, dict):
+        return []
+    for owner in (info, info.get("user") if isinstance(info.get("user"), dict) else None):
+        if not isinstance(owner, dict):
+            continue
+        for key in ("offersReceived", "offers", "offer_list"):
+            raw = owner.get(key)
+            if isinstance(raw, list):
+                return [o for o in raw if isinstance(o, dict)]
+    return []
+
+
+def _extract_reference_from_me(info: Any) -> str | None:
+    """Read the application reference number off ``auth_me``.
+
+    The backend exposes the same value under several field names across
+    `user.uniqueId` / `user.referenceNumber` / top-level `referenceNumber`.
+    Falls back to None when none are populated so callers can keep their
+    existing ``or state.application_ref`` chain."""
+
+    if not isinstance(info, dict):
+        return None
+    candidates = (info, info.get("user") if isinstance(info.get("user"), dict) else None)
+    for owner in candidates:
+        if not isinstance(owner, dict):
+            continue
+        for key in (
+            "referenceNumber", "reference_number",
+            "uniqueId", "unique_id", "applicationRef", "application_ref",
+        ):
+            value = owner.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _extract_credit_line_from_me(info: Any) -> dict[str, Any]:
+    """Read the active credit line off ``auth_me``.
+
+    Per Ishan's handover §8: ``creditLines`` is a list (one per active
+    line). For the activation message (PDF Step 9) we want the most
+    recent active entry. Returns an empty dict when none are present so
+    the caller can fall back to its existing offer-derived fields.
+    """
+
+    if not isinstance(info, dict):
+        return {}
+    candidates = (info, info.get("user") if isinstance(info.get("user"), dict) else None)
+    for owner in candidates:
+        if not isinstance(owner, dict):
+            continue
+        raw = owner.get("creditLines") or owner.get("credit_lines")
+        if isinstance(raw, list) and raw:
+            for entry in raw:
+                if isinstance(entry, dict):
+                    status = str(
+                        entry.get("status") or entry.get("state") or ""
+                    ).upper()
+                    if not status or "ACTIVE" in status:
+                        return entry
+            first = raw[0]
+            if isinstance(first, dict):
+                return first
+    return {}
+
+
 def _format_offer_cards(offers: list[dict[str, Any]]) -> str:
     """Render the offer set as PDF Step 8-style cards (one block per offer).
 
@@ -826,6 +905,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             "documents_upload_loop_send": self._documents_upload_loop_send,
             "documents_upload_loop_await": self._documents_upload_loop_await,
             "documents_complete": self._documents_complete,
+            "more_docs_prompt_send": self._more_docs_prompt_send,
+            "more_docs_prompt_await": self._more_docs_prompt_await,
             # Postman-triggered gates (demo): pre-qualification (after audit)
             # and payment (after coffee) are released by an external trigger.
             "prequalify_wait_await": self._prequalify_wait_await,
@@ -952,10 +1033,25 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "await_again": "documents_upload_loop_await",
             },
         )
-        # Spec Step 5 → payment: after the coffee message, PARK until the payment
-        # step is triggered (via Postman in the demo). On trigger → Madad score +
-        # the "Pay QAR 6,000 →" button.
-        graph.add_edge("documents_complete", "payment_wait_await")
+        # Per user (UAT 2026-06-10): after the coffee message, ask whether
+        # the SME wants to send more documents. Classifier failures and
+        # post-prequal "I forgot one" cases need an explicit way back into
+        # the upload loop instead of being forced past it. NO routes on to
+        # payment_wait_await; YES loops back to documents_upload_loop_await.
+        graph.add_edge("documents_complete", "more_docs_prompt_send")
+        graph.add_edge("more_docs_prompt_send", "more_docs_prompt_await")
+        graph.add_conditional_edges(
+            "more_docs_prompt_await",
+            self._route_more_docs,
+            {
+                "yes": "documents_upload_loop_await",
+                "no": "payment_wait_await",
+                "await_again": "more_docs_prompt_await",
+            },
+        )
+        # Spec Step 5 → payment: after the coffee message + more-docs prompt,
+        # PARK until the payment step is triggered (via Postman in the demo).
+        # On trigger → Madad score + the "Pay QAR 6,000 →" button.
         graph.add_conditional_edges(
             "payment_wait_await",
             self._route_payment_wait,
@@ -2312,6 +2408,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         # re-query the backend's requested-docs list, which kept returning the
         # just-uploaded docs as still-missing and caused the loop).
         missing = pending
+        # Per Ishan + user (UAT 2026-06-10): classifier hangs (e.g. AoA)
+        # leave required slots permanently "still needed" even when the
+        # SME has uploaded enough total files. Track every attachment we
+        # processed this turn (validated, ⏳, or even unclassifiable);
+        # ``_route_documents`` exits when the cumulative count meets the
+        # required count regardless of pending slots. Mirrors the doc-
+        # service's count-based unblock (PR #4, commit 6c05b1c).
+        new_uploaded_count = state.docs_uploaded_count + len(attachments)
         if not missing:
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
@@ -2321,6 +2425,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx,
             missing_documents=missing,
             documents_received=bool(attachments),
+            docs_uploaded_count=new_uploaded_count,
             access_token=token,
             refresh_token=refresh,
             token_expires_at=expires,
@@ -2469,6 +2574,45 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
+
+    async def _more_docs_prompt_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """Per user (UAT 2026-06-10): after the coffee message, ask the SME
+        whether they have any more documents to send. Covers the classifier-
+        failure case (e.g. AoA hangs → marked unprocessed → count-based
+        unblock advanced us anyway) and the "I forgot one" case so the SME
+        can keep sending docs even after the loop has provisionally
+        completed. YES → loops back to the upload-await node; NO → run
+        proceeds to payment_wait.
+        """
+
+        await self._send(ctx, state, "onboarding.documents.more_docs_prompt")
+        # Clear any stale decision from a previous trip through this prompt
+        # so the router waits for THIS turn's reply.
+        return self._step("more_docs_prompt_send", ctx, more_docs_decision=None)
+
+    async def _more_docs_prompt_await(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        reply = await_input({"waiting_for": "reply", "step": "more_docs_prompt"})
+        if is_yes(reply):
+            # Reset the upload counter so the count-based unblock fires
+            # again only after this fresh batch meets the threshold.
+            return self._step(
+                "more_docs_prompt_await", ctx,
+                more_docs_decision="yes",
+                docs_uploaded_count=0,
+            )
+        if is_no(reply):
+            return self._step("more_docs_prompt_await", ctx, more_docs_decision="no")
+        # Off-script reply — answer in context and re-prompt.
+        await self._smart_contextual(
+            ctx, state, reply,
+            "No problem — just reply YES if you have more documents to send, "
+            "or NO if you're done. 🙂",
+        )
+        return self._step("more_docs_prompt_await", ctx, more_docs_decision=None)
 
     # -- Postman-triggered gates (pre-qualification + payment) ----------------
 
@@ -2868,15 +3012,37 @@ class OnboardingWorkflow(WorkflowDefinition):
             # forwards). Fail-safe to the empty list so the message still goes
             # out — minus the bank-list line.
             banks = await self._fetch_banks_to_send(state, ctx)
+            # UAT 2026-06-10 screenshot: "(Ref: )" rendered empty because
+            # state.application_ref was never populated for the SIGN_UP
+            # paths that don't capture session.reference_number. Fetch
+            # from /me as a fallback so the SME always sees their ref
+            # number on the payment-confirmed message.
+            ref = state.application_ref
+            if not ref:
+                token = (await self._live_token(state, ctx))[0]
+                if token:
+                    try:
+                        info = await self._identity.me(access_token=token)
+                        ref = _extract_reference_from_me(info)
+                    except Exception as exc:  # noqa: BLE001
+                        ctx.logger.warning(
+                            "payment_confirmed.ref_fetch_failed",
+                            error=str(exc)[:200],
+                        )
             await self._send(
                 ctx,
                 state,
                 "onboarding.payment.confirmed",
                 {
                     "banks":     _format_banks_list(banks),
-                    "ref":       state.application_ref or "",
+                    "ref":       ref or "",
                     "bank_count": len(banks),
                 },
+            )
+            return self._step(
+                "payment_await", ctx,
+                paid=paid,
+                application_ref=ref or state.application_ref,
             )
         return self._step("payment_await", ctx, paid=paid)
 
@@ -3000,20 +3166,33 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         # The backend embeds the lender offer set on the user record once the
-        # journey reaches ACCEPTED. Pull it off the latest auth_me response.
+        # journey reaches ACCEPTED. UAT 2026-06-10: the enriched /me payload
+        # exposes them under ``offersReceived`` (Ishan handover §8), not
+        # ``offers`` — earlier code rendered the offers template with empty
+        # cards because the field name didn't match. Try the registered
+        # payload first (already on state if check_registration ran),
+        # otherwise fetch fresh.
         offers: list[dict[str, Any]] = []
-        if state.access_token:
-            info = await self._identity.me(access_token=state.access_token)
-            if isinstance(info, dict):
-                raw = info.get("offers")
-                if isinstance(raw, list):
-                    offers = list(raw)
+        if isinstance(state.registration_payload, dict):
+            raw = state.registration_payload.get("offers")
+            if isinstance(raw, list):
+                offers = [o for o in raw if isinstance(o, dict)]
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not offers and token:
+            try:
+                info = await self._identity.me(access_token=token)
+                offers = _extract_offers_from_me(info)
+            except Exception as exc:  # noqa: BLE001 — degrade gracefully
+                ctx.logger.warning(
+                    "offers_fetch.me_failed", error=str(exc)[:200]
+                )
         # Step 8 — offers ready, handing off to platform.
         progress_step = await self._update_progress(state, ctx, step=8)
         return self._step(
             "offers_fetch",
             ctx,
             offers=offers,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
 
@@ -3067,28 +3246,37 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _activated(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        # A8b: PDF Step 9 — render the accepted offer's lender / limit / rate /
-        # tenure on the activation message. Prefer state.selected_offer if set
-        # (offer-handoff flow); otherwise look at state.offers (offers_fetch
-        # may have populated it from auth_me); otherwise call auth_me directly
-        # for the latest offer set.
-        offer = state.selected_offer or {}
+        # A8b: PDF Step 9 — render the lender / limit / rate / tenure on the
+        # activation message. UAT 2026-06-10: the prior code only inspected
+        # ``offers`` on /me which is the wrong field name (it's
+        # ``offersReceived``), and didn't read the actual ``creditLines``
+        # entry at all — so the activated message showed empty details
+        # even when the line was active. Preference order now:
+        #   1. state.selected_offer (offer-handoff flow set it)
+        #   2. state.registration_payload.creditLine (if check_registration
+        #      already returned an active line)
+        #   3. /me creditLines (most authoritative for an ACTIVE state)
+        #   4. /me offersReceived → look for an ACCEPTED offer / fall back to first
+        offer: dict[str, Any] = state.selected_offer or {}
         offers = list(state.offers)
-        if not offer and not offers and state.access_token:
+        credit_line: dict[str, Any] = {}
+        if isinstance(state.registration_payload, dict):
+            cl = state.registration_payload.get("creditLine")
+            if isinstance(cl, dict):
+                credit_line = cl
+
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not (offer or credit_line) and token:
             try:
-                info = await self._identity.me(access_token=state.access_token)
-                if isinstance(info, dict):
-                    raw = info.get("offers")
-                    if isinstance(raw, list):
-                        offers = raw
+                info = await self._identity.me(access_token=token)
+                credit_line = credit_line or _extract_credit_line_from_me(info)
+                if not offers:
+                    offers = _extract_offers_from_me(info)
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
-                    "activated.offers_fetch_failed",
-                    error=str(exc)[:200],
-                    note="continuing with generic activation message",
+                    "activated.me_failed", error=str(exc)[:200]
                 )
         if not offer and offers:
-            # Look for an explicitly-accepted offer; fall back to the first.
             for cand in offers:
                 if isinstance(cand, dict):
                     status = str(
@@ -3101,23 +3289,26 @@ class OnboardingWorkflow(WorkflowDefinition):
                 first = offers[0] if offers else {}
                 offer = first if isinstance(first, dict) else {}
 
-        def _g(key_camel: str, key_snake: str) -> Any:
-            value = offer.get(key_camel)
-            if value is None:
-                value = offer.get(key_snake)
-            return value
+        # Read each field from credit_line first (Step 9 ground truth),
+        # offer second (handoff time), then fall back to "—".
+        def _from_any(*keys: str) -> Any:
+            for src in (credit_line, offer):
+                for k in keys:
+                    if k in src and src[k] is not None:
+                        return src[k]
+            return None
 
-        lender = _g("lender", "lender") or "your bank"
+        lender = _from_any("lender", "lenderName", "bank_name", "bankName") or "your bank"
         try:
-            limit = f"QAR {int(_g('creditLimit', 'credit_limit') or 0):,}"
+            limit = f"QAR {int(_from_any('creditLimit', 'credit_limit', 'limit') or 0):,}"
         except (TypeError, ValueError):
             limit = "QAR —"
         try:
-            rate = f"{float(_g('interestRate', 'interest_rate') or 0):g}%"
+            rate = f"{float(_from_any('interestRate', 'interest_rate', 'rate') or 0):g}%"
         except (TypeError, ValueError):
             rate = "—"
         try:
-            tenure = f"{int(_g('tenureDays', 'tenure_days') or 0)} days"
+            tenure = f"{int(_from_any('tenureDays', 'tenure_days', 'tenure') or 0)} days"
         except (TypeError, ValueError):
             tenure = "—"
 
@@ -3133,7 +3324,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "ref": state.application_ref or "",
             },
         )
-        return self._step("activated", ctx, outcome="completed")
+        return self._step(
+            "activated", ctx,
+            outcome="completed",
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
 
     async def _invoice_collect_await(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -3296,9 +3491,27 @@ class OnboardingWorkflow(WorkflowDefinition):
             return "payment"
         # Natural completion path: the SME uploaded every required doc.
         # The coffee message IS accurate here, so the original flow
-        # (documents_complete → payment_wait_await → trigger) stays.
+        # (documents_complete → more_docs_prompt) stays.
         if not state.missing_documents:
             return "complete"
+        # Per Ishan + user (UAT 2026-06-10): the classifier hangs (notably
+        # AoA) leave required slots permanently "still needed" even when
+        # the SME has uploaded enough total files. Count-based unblock:
+        # if the cumulative attachment count meets the required count, the
+        # SME has done their part — proceed to the coffee message with the
+        # current state and let the "any more documents?" prompt cover the
+        # tail. Guarded so 1 upload vs 10 required stays incomplete.
+        required = len(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+        if required and state.docs_uploaded_count >= required:
+            return "complete"
+        return "await_again"
+
+    def _route_more_docs(self, state: OnboardingState) -> str:
+        decision = (state.more_docs_decision or "").lower()
+        if decision == "yes":
+            return "yes"
+        if decision == "no":
+            return "no"
         return "await_again"
 
     def _route_prequalify_wait(self, state: OnboardingState) -> str:

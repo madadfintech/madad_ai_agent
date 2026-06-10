@@ -295,6 +295,20 @@ class MadadIdentityClient(Protocol):
         own in-memory state."""
         ...
 
+    async def set_business_email(
+        self,
+        *,
+        email: str,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach the lead's BUSINESS email (the step right after YES). Returns
+        ``{ok, conflict, alreadyPortalUser, ...}`` — ``conflict=True`` means the
+        email is already registered, so offer different-email / contact-support
+        instead of advancing to the CR step."""
+        ...
+
 
 class InMemoryMadadIdentityClient:
     """Configurable fake implementing :class:`MadadIdentityClient`.
@@ -486,6 +500,25 @@ class InMemoryMadadIdentityClient:
             identifier=identifier,
         )
         return {"step": 0, "journey_status": "SIGN_UP", "last_inbound_at": None}
+
+    async def set_business_email(
+        self,
+        *,
+        email: str,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        self._record(
+            "set_business_email",
+            email=email,
+            user_id=user_id,
+            channel=channel,
+            identifier=identifier,
+        )
+        # Configurable conflict for tests: emails in ``self.taken_emails`` clash.
+        conflict = email.strip().lower() in getattr(self, "taken_emails", set())
+        return {"ok": not conflict, "conflict": conflict, "email": email}
 
 
 # -- KycClient: the new port the Phase 2 graph uses for KYC tools -------------

@@ -327,6 +327,28 @@ class McpMadadIdentityClient:
             Tools.MCP_GET_ONBOARDING_PROGRESS, payload
         )
 
+    async def set_business_email(
+        self,
+        *,
+        email: str,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach the lead's BUSINESS email (the step right after YES). Returns
+        the backend payload ``{ok, conflict, alreadyPortalUser, ...}``;
+        ``conflict=True`` means the email is already registered to another
+        account, so the agent asks for a different email / contact support
+        instead of advancing to the CR step."""
+        payload: dict[str, Any] = {"email": email}
+        if user_id is not None:
+            payload["user_id"] = user_id
+        if channel is not None:
+            payload["channel"] = _channel_value(channel)
+        if identifier is not None:
+            payload["identifier"] = identifier
+        return await self._tools.call_tool(Tools.MCP_SET_BUSINESS_EMAIL, payload)
+
     async def check_registration(
         self,
         *,

@@ -300,6 +300,20 @@ class MadadIdentityClient(Protocol):
         own in-memory state."""
         ...
 
+    async def set_business_email(
+        self,
+        *,
+        email: str,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach the lead's BUSINESS email (step right after YES). Returns
+        ``{ok, conflict, alreadyPortalUser, ...}`` — ``conflict=True`` means the
+        email is already registered, so ask for a different email / contact
+        support instead of advancing to the CR step."""
+        ...
+
     async def check_registration(
         self,
         *,
@@ -519,6 +533,24 @@ class InMemoryMadadIdentityClient:
             identifier=identifier,
         )
         return {"step": 0, "journey_status": "SIGN_UP", "last_inbound_at": None}
+
+    async def set_business_email(
+        self,
+        *,
+        email: str,
+        user_id: str | None = None,
+        channel: Channel | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        self._record(
+            "set_business_email",
+            email=email,
+            user_id=user_id,
+            channel=channel,
+            identifier=identifier,
+        )
+        conflict = email.strip().lower() in getattr(self, "taken_emails", set())
+        return {"ok": not conflict, "conflict": conflict, "email": email}
 
     async def check_registration(
         self,

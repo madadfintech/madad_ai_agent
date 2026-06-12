@@ -68,15 +68,28 @@ async def _drive_to_completion(harness):
     assert after_pay.prompt == {"waiting_for": "journey_status", "step": "lender_wait"}
 
     # Backend advances → ACCEPTED → offers_fetch → offer_view → handoff.
+    # Ishan 17c3d44 (2026-06-11): the run no longer completes at handoff;
+    # it parks at journey_wait_await so the post-handoff offer.accepted +
+    # credit_line.activated webhooks can fire the ✅ confirmation and
+    # 🎊 activation messages, then transitions into invoice_collect_await
+    # so the SME can submit invoices once the line is live.
     harness.identity.journey_status = "ACCEPTED"
-    return await resume({"type": "status_update"})
+    await resume({"type": "status_update"})
+    harness.identity.journey_status = "OFFER_ACCEPTED"
+    await resume({"type": "status_update", "lenderName": "Qatar Islamic Bank"})
+    harness.identity.journey_status = "ACTIVATED"
+    return await resume({"type": "status_update", "lenderName": "Qatar Islamic Bank"})
 
 
 async def test_full_onboarding_completes(harness):
     result = await _drive_to_completion(harness)
 
-    assert result.status == RunStatus.COMPLETED
-    assert result.values["outcome"] == "offer_handoff"
+    # Run stays open at invoice_collect after activation — the SME can now
+    # submit invoices over WhatsApp. ``outcome="completed"`` is the marker
+    # that onboarding-proper finished; the run lives on for invoice work.
+    assert result.status == RunStatus.WAITING_FOR_INPUT
+    assert result.prompt == {"waiting_for": "invoice", "step": "invoice_collect"}
+    assert result.values["outcome"] == "completed"
     # collect_details step is gone — onboarding_first_name / onboarding_last_name
     # are no longer captured. CR upload + financials + docs still are.
     assert result.values["consent"] is True

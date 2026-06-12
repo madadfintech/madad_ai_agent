@@ -146,6 +146,7 @@ TEMPLATE_KEYS = [
     "onboarding.offers.preview",
     "onboarding.offer.handoff",
     "onboarding.offer.handoff.button",
+    "onboarding.offer.confirmed",
     "onboarding.activated",
 ]
 
@@ -757,6 +758,60 @@ def _extract_credit_line_from_me(info: Any) -> dict[str, Any]:
     return {}
 
 
+def _offers_sig(offers: list[dict[str, Any]]) -> str:
+    """Stable signature of the offer set (lender + key terms), so we re-send the
+    offer cards only when a lender actually adds/changes an offer — not on every
+    routine status poll while the SME is deciding."""
+    parts = sorted(
+        f"{_lender_name(o) or '?'}|{o.get('creditLimit') or o.get('credit_limit')}"
+        f"|{o.get('interestRate') or o.get('interest_rate')}"
+        f"|{o.get('tenureDays') or o.get('tenure_days')}"
+        for o in (offers or [])
+        if isinstance(o, dict)
+    )
+    return ";".join(parts)
+
+
+def _selected_offer_from_payload(payload: Any) -> dict[str, Any] | None:
+    """Pull the lender + terms off an offer.selected / credit_line.activated
+    webhook payload so the confirmation/activation messages can name the bank."""
+    if not isinstance(payload, dict):
+        return None
+    name = payload.get("lenderName") or payload.get("bankName")
+    if not name:
+        return None
+    return {
+        "lenderName": name,
+        "creditLimit": payload.get("creditLimit"),
+        "interestRate": payload.get("interestRate"),
+        "tenureDays": payload.get("tenureDays"),
+        "currency": payload.get("currency"),
+    }
+
+
+def _lender_name(offer: dict[str, Any]) -> str | None:
+    """Extract a lender's display NAME from an offer across every shape the
+    backend uses: ``lenderName`` (webhook payload), ``lender`` as a plain
+    string, or ``lender`` / ``financialInstitution`` as a nested object with a
+    ``name``. Prevents rendering the raw ``{id, name}`` object in the message.
+    """
+    if not isinstance(offer, dict):
+        return None
+    for key in ("lenderName", "bankName", "lender_name", "bank_name"):
+        v = offer.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for key in ("lender", "financialInstitution", "bank"):
+        v = offer.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, dict):
+            name = v.get("name") or v.get("displayName")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return None
+
+
 def _format_offer_cards(offers: list[dict[str, Any]]) -> str:
     """Render the offer set as PDF Step 8-style cards (one block per offer).
 
@@ -798,7 +853,7 @@ def _format_offer_cards(offers: list[dict[str, Any]]) -> str:
 
     lines: list[str] = []
     for idx, offer in enumerate(offers, start=1):
-        lender = _g(offer, "lender", "bank_name", "bankName") or "Lender"
+        lender = _lender_name(offer) or "Lender"
         limit = _fmt_qar(_g(offer, "creditLimit", "credit_limit", "limit"))
         rate = _fmt_pct(_g(offer, "interestRate", "interest_rate", "rate"))
         tenure = _fmt_days(_g(offer, "tenureDays", "tenure_days", "tenure"))
@@ -945,6 +1000,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "offers_fetch": self._offers_fetch,
             "offer_view_send": self._offer_view_send,
             "offer_handoff_to_madad": self._offer_handoff_to_madad,
+            "offer_confirmed": self._offer_confirmed,
             "activated": self._activated,
             "invoice_collect_await": self._invoice_collect_await,
         }
@@ -1115,6 +1171,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "ineligible": "not_eligible",
                 "unqualified": "not_qualified",
                 "offers": "offers_fetch",
+                "offer_confirmed": "offer_confirmed",
                 "activated": "activated",
                 "wait": "journey_wait_await",
             },
@@ -1145,6 +1202,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "ineligible": "not_qualified",
                 "unqualified": "not_qualified",
                 "offers": "offers_fetch",
+                "offer_confirmed": "offer_confirmed",
                 "activated": "activated",
                 "wait": "lender_wait_await",
             },
@@ -1157,6 +1215,14 @@ class OnboardingWorkflow(WorkflowDefinition):
 
         graph.add_edge("offers_fetch", "offer_view_send")
         graph.add_edge("offer_view_send", "offer_handoff_to_madad")
+        # Step 8 → 9: after showing offers + the "Login to Madad" button the run
+        # must NOT terminate — it parks in journey_wait_await so the post-handoff
+        # webhooks can resume it: another lender's offers.available (re-show ALL
+        # offers), offer.selected (✅ confirmation), credit_line.activated
+        # (activation message). Previously offer_handoff was a finish node, so
+        # every one of those events hit a dead run and no message was sent.
+        graph.add_edge("offer_handoff_to_madad", "journey_wait_await")
+        graph.add_edge("offer_confirmed", "journey_wait_await")
 
         # Step 9 → 10-13: after the credit-line activation message, the run no
         # longer terminates — it parks to collect invoices for financing. Each
@@ -1174,7 +1240,6 @@ class OnboardingWorkflow(WorkflowDefinition):
             "domain_blocked",
             "not_eligible",
             "not_qualified",
-            "offer_handoff_to_madad",
             # Returning-user route per Ishan's check_registration tool —
             # the SME has been re-greeted with the right message, no
             # further onboarding work is needed in this run.
@@ -2940,6 +3005,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         forced = _extract_journey_status(payload)
         if forced is not None:
             fields["journey_status"] = forced
+        # The offer.selected / credit_line.activated webhooks carry the
+        # lender + terms; capture them so the ✅ confirmation and 🎊 activation
+        # messages can name the bank without an extra /me round-trip.
+        sel = _selected_offer_from_payload(payload)
+        if sel:
+            fields["selected_offer"] = sel
         return self._step("journey_wait_await", ctx, **fields)
 
     async def _not_qualified(
@@ -3356,13 +3427,19 @@ class OnboardingWorkflow(WorkflowDefinition):
         # into the single CTA-URL message sent by ``_offer_handoff_to_madad``
         # so the SME sees one clean message with offer details + login
         # button. This node stays in the graph for state-transition
-        # symmetry but no longer emits anything.
+        # symmetry but no longer emits anything. (Ishan's 2026-06-11 sig
+        # guard for re-send-on-new-lender lives on the handoff node instead.)
         return self._step("offer_view_send", ctx)
 
     async def _offer_handoff_to_madad(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         # Combined "your offers are ready + login to select" message.
+        # Re-send guard (Ishan, bdc7e2a): the status poller re-enters this
+        # route ~every minute while the SME is deciding. Only (re)send the
+        # button when the offer set actually changed (a new lender's offer).
+        if _offers_sig(state.offers) == state.offers_shown_sig:
+            return self._step("offer_handoff_to_madad", ctx, outcome="offer_handoff")
         # PDF Step 8 — tappable "Login to Madad →" CTA-URL button on WhatsApp
         # with offer details inline (UAT 2026-06-10: was firing as two bubbles
         # with empty cards). Meta caps the button label at 20 chars. Falls
@@ -3401,7 +3478,28 @@ class OnboardingWorkflow(WorkflowDefinition):
                 },
             )
             await self._send(ctx, state, "onboarding.offer.handoff")
-        return self._step("offer_handoff_to_madad", ctx, outcome="offer_handoff")
+        # Record the shown offer set so routine polls don't re-send these cards.
+        return self._step(
+            "offer_handoff_to_madad", ctx, outcome="offer_handoff",
+            offers_shown_sig=_offers_sig(state.offers),
+        )
+
+    async def _offer_confirmed(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        # The SME selected an offer in the Madad portal (backend offer.selected
+        # webhook → OFFER_ACCEPTED). Send the one-time ✅ confirmation, then park
+        # (the edge back to journey_wait_await) for the credit-line activation.
+        # Guarded so a later background poll that still reports OFFER_ACCEPTED
+        # can't re-send the confirmation.
+        if state.offer_confirmed_sent:
+            return self._step("offer_confirmed", ctx)
+        offer = state.selected_offer or {}
+        lender = _lender_name(offer) or "your selected bank"
+        await self._send(
+            ctx, state, "onboarding.offer.confirmed", {"lender": lender}
+        )
+        return self._step("offer_confirmed", ctx, offer_confirmed_sent=True)
 
     async def _activated(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -3709,8 +3807,13 @@ class OnboardingWorkflow(WorkflowDefinition):
             return "ineligible"
         if s in (JourneyStatus.UNQUALIFIED, JourneyStatus.NOT_ACCEPTED):
             return "unqualified"
-        if s in (JourneyStatus.ACCEPTED, JourneyStatus.OFFER_ACCEPTED):
+        # ACCEPTED = a lender just made (another) offer → (re)show ALL offers.
+        # OFFER_ACCEPTED = the SME picked one in the portal → ✅ confirmation.
+        # Split so a portal selection doesn't re-spam the offer list.
+        if s == JourneyStatus.ACCEPTED:
             return "offers"
+        if s == JourneyStatus.OFFER_ACCEPTED:
+            return "offer_confirmed"
         if s == JourneyStatus.ACTIVATED:
             return "activated"
         return "wait"

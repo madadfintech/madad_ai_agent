@@ -190,7 +190,11 @@ async def test_poller_advances_a_due_run_at_journey_wait_await() -> None:
 
     # Backend status advances → poller picks it up.
     # Post-merge the run is parked at lender_wait_await (we already paid).
-    # An ACCEPTED status moves it to offers_fetch → offer_handoff terminal.
+    # Ishan 17c3d44 (2026-06-11): an ACCEPTED status no longer completes
+    # the run — it re-parks at journey_wait_await for the post-handoff
+    # offer.accepted / credit_line.activated webhooks. Assert the run is
+    # still waiting (advanced past lender_wait, now sitting at the
+    # post-handoff park point) rather than completed.
     platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
 
     stats = await run_status_poller(
@@ -198,8 +202,12 @@ async def test_poller_advances_a_due_run_at_journey_wait_await() -> None:
     )
 
     assert stats.polled == 1
-    # After the poll, the run completed via offers_fetch → offer_handoff.
-    runs = await platform.runtime.run_store.list_by_status(RunStatus.COMPLETED)
+    # After the poll, the run is parked at journey_wait (post-handoff)
+    # rather than completed. The offer_handoff outcome is recorded in
+    # state to mark that the handoff message was sent.
+    runs = await platform.runtime.run_store.list_by_status(
+        RunStatus.WAITING_FOR_INPUT
+    )
     matching = [r for r in runs if r.identity == identity]
     assert len(matching) == 1
 

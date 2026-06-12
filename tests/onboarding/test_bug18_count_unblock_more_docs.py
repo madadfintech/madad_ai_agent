@@ -35,16 +35,30 @@ def _wf() -> OnboardingWorkflow:
     return build_onboarding_platform().workflow
 
 
-def test_route_documents_unblocks_on_count_with_missing_slots() -> None:
-    """Classifier hung on a few docs → required slots stay pending → the
-    count-based unblock kicks in and lets the loop complete (coffee once)."""
+def test_route_documents_incomplete_stays_in_loop_no_auto_coffee() -> None:
+    """Classifier hung on a few docs → required slots stay pending. We do NOT
+    auto-complete to the coffee (that would be a misleading 'all received').
+    Instead the loop stays parked — the in-loop 'any more documents?' prompt
+    fires and the SME replies NO to proceed (user 2026-06-12)."""
     wf = _wf()
     state = OnboardingState(
         identity=IDENTITY,
         missing_documents=["aoa", "proof_of_address"],
         docs_uploaded_count=len(DEFAULT_WHATSAPP_REQUIRED_DOCS),
     )
-    assert wf._route_documents(state) == "complete"  # noqa: SLF001
+    assert wf._route_documents(state) == "await_again"  # noqa: SLF001
+
+
+def test_route_documents_proceed_on_no() -> None:
+    """SME replied NO to 'any more documents?' (docs_proceed) → route straight
+    to the payment-wait park even with docs still missing."""
+    wf = _wf()
+    state = OnboardingState(
+        identity=IDENTITY,
+        missing_documents=["aoa"],
+        docs_proceed=True,
+    )
+    assert wf._route_documents(state) == "proceed"  # noqa: SLF001
 
 
 def test_route_documents_does_not_unblock_below_threshold() -> None:

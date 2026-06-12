@@ -546,6 +546,10 @@ def _parse_shareholder_text(text: str, fallback_phone: str | None) -> list[dict[
 # messages in 3 seconds. 30s covers a typical multi-file burst plus a small
 # buffer; anything older is treated as a fresh batch and re-fires the ack.
 DOCS_PROCESSING_ACK_TTL_SECONDS = 30.0
+# The "any more documents?" prompt is debounced to once per upload burst — a
+# ZIP / multi-doc upload arrives as many separate inbounds and must not yield
+# one prompt per file (user 2026-06-12).
+MORE_DOCS_PROMPT_TTL_SECONDS = 45.0
 
 # Bug #15 (UAT 2026-06-09): same debounce shape but for the full
 # "📋 Application checklist" body. Per-file POSTs land as separate
@@ -1148,6 +1152,9 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "payment": "business_details_fetch",
                 "missing": "documents_upload_loop_send",
                 "await_again": "documents_upload_loop_await",
+                # SME replied NO to "any more documents?" → proceed to the
+                # payment-wait park even though some docs are still undetected.
+                "proceed": "payment_wait_await",
             },
         )
         # Per user (2026-06-12): NO "any more documents?" prompt once the
@@ -2491,7 +2498,35 @@ class OnboardingWorkflow(WorkflowDefinition):
                     missing_documents=list(state.missing_documents),
                     documents_received=False,
                 )
-            # No file — it's a question, a "no", or chit-chat. Answer it in
+            # "NO / done" → the SME wants to proceed even though some required
+            # docs weren't detected (frustrated-user escape hatch, user
+            # 2026-06-12). Only honoured once we've actually shown the "any
+            # more documents?" prompt, so a stray "no" earlier in the phase
+            # can't skip the document step.
+            if is_no(reply) and state.more_docs_prompt_at:
+                await self._send(
+                    ctx, state, "onboarding.help.contextual",
+                    {"answer": "Got it — moving you to the next step. 👍", "next_step": ""},
+                )
+                return self._step(
+                    "documents_upload_loop_await", ctx,
+                    docs_proceed=True,
+                    missing_documents=list(state.missing_documents),
+                    documents_received=False,
+                )
+            # "YES" → they have more to send; acknowledge and stay parked.
+            if is_yes(reply) and state.more_docs_prompt_at:
+                await self._send(
+                    ctx, state, "onboarding.help.contextual",
+                    {"answer": "Sure — send the rest whenever you're ready, "
+                     "as a PDF or photo. 📎", "next_step": ""},
+                )
+                return self._step(
+                    "documents_upload_loop_await", ctx,
+                    missing_documents=list(state.missing_documents),
+                    documents_received=False,
+                )
+            # No file — it's a question or chit-chat. Answer it in
             # context (the agent must actually understand, not robotically nag
             # "text alone is not enough"), then stay parked for the upload.
             fallback = (
@@ -2750,10 +2785,26 @@ class OnboardingWorkflow(WorkflowDefinition):
         # required count regardless of pending slots. Mirrors the doc-
         # service's count-based unblock (PR #4, commit 6c05b1c).
         new_uploaded_count = state.docs_uploaded_count + len(attachments)
+        more_docs_prompt_at = state.more_docs_prompt_at
         if not missing:
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
+        else:
+            # Still incomplete after this batch → ask "any more documents?"
+            # so a frustrated SME can reply NO to proceed. Debounced to ONCE
+            # per upload burst (a ZIP / 20-doc upload arrives as many inbounds
+            # — never one prompt per file, user 2026-06-12). NOT sent when the
+            # checklist is complete (``missing`` empty) — that path shows the
+            # coffee message and moves on instead.
+            prior_prompt = _parse_iso_or_none(state.more_docs_prompt_at)
+            prompt_age = (now - prior_prompt).total_seconds() if prior_prompt else None
+            if prompt_age is None or prompt_age >= MORE_DOCS_PROMPT_TTL_SECONDS:
+                try:
+                    await self._send(ctx, state, "onboarding.documents.more_docs_prompt")
+                    more_docs_prompt_at = now.isoformat()
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning("more_docs_prompt.send_failed", error=str(exc)[:200])
         return self._step(
             "documents_upload_loop_await",
             ctx,
@@ -2764,6 +2815,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             refresh_token=refresh,
             token_expires_at=expires,
             documents_processing_ack_at=processing_ack_at,
+            more_docs_prompt_at=more_docs_prompt_at,
         )
 
     async def _send_pending_docs(
@@ -3868,19 +3920,17 @@ class OnboardingWorkflow(WorkflowDefinition):
             JourneyStatus.ACTIVATED,
         }:
             return "payment"
-        # Completion: every required doc uploaded, OR (classifier-hang
-        # unblock) the cumulative attachment count meets the required count
-        # — the SME has done their part. Guarded so 1 upload vs 10 required
-        # stays incomplete.
-        required = len(DEFAULT_WHATSAPP_REQUIRED_DOCS)
-        complete = (not state.missing_documents) or (
-            required and state.docs_uploaded_count >= required
-        )
-        if complete:
-            # Send the coffee / "all documents received" message exactly
-            # ONCE (per user 2026-06-12). Thereafter just re-park silently in
-            # the upload-await node — accept any extra uploads, wait for the
-            # qualify/offer/activate event — WITHOUT re-spamming the coffee.
+        # Frustrated-user escape hatch: the SME replied NO to "any more
+        # documents?" while some required docs were still undetected — proceed
+        # to the next step (the payment-wait park) without the coffee.
+        if state.docs_proceed:
+            return "proceed"
+        # TRUE completion: every required doc detected. Show the coffee /
+        # "all documents received" message exactly ONCE (user 2026-06-12),
+        # then re-park silently. A classifier hang that leaves a required slot
+        # pending does NOT auto-complete here — instead the in-loop "any more
+        # documents?" prompt fires and the SME replies NO to proceed.
+        if not state.missing_documents:
             return "complete" if not state.documents_complete_sent else "await_again"
         return "await_again"
 

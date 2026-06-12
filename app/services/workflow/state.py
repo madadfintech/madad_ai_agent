@@ -157,9 +157,17 @@ class OnboardingState(WorkflowState):
     # re-parks silently in the upload-await node instead of re-sending it
     # (user 2026-06-12 — kills the repeated "any more documents?" loop).
     documents_complete_sent: bool = False
-    # Deprecated (2026-06-12): the "any more documents to upload?" prompt was
-    # removed — it caused a stuck loop and swallowed qualify/offer events.
-    # Field retained for checkpoint back-compat; no longer read.
+    # The SME replied NO / "done" to the "any more documents?" prompt while
+    # some required docs were still undetected — proceed to the next step
+    # anyway (frustrated-user escape hatch, user 2026-06-12).
+    docs_proceed: bool = False
+    # Debounce for the "any more documents?" prompt: timestamp (ISO) of the
+    # last time it was sent. A 20-doc / ZIP burst arrives as 20 separate
+    # inbounds — the prompt fires once per burst (within the TTL), never per
+    # doc. Reset implicitly by the TTL window.
+    more_docs_prompt_at: str | None = None
+    # Deprecated (2026-06-12): replaced by the in-loop is_no/is_yes handling.
+    # Retained for checkpoint back-compat; no longer read.
     more_docs_decision: str | None = None  # "yes" | "no" | None (not asked yet)
     # Bug #11 (UAT 2026-06-09): debounce the ``documents.processing`` ack
     # so the bridge's per-file POST burst (one inbound per ZIP-member,

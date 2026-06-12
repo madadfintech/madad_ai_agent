@@ -2791,17 +2791,22 @@ class OnboardingWorkflow(WorkflowDefinition):
                 target_ref=state.madad_user_id or ctx.session_id
             )
         else:
-            # Still incomplete after this batch → ask "any more documents?"
-            # so a frustrated SME can reply NO to proceed. Debounced to ONCE
-            # per upload burst (a ZIP / 20-doc upload arrives as many inbounds
-            # — never one prompt per file, user 2026-06-12). NOT sent when the
-            # checklist is complete (``missing`` empty) — that path shows the
-            # coffee message and moves on instead.
+            # Still incomplete after this batch → (1) show the checklist of
+            # which docs are STILL missing, then (2) ask "any more documents?"
+            # as a separate message so a frustrated SME can reply NO to
+            # proceed. Both are debounced together to ONCE per upload burst (a
+            # ZIP / 20-doc upload arrives as many inbounds — never one prompt
+            # per file, user 2026-06-12). NOT sent when the checklist is
+            # complete (``missing`` empty) — that path shows the coffee message
+            # and moves on instead.
             prior_prompt = _parse_iso_or_none(state.more_docs_prompt_at)
             prompt_age = (now - prior_prompt).total_seconds() if prior_prompt else None
             if prompt_age is None or prompt_age >= MORE_DOCS_PROMPT_TTL_SECONDS:
                 try:
-                    await self._send(ctx, state, "onboarding.documents.more_docs_prompt")
+                    # 1) "Still missing" checklist.
+                    await self._send_pending_docs(ctx, state, list(missing))
+                    # 2) Separate "any more documents?" prompt (YES/NO buttons).
+                    await self._send_more_docs_prompt(ctx, state)
                     more_docs_prompt_at = now.isoformat()
                 except Exception as exc:  # noqa: BLE001
                     ctx.logger.warning("more_docs_prompt.send_failed", error=str(exc)[:200])
@@ -2878,6 +2883,32 @@ class OnboardingWorkflow(WorkflowDefinition):
         await self._send(
             ctx, state, "onboarding.documents.single_received", {"results": body}
         )
+
+    async def _send_more_docs_prompt(
+        self, ctx: WorkflowContext, state: OnboardingState
+    ) -> None:
+        """Send the 'any more documents?' prompt. Tries interactive YES/NO
+        reply buttons; falls back to the plain-text template when the button
+        path (backend ``messages/interactive-buttons`` + MCP tool) isn't live
+        — mirroring the CTA-URL fallback pattern. The button replies map to
+        is_yes/is_no via the backend webhook (button_reply.title)."""
+        sent = False
+        send_buttons = getattr(self._msg, "send_reply_buttons", None)
+        if send_buttons is not None and ctx.channel is Channel.WHATSAPP:
+            try:
+                sent = await send_buttons(
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    template_key="onboarding.documents.more_docs_prompt",
+                    buttons=[("more_docs_yes", "Yes"), ("more_docs_no", "No")],
+                    locale=state.locale,
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back to text
+                ctx.logger.warning(
+                    "more_docs_buttons.failed", error=str(exc)[:200]
+                )
+        if not sent:
+            await self._send(ctx, state, "onboarding.documents.more_docs_prompt")
 
     async def _acknowledge_uploads(
         self,

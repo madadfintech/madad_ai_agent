@@ -4019,15 +4019,20 @@ class OnboardingWorkflow(WorkflowDefinition):
         refresh = state.refresh_token
         expires = state.token_expires_at
         now_ts = ctx.clock.now().timestamp()
-        # Fast path: a cached token that is still comfortably valid.
-        if token and (expires is None or expires - now_ts > 60):
+        # Fast path: a cached token with a KNOWN expiry that is still
+        # comfortably valid. A None/unknown expiry is NOT treated as
+        # valid-forever (the old bug) — an onboarding run can be parked for
+        # days/weeks while the SME collects documents, so an unknown-expiry
+        # cached token is almost certainly stale. When in doubt, re-mint.
+        if token and expires is not None and expires - now_ts > 60:
             return token, refresh, expires
         # Otherwise MINT ON DEMAND. The WhatsApp identity is already verified
         # (Meta-signed inbound webhook + a WhatsApp-verified number), so the
         # backend mints a fresh agent access token from the identity alone — no
-        # password, no login. This covers both the near-expiry refresh case AND
-        # the "run resumed with no token in state" case that was silently
-        # dropping document uploads.
+        # password, no login. This covers: no token in state, unknown expiry,
+        # and the near/after-expiry case — so an upload that arrives 5 days
+        # after YES still gets a live token instead of a 401. (Root cause of
+        # docs silently not persisting, 2026-06-12.)
         try:
             session = await self._identity.open_session(
                 channel=_channel(ctx),

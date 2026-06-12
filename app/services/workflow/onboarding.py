@@ -932,6 +932,13 @@ class OnboardingWorkflow(WorkflowDefinition):
             "check_contact_await": self._check_contact_await,
             "domain_blocked": self._domain_blocked,
             "registered_route_send": self._registered_route_send,
+            # Returning-user resume: open session → fetch live status → re-enter
+            # the exact step the SME left off at (instead of greet-and-end).
+            "channel_session_resume": self._channel_session_resume,
+            "resume_status_fetch": self._resume_status_fetch,
+            "resume_rejected": self._resume_rejected,
+            "resume_offer_expired": self._resume_offer_expired,
+            "resume_application_open": self._resume_application_open,
             "channel_session_first": self._channel_session_first,
             "channel_session_create_user": self._channel_session_create_user,
             "collect_onboarding_details_send": self._collect_onboarding_details_send,
@@ -1015,18 +1022,54 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "new_whatsapp": "channel_session_create_user",
                 "blocked": "domain_blocked",
                 # Per Ishan (cluster e6ea5d2, 2026-06-10): returning users
-                # routed by check_registration land here so the SME gets
-                # the route-appropriate message instead of being silently
-                # re-onboarded (Bug #2 + Bug #6).
-                "registered_routed": "registered_route_send",
+                # routed by check_registration are existing accounts mid/post
+                # journey — open a session (mint access_token) then RESUME at
+                # their exact step via resume_status_fetch, instead of the old
+                # greet-and-end. Closes Bug #2 + Bug #6 and the "bot doesn't
+                # continue the journey" gap (user 2026-06-12). NOTE: the plain
+                # "existing" path (contact exists but check_registration gave no
+                # route) keeps the original continue-at-consent behaviour.
+                "registered_routed": "channel_session_resume",
             },
         )
 
-        # Existing-user path converges at consent_send via one session call.
+        # Plain existing-user path converges at consent_send via one session call
+        # (unchanged — early-stage contacts continue onboarding from consent/CR).
         graph.add_conditional_edges(
             "channel_session_first",
             self._route_channel_session,
             {"consent": "consent_send"},
+        )
+        # Returning-user RESUME path: a dedicated session call mints the
+        # access_token, then resume_status_fetch reads the live journey_status
+        # and drops the run back into the exact node the SME left off at.
+        graph.add_edge("channel_session_resume", "resume_status_fetch")
+        graph.add_conditional_edges(
+            "resume_status_fetch",
+            self._route_resume_by_status,
+            {
+                # SIGN_UP / ONBOARDED: no email yet → collect it; else consent/CR.
+                "email": "business_email_send",
+                "consent": "consent_send",
+                # ELIGIBLE: right after CR → ask for the audited financials.
+                "financials": "financials_send",
+                # INCOMPLETE / UNVERIFIED / VERIFIED / PRE_QUALIFIED: all the
+                # document-submission phase — the checklist loop asks for what's
+                # missing or shows the "under review" coffee message when full.
+                "documents": "documents_list_fetch",
+                # QUALIFIED: initiate the onboarding-fee payment.
+                "payment": "business_details_fetch",
+                "offers": "offers_fetch",
+                "offer_confirmed": "offer_confirmed",
+                "activated": "activated",
+                "rejected": "resume_rejected",
+                "offer_expired": "resume_offer_expired",
+                "application_open": "resume_application_open",
+                "ineligible": "not_eligible",
+                "unqualified": "not_qualified",
+                # Unknown / unreadable status → safe greet-and-end fallback.
+                "welcome": "registered_route_send",
+            },
         )
         # New-lead path: the spec says NO form-filling — we never ask the SME to
         # type their name/CR/role. The account is created up front with safe
@@ -1215,6 +1258,11 @@ class OnboardingWorkflow(WorkflowDefinition):
             # the SME has been re-greeted with the right message, no
             # further onboarding work is needed in this run.
             "registered_route_send",
+            # Returning-user resume terminals (status-specific messages that
+            # have no in-chat next action — contact support / log in to portal).
+            "resume_rejected",
+            "resume_offer_expired",
+            "resume_application_open",
         ):
             graph.set_finish(terminal)
 
@@ -1404,6 +1452,154 @@ class OnboardingWorkflow(WorkflowDefinition):
             outcome="returning_user",
             application_ref=ref or state.application_ref,
         )
+
+    # -- Returning-user RESUME (continue the journey at the exact step) -------
+
+    async def _channel_session_resume(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """Returning user (check_registration returned a route): open a channel
+        session to mint a fresh access_token, then resume_status_fetch reads the
+        live journey_status off it. Mirrors _channel_session_first but feeds the
+        RESUME branch instead of consent/CR."""
+        session = await self._identity.open_session(
+            channel=_channel(ctx),
+            identifier=ctx.identity,
+            create_onboarding_token=False,
+        )
+        # Prefer the authoritative referenceNumber from check_registration's
+        # payload (the SME's real application ref) over the freshly-minted
+        # session ref, so status queries / payment re-sends use the right one.
+        ref = (state.registration_payload or {}).get("referenceNumber")
+        return self._step(
+            "channel_session_resume",
+            ctx,
+            channel_session_response=session,
+            session_type=session.session_type,
+            access_token=session.access_token,
+            refresh_token=session.refresh_token,
+            token_expires_at=session.token_expires_at,
+            madad_user_id=session.user_or_lead_ref,
+            application_ref=ref or session.reference_number or state.application_ref,
+        )
+
+    async def _resume_status_fetch(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """Returning user: read the authoritative ``journeyStatus`` (and whether
+        the account has an email) so ``_route_resume_by_status`` can drop the
+        LIVE run back into the exact step the SME left off at — rather than the
+        old greet-and-end behaviour. ``channel_session_first`` has just minted
+        the ``access_token`` we poll with. Tolerant: any failure leaves
+        ``journey_status`` unset and the router falls back to a safe greeting.
+        """
+        status = await self._poll_journey_status(state)
+        has_email: bool | None = None
+        if state.access_token:
+            try:
+                info = await self._identity.me(access_token=state.access_token)
+                if isinstance(info, dict):
+                    nested = info.get("user")
+                    user = nested if isinstance(nested, dict) else info
+                    has_email = bool(user.get("email"))
+            except Exception as exc:  # noqa: BLE001 — tolerate; default routing
+                ctx.logger.warning(
+                    "resume_status_fetch.me_failed", error=str(exc)[:200]
+                )
+        return self._step(
+            "resume_status_fetch",
+            ctx,
+            journey_status=status,
+            account_has_email=has_email,
+        )
+
+    def _route_resume_by_status(self, state: OnboardingState) -> str:
+        """Map the canonical journey status → the node that re-enters the SME's
+        current step. Spec confirmed with the user (2026-06-12), aligned to the
+        MCP cluster README's 16-status reference. INCOMPLETE/UNVERIFIED/
+        VERIFIED/PRE_QUALIFIED are all the document-submission phase (the loop
+        asks for missing docs or shows the under-review message); payment is
+        triggered at QUALIFIED, not before."""
+        s = state.journey_status
+        JS = JourneyStatus
+        if s is None:
+            return "welcome"
+        if s in (JS.SIGN_UP, JS.ONBOARDED):
+            return "consent" if state.account_has_email else "email"
+        if s == JS.ELIGIBLE:
+            return "financials"
+        if s in (JS.INCOMPLETE, JS.UNVERIFIED, JS.VERIFIED, JS.PRE_QUALIFIED):
+            return "documents"
+        if s == JS.QUALIFIED:
+            return "payment"
+        if s == JS.ACCEPTED:
+            return "offers"
+        if s == JS.OFFER_ACCEPTED:
+            return "offer_confirmed"
+        if s == JS.OFFER_EXPIRED:
+            return "offer_expired"
+        if s == JS.ACTIVATED:
+            return "activated"
+        if s == JS.NOT_ACCEPTED:
+            return "rejected"
+        if s == JS.OPEN:
+            return "application_open"
+        if s == JS.IN_ELIGIBLE:
+            return "ineligible"
+        if s == JS.UNQUALIFIED:
+            return "unqualified"
+        return "welcome"
+
+    async def _resume_rejected(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        await self._send(
+            ctx, state, "onboarding.help.contextual",
+            {
+                "answer": (
+                    "We're sorry — after review by our banking partners your "
+                    "application was not accepted this time. Please contact "
+                    "Madad support at support@madadfintech.com or "
+                    "madadfintech.com and our team will talk you through your "
+                    "options."
+                ),
+                "next_step": "",
+            },
+        )
+        return self._step("resume_rejected", ctx, outcome="returning_user")
+
+    async def _resume_offer_expired(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        await self._send(
+            ctx, state, "onboarding.help.contextual",
+            {
+                "answer": (
+                    "Your financing offer(s) have expired. Please contact Madad "
+                    "support at support@madadfintech.com (or madadfintech.com) "
+                    "and we'll have fresh offers issued for you."
+                ),
+                "next_step": "",
+            },
+        )
+        return self._step("resume_offer_expired", ctx, outcome="returning_user")
+
+    async def _resume_application_open(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        await self._send(
+            ctx, state, "onboarding.help.contextual",
+            {
+                "answer": (
+                    "Your application is open — we need a little more "
+                    "information to proceed. Please log in to the Madad portal "
+                    "at uat-portal.madadfintech.com to see what's required, or "
+                    "contact support@madadfintech.com and our team will help."
+                ),
+                "next_step": "",
+            },
+        )
+        return self._step("resume_application_open", ctx, outcome="returning_user")
 
     async def _channel_session_first(
         self, state: OnboardingState, ctx: WorkflowContext

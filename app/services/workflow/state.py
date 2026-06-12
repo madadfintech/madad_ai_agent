@@ -98,6 +98,10 @@ class OnboardingState(WorkflowState):
     journey_status: JourneyStatus | None = None
     last_polled_at: datetime | None = None
     last_status_source: StatusSource | None = None
+    # Returning-user resume (set by _resume_status_fetch): whether the existing
+    # account already has an email on file. Drives the SIGN_UP/ONBOARDED resume
+    # split — no email → ask for it first; has email → straight to consent/CR.
+    account_has_email: bool | None = None
     # Step 1: new-lead onboarding-details capture (precedes complete_onboarding).
     # ALL 9 fields the cluster's AUTH_COMPLETE_ONBOARDING tool requires for a
     # fresh signup; email/phone are normally derived from the channel identity

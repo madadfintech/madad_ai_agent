@@ -1,19 +1,20 @@
-"""Bug #2 + Bug #6 (closed 2026-06-10): returning users now route through
-the new ``registered_route_send`` terminal instead of silently re-onboarding.
+"""Returning-user RESUME (rebuilt 2026-06-12 per user spec).
 
 Driven by Ishan's ``madad_mcp_check_registration`` tool (cluster commit
-e6ea5d2) — a read-only lookup that returns a ``route`` enum telling the
-agent which message to send for a returning user. Seven canonical routes:
-portal_login_required, invoice_discounting, offer_accepted_confirmation,
-offers_available, payment_received, payment_link, continue_step.
+e6ea5d2) — a read-only lookup that flags a contact as an existing account.
+When it does, the workflow now opens a session, reads the live
+``journeyStatus`` (``madad_auth_me``) and RE-ENTERS the exact step the SME
+left off at, keeping the run alive — instead of the old "send one greeting
+and terminate" behaviour. The canonical status→step mapping is confirmed
+with the user and pinned by ``test_route_resume`` unit-style below.
 
 These tests pin:
-  * The fallthrough — when the cluster says ``registered=False``, the
-    workflow uses the existing SIGN_UP / SIGN_UP-with-existing-user
-    branches unchanged.
-  * The routed-user path — when the cluster returns a route, the workflow
-    sends the route-appropriate message via ``onboarding.help.contextual``
-    and terminates with ``outcome="returning_user"``.
+  * Fallthrough — ``registered=False`` leaves the SIGN_UP path unchanged.
+  * Terminal statuses (rejected / expired / open / ineligible / unqualified)
+    send the right message and complete.
+  * Mid-journey statuses (INCOMPLETE / QUALIFIED / ACTIVATED) keep the run
+    WAITING — i.e. the bot continues the journey instead of dead-ending.
+  * referenceNumber from the registration payload threads onto state.
 """
 
 from __future__ import annotations
@@ -26,94 +27,92 @@ WA = Channel.WHATSAPP
 IDENTITY = "+97455502601"
 
 
+def _returning(harness, journey_status: str, **payload):
+    """Mark IDENTITY as a returning user with the given live journey status."""
+    harness.identity.journey_status = journey_status
+    harness.identity.check_registration_overrides = {
+        IDENTITY: {"route": "continue_step", "journeyStatus": journey_status, **payload},
+    }
+
+
 @pytest.mark.parametrize(
-    "route, must_contain",
+    "journey_status, must_contain, outcome",
     [
-        ("portal_login_required", "log in at madadfintech.com"),
-        ("invoice_discounting", "credit line is already active"),
-        ("offer_accepted_confirmation", "already accepted an offer"),
-        ("offers_available", "financing offers are ready"),
-        ("payment_received", "onboarding fee is already in"),
-        ("payment_link", "complete the QAR 6,000 onboarding fee"),
-        ("continue_step", "Picking up where you left off"),
+        ("NOT_ACCEPTED", "was not accepted", "returning_user"),
+        ("OFFER_EXPIRED", "have expired", "returning_user"),
+        ("OPEN", "application is open", "returning_user"),
+        ("IN_ELIGIBLE", "", "not_eligible"),
+        ("UNQUALIFIED", "", "not_qualified"),
     ],
 )
-async def test_returning_user_routes_terminate_with_correct_message(
-    make_harness, route: str, must_contain: str
+async def test_returning_user_terminal_statuses(
+    make_harness, journey_status: str, must_contain: str, outcome: str
 ) -> None:
-    """Each of the 7 routes Ishan's tool returns must produce a
-    route-appropriate reply and complete the run without re-onboarding."""
-
+    """Terminal journey statuses send the status-appropriate message and
+    complete the run (no in-chat next action)."""
     harness = make_harness(known_phones={IDENTITY: "user_42"})
-    # Opt the InMemory client into the returning-user response for THIS
-    # identity with THIS route. Other identities still get
-    # ``registered=False`` so unrelated tests are unaffected.
-    harness.identity.check_registration_overrides = {
-        IDENTITY: {
-            "route": route,
-            "referenceNumber": "7388266",
-            "journeyStatus": "QUALIFIED",
-            "onboardingFeePaid": route in (
-                "payment_received",
-                "offers_available",
-                "offer_accepted_confirmation",
-                "invoice_discounting",
-            ),
-            "creditLineActive": route == "invoice_discounting",
-            "offerAccepted": route == "offer_accepted_confirmation",
-            "hasPendingOffers": route == "offers_available",
-        }
-    }
+    _returning(harness, journey_status)
 
     runtime = harness.platform.runtime
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     result = await runtime.resume(WA, IDENTITY, message={"text": "YES"})
 
-    # Returning-user runs terminate — no further onboarding work.
     assert result.status == RunStatus.COMPLETED, (
-        f"route={route!r} should complete the run, got {result.status}"
+        f"{journey_status} should complete, got {result.status}"
     )
-    assert result.values["outcome"] == "returning_user"
-    # The contextual reply carries the route-specific answer.
-    sent = [
-        s for s in harness.messenger.sent
-        if s["template_key"] == "onboarding.help.contextual"
-    ]
-    assert sent, f"contextual reply must fire for route={route!r}"
-    answer = sent[-1]["variables"]["answer"]
-    assert must_contain in answer, (
-        f"route={route!r} answer should mention {must_contain!r}, got: {answer}"
+    assert result.values["outcome"] == outcome
+    if must_contain:
+        sent = [
+            s for s in harness.messenger.sent
+            if s["template_key"] == "onboarding.help.contextual"
+        ]
+        assert sent, f"a message must fire for {journey_status}"
+        assert must_contain in sent[-1]["variables"]["answer"]
+
+
+@pytest.mark.parametrize("journey_status", ["INCOMPLETE", "QUALIFIED", "ACTIVATED"])
+async def test_returning_user_midjourney_resumes_live(
+    make_harness, journey_status: str
+) -> None:
+    """The core fix: a mid-journey returning user does NOT dead-end on a
+    greeting — the run re-enters the live step and stays WAITING for the
+    SME's next message (doc upload / payment / invoice)."""
+    harness = make_harness(known_phones={IDENTITY: "user_42"})
+    _returning(harness, journey_status)
+
+    runtime = harness.platform.runtime
+    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
+    result = await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+
+    assert result.status == RunStatus.WAITING_FOR_INPUT, (
+        f"{journey_status} must keep the journey alive, got {result.status}"
     )
+    # It did NOT take the greet-and-end returning_user terminal.
+    assert result.values.get("outcome") != "returning_user"
 
 
 async def test_unregistered_user_falls_through_to_signup(make_harness) -> None:
     """``registered=False`` (the InMemory default) must leave the SIGN_UP
-    path completely intact — no new node, no terminal short-circuit."""
-
+    path completely intact — no resume, no terminal short-circuit."""
     harness = make_harness()  # nobody is known
     runtime = harness.platform.runtime
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     result = await runtime.resume(WA, IDENTITY, message={"text": "YES"})
 
-    # Lands at the consent step (the SIGN_UP path's next stop), NOT at
-    # the returning-user terminal.
-    assert result.prompt == {"waiting_for": "upload", "step": "consent_cr"}
+    # Lands at the business-email step (the new-lead path's next stop after
+    # YES, per task #28), NOT a returning-user resume.
+    assert result.prompt == {"waiting_for": "email", "step": "business_email"}
     assert result.values.get("outcome") != "returning_user"
-    # check_registration WAS called (registry contract) — it just
-    # returned registered=False so the router fell through.
     calls = [name for name, _ in harness.identity.calls]
     assert "check_registration" in calls
 
 
 async def test_referenceNumber_threaded_into_state(make_harness) -> None:
-    """When the registration payload carries a referenceNumber, the
-    workflow promotes it onto ``state.application_ref`` so downstream
-    nodes (status queries, payment-link re-sends) can use it."""
-
+    """The registration payload's referenceNumber is promoted onto
+    ``state.application_ref`` so downstream nodes can use it."""
     harness = make_harness(known_phones={IDENTITY: "user_42"})
-    harness.identity.check_registration_overrides = {
-        IDENTITY: {"route": "payment_link", "referenceNumber": "7388266"},
-    }
+    _returning(harness, "QUALIFIED", referenceNumber="7388266")
+
     runtime = harness.platform.runtime
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     result = await runtime.resume(WA, IDENTITY, message={"text": "YES"})

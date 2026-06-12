@@ -152,10 +152,14 @@ class OnboardingState(WorkflowState):
     # When this hits ``len(DEFAULT_WHATSAPP_REQUIRED_DOCS)`` the docs
     # loop unblocks even if some required slots are still pending.
     docs_uploaded_count: int = 0
-    # Tracks the SME's reply to the "any more documents to upload?" prompt
-    # that fires once the docs phase has produced enough uploads. NO → the
-    # run advances to payment_wait. YES → the run loops back to the docs
-    # upload-await node so they can keep sending.
+    # The coffee / "all documents received" message must fire exactly ONCE.
+    # Set True after _documents_complete sends it; _route_documents then
+    # re-parks silently in the upload-await node instead of re-sending it
+    # (user 2026-06-12 — kills the repeated "any more documents?" loop).
+    documents_complete_sent: bool = False
+    # Deprecated (2026-06-12): the "any more documents to upload?" prompt was
+    # removed — it caused a stuck loop and swallowed qualify/offer events.
+    # Field retained for checkpoint back-compat; no longer read.
     more_docs_decision: str | None = None  # "yes" | "no" | None (not asked yet)
     # Bug #11 (UAT 2026-06-09): debounce the ``documents.processing`` ack
     # so the bridge's per-file POST burst (one inbound per ZIP-member,

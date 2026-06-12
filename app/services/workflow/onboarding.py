@@ -971,8 +971,6 @@ class OnboardingWorkflow(WorkflowDefinition):
             "documents_upload_loop_send": self._documents_upload_loop_send,
             "documents_upload_loop_await": self._documents_upload_loop_await,
             "documents_complete": self._documents_complete,
-            "more_docs_prompt_send": self._more_docs_prompt_send,
-            "more_docs_prompt_await": self._more_docs_prompt_await,
             # Postman-triggered gates (demo): pre-qualification (after audit)
             # and payment (after coffee) are released by an external trigger.
             "prequalify_wait_await": self._prequalify_wait_await,
@@ -1152,22 +1150,16 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "await_again": "documents_upload_loop_await",
             },
         )
-        # Per user (UAT 2026-06-10): after the coffee message, ask whether
-        # the SME wants to send more documents. Classifier failures and
-        # post-prequal "I forgot one" cases need an explicit way back into
-        # the upload loop instead of being forced past it. NO routes on to
-        # payment_wait_await; YES loops back to documents_upload_loop_await.
-        graph.add_edge("documents_complete", "more_docs_prompt_send")
-        graph.add_edge("more_docs_prompt_send", "more_docs_prompt_await")
-        graph.add_conditional_edges(
-            "more_docs_prompt_await",
-            self._route_more_docs,
-            {
-                "yes": "documents_upload_loop_await",
-                "no": "payment_wait_await",
-                "await_again": "more_docs_prompt_await",
-            },
-        )
+        # Per user (2026-06-12): NO "any more documents?" prompt once the
+        # checklist is satisfied — it caused a stuck loop (every non-YES/NO
+        # reply, INCLUDING an incoming qualify/offer webhook, re-fired the
+        # "No problem…" line) and swallowed the qualify event so the payment
+        # message never came. After the coffee message we re-park in the SMART
+        # upload-await node, which (a) silently accepts any further document
+        # uploads and (b) ALWAYS breaks out to the right message on a
+        # QUALIFIED / ACCEPTED / OFFER_ACCEPTED / ACTIVATED status event. The
+        # coffee message fires ONCE (guarded by ``documents_complete_sent``).
+        graph.add_edge("documents_complete", "documents_upload_loop_await")
         # Spec Step 5 → payment: after the coffee message + more-docs prompt,
         # PARK until the payment step is triggered (via Postman in the demo).
         # On trigger → Madad score + the "Pay QAR 6,000 →" button.
@@ -2908,12 +2900,19 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _documents_complete(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
+        # Coffee / "all documents received" exactly ONCE per run. This node is
+        # re-entered every time the SME uploads an extra doc after completion;
+        # _route_documents only routes here on the FIRST completion, but guard
+        # here too so the message can never double-fire (user 2026-06-12).
+        if state.documents_complete_sent:
+            return self._step("documents_complete", ctx)
         await self._send(ctx, state, "onboarding.documents.complete")
         # Step 5 — all docs submitted, waiting for risk assessment.
         progress_step = await self._update_progress(state, ctx, step=5)
         return self._step(
             "documents_complete",
             ctx,
+            documents_complete_sent=True,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
 
@@ -3869,21 +3868,20 @@ class OnboardingWorkflow(WorkflowDefinition):
             JourneyStatus.ACTIVATED,
         }:
             return "payment"
-        # Natural completion path: the SME uploaded every required doc.
-        # The coffee message IS accurate here, so the original flow
-        # (documents_complete → more_docs_prompt) stays.
-        if not state.missing_documents:
-            return "complete"
-        # Per Ishan + user (UAT 2026-06-10): the classifier hangs (notably
-        # AoA) leave required slots permanently "still needed" even when
-        # the SME has uploaded enough total files. Count-based unblock:
-        # if the cumulative attachment count meets the required count, the
-        # SME has done their part — proceed to the coffee message with the
-        # current state and let the "any more documents?" prompt cover the
-        # tail. Guarded so 1 upload vs 10 required stays incomplete.
+        # Completion: every required doc uploaded, OR (classifier-hang
+        # unblock) the cumulative attachment count meets the required count
+        # — the SME has done their part. Guarded so 1 upload vs 10 required
+        # stays incomplete.
         required = len(DEFAULT_WHATSAPP_REQUIRED_DOCS)
-        if required and state.docs_uploaded_count >= required:
-            return "complete"
+        complete = (not state.missing_documents) or (
+            required and state.docs_uploaded_count >= required
+        )
+        if complete:
+            # Send the coffee / "all documents received" message exactly
+            # ONCE (per user 2026-06-12). Thereafter just re-park silently in
+            # the upload-await node — accept any extra uploads, wait for the
+            # qualify/offer/activate event — WITHOUT re-spamming the coffee.
+            return "complete" if not state.documents_complete_sent else "await_again"
         return "await_again"
 
     def _route_more_docs(self, state: OnboardingState) -> str:

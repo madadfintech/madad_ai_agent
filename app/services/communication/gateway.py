@@ -143,6 +143,41 @@ class McpCommunicationGateway(CommunicationGateway):
                 raw=response,
             )
 
+        # Interactive reply (quick-reply) buttons (WhatsApp): up to 3 tappable
+        # YES/NO-style buttons instead of asking the SME to type. Selected when
+        # the outbound carries an ``interactive_buttons`` block with a non-empty
+        # ``buttons`` list. The tapped button's title comes back as inbound text.
+        ib = (message.metadata or {}).get("interactive_buttons") if message.metadata else None
+        if (
+            message.channel is Channel.WHATSAPP
+            and isinstance(ib, dict)
+            and ib.get("buttons")
+        ):
+            tool = Tools.EXT_SEND_WHATSAPP_INTERACTIVE_BUTTONS
+            btn_payload: dict[str, Any] = {
+                "to": message.identity,
+                "body": message.text or "",
+                "buttons": [
+                    {"id": str(b.get("id")), "title": str(b.get("title") or "")[:20]}
+                    for b in ib["buttons"]
+                ][:3],
+            }
+            if ib.get("header"):
+                btn_payload["header"] = ib["header"]
+            if ib.get("footer"):
+                btn_payload["footer"] = ib["footer"]
+            try:
+                response = await self._tools.call_tool(tool, btn_payload)
+            except Exception as exc:  # noqa: BLE001 - normalize transport errors
+                raise GatewayError(
+                    f"MCP tool {tool!r} failed: {exc}", details={"tool": tool}
+                ) from exc
+            return OutboundDispatchResult(
+                accepted=bool(response.get("accepted", True)),
+                provider_message_id=response.get("provider_message_id"),
+                raw=response,
+            )
+
         mapped = _TOOL_BY_CHANNEL.get(message.channel)
         if mapped is None:
             raise GatewayError(

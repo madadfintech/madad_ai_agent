@@ -76,6 +76,41 @@ class CommunicationMessenger(Messenger):
         # backend interactive endpoint / MCP tool is not yet live).
         return getattr(message, "status", None) == MessageStatus.SENT
 
+    async def send_reply_buttons(
+        self,
+        *,
+        channel: Channel,
+        identity: str,
+        template_key: str,
+        buttons: list[tuple[str, str]],
+        variables: dict[str, Any] | None = None,
+        locale: str = "en",
+    ) -> bool:
+        """Send up to 3 interactive reply (quick-reply) buttons. ``buttons`` is
+        a list of ``(id, title)`` pairs. Returns True only if the interactive
+        send went out; the caller falls back to plain text otherwise (backend
+        ``interactive-buttons`` endpoint / MCP tool not yet live)."""
+        from app.services.communication.models import MessageStatus  # type: ignore[attr-defined]
+        from app.shared.i18n import Locale
+
+        message = await self._comms.send(
+            OutboundMessageRequest(
+                channel=channel,
+                identity=identity,
+                template_key=template_key,
+                variables=variables or {},
+                locale=Locale(locale),
+                metadata={
+                    "interactive_buttons": {
+                        "buttons": [
+                            {"id": bid, "title": title} for bid, title in buttons
+                        ]
+                    }
+                },
+            )
+        )
+        return getattr(message, "status", None) == MessageStatus.SENT
+
     async def send_template(
         self,
         *,

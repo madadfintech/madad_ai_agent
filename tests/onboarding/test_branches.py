@@ -39,11 +39,10 @@ async def test_domain_blocked_terminal_for_corporate_email(make_harness):
 # happens inline via consent_await without surfacing an explicit
 # "ineligible" terminal.
 
-# NOTE: test_missing_documents_loops_until_complete was deleted — main's
-# _route_documents is now LENIENT (returns "complete" as soon as ANY
-# attachment lands), per "fix(workflow): docs step is lenient — proceed
-# to coffee after any 1 upload" (commit d01a0e5). The missing-docs loop
-# behaviour no longer exists.
+# NOTE: test_missing_documents_loops_until_complete was reinstated by
+# Bug #10a (2026-06-09) — _route_documents is no longer lenient. A single
+# upload no longer completes the loop; tests that don't care about the
+# loop's per-doc behaviour fast-forward via a forward-status webhook.
 
 
 async def _drive_to_payment(harness):
@@ -59,18 +58,12 @@ async def _drive_to_payment(harness):
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
-    await resume(
-        {
-            "attachments": [
-                {"filename": "Trade_License.pdf", "content_base64": doc},
-                {"filename": "Tax_Card.pdf", "content_base64": doc},
-            ]
-        }
-    )
-    # Release payment gate
-    harness.identity.journey_status = "PRE_QUALIFIED"
+    # Bug #10a + Bug #12 (2026-06-09): one ``madad_score.ready`` event
+    # (QUALIFIED) exits the docs loop AND fast-forwards through payment_wait
+    # into the payment chain on the same resume.
+    harness.identity.journey_status = "QUALIFIED"
     return await resume(
-        {"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED"}
+        {"event": "madad_score.ready", "journey_status": "QUALIFIED"}
     )
 
 
@@ -94,9 +87,10 @@ async def test_not_qualified_post_payment_via_lender_status(make_harness):
     assert "onboarding.not_qualified" in harness.messenger.templates()
 
 
-async def test_terminal_success_via_activated_status(harness):
+async def test_activated_parks_into_invoice_collect_loop(harness):
     """If the backend reaches ACTIVATED before we hit offers_fetch (race
-    between webhook + poll), the activated terminal completes the flow."""
+    between webhook + poll), the activated message still goes out and the run
+    parks in the invoice-collection loop (steps 10–13, per db9b4a0)."""
     runtime = harness.platform.runtime
 
     async def resume(message):
@@ -109,6 +103,6 @@ async def test_terminal_success_via_activated_status(harness):
     harness.identity.journey_status = "ACTIVATED"
     result = await resume({"type": "status_update"})
 
-    assert result.status == RunStatus.COMPLETED
-    assert result.values["outcome"] == "completed"
+    assert result.status == RunStatus.WAITING_FOR_INPUT
+    assert result.run.current_step == "invoice_collect_await"
     assert "onboarding.activated" in harness.messenger.templates()

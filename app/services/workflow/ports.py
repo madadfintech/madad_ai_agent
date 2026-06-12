@@ -151,6 +151,11 @@ class RecordingMessenger(Messenger):
                 "identity": identity,
                 "template_key": template_key,
                 "variables": variables or {},
+                # Mirror the regular send()'s ``locale`` key so
+                # test_locale_propagates and other locale-aware tests can
+                # inspect the dispatched locale without forking the assertion
+                # by send-shape.
+                "locale": language_code,
                 "whatsapp_template": {
                     "name": template_name,
                     "language": language_code,
@@ -303,10 +308,38 @@ class MadadIdentityClient(Protocol):
         channel: Channel | None = None,
         identifier: str | None = None,
     ) -> dict[str, Any]:
-        """Attach the lead's BUSINESS email (the step right after YES). Returns
+        """Attach the lead's BUSINESS email (step right after YES). Returns
         ``{ok, conflict, alreadyPortalUser, ...}`` — ``conflict=True`` means the
-        email is already registered, so offer different-email / contact-support
-        instead of advancing to the CR step."""
+        email is already registered, so ask for a different email / contact
+        support instead of advancing to the CR step."""
+        ...
+
+    async def check_registration(
+        self,
+        *,
+        identifier: str,
+        channel: Channel,
+        email: str | None = None,
+        phone: str | None = None,
+    ) -> dict[str, Any]:
+        """Per Ishan (cluster commit e6ea5d2, 2026-06-10): read-only
+        registration lookup. Returns ``{registered, route, ...}``. When
+        ``registered`` is True, ``route`` tells the workflow which
+        downstream branch to take instead of starting fresh onboarding.
+
+        Routes (see project_check_registration_tool memory for details):
+          * portal_login_required, invoice_discounting,
+            offer_accepted_confirmation, offers_available,
+            payment_received, payment_link, continue_step.
+
+        Plus payload: ``whatsappOnboardingStep``, ``journeyStatus``,
+        ``onboardingFeePaid``, ``creditLineActive``, ``creditLine{...}``,
+        ``offerAccepted``, ``hasPendingOffers``, ``offers[...]``,
+        ``userId``, ``referenceNumber``.
+
+        Returns ``{registered: False}`` when no account matches —
+        caller proceeds with the normal SIGN_UP path.
+        """
         ...
 
 
@@ -519,6 +552,48 @@ class InMemoryMadadIdentityClient:
         # Configurable conflict for tests: emails in ``self.taken_emails`` clash.
         conflict = email.strip().lower() in getattr(self, "taken_emails", set())
         return {"ok": not conflict, "conflict": conflict, "email": email}
+
+    async def check_registration(
+        self,
+        *,
+        identifier: str,
+        channel: Channel,
+        email: str | None = None,
+        phone: str | None = None,
+    ) -> dict[str, Any]:
+        self._record(
+            "check_registration",
+            identifier=identifier,
+            channel=channel,
+            email=email,
+            phone=phone,
+        )
+        # Opt-in registered response: most tests only set ``known_phones``
+        # to exercise the SIGN_UP → SIGN_UP-with-existing-user path of
+        # ``check_contact`` / ``open_session``. Returning-user behaviour
+        # is gated on an explicit ``check_registration_overrides`` entry
+        # so those tests don't accidentally trigger the new
+        # ``registered_route_send`` branch.
+        override = getattr(self, "check_registration_overrides", {}).get(identifier)
+        if override is None:
+            return {"registered": False}
+        match_phone = identifier if channel is Channel.WHATSAPP else phone
+        match_email = identifier if channel is Channel.EMAIL else email
+        user_id = self._user_for(phone=match_phone, email=match_email)
+        base: dict[str, Any] = {
+            "registered": True,
+            "userId": user_id or override.get("userId"),
+            "route": "continue_step",
+            "whatsappOnboarding": True,
+            "whatsappOnboardingStep": 0,
+            "journeyStatus": self.journey_status,
+            "onboardingFeePaid": False,
+            "creditLineActive": False,
+            "offerAccepted": False,
+            "hasPendingOffers": False,
+            "offers": [],
+        }
+        return {**base, **override}
 
 
 # -- KycClient: the new port the Phase 2 graph uses for KYC tools -------------

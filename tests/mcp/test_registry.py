@@ -5,13 +5,12 @@ from __future__ import annotations
 from app.shared.mcp import Tools
 
 
-def test_registry_has_72_constants_grouped_by_module() -> None:
+def test_registry_has_75_constants_grouped_by_module() -> None:
     names = Tools.all()
-    # 13 + 6 + 5 + 30 + 4 + 5 + 9 = 72. +2 vs prior added 2026-06-07 by
-    # Ishan: KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64 and
-    # KYC_CLASSIFY_AND_UPLOAD_ZIP_BASE64 — the portal-classifier upload
-    # tools we route WhatsApp/email attachments through.
-    assert len(names) == 72
+    # 13 + 7 + 6 + 31 + 4 + 5 + 9 = 75. +1 vs prior added 2026-06-10 by Ishan:
+    # MCP_CHECK_REGISTRATION (read-only existing-user lookup; closes Bug #2 +
+    # Bug #6 by routing returning users instead of re-onboarding them).
+    assert len(names) == 75
 
     by_prefix: dict[str, int] = {}
     for value in names.values():
@@ -19,9 +18,9 @@ def test_registry_has_72_constants_grouped_by_module() -> None:
         by_prefix[prefix] = by_prefix.get(prefix, 0) + 1
 
     assert by_prefix["auth"] == 13
-    assert by_prefix["external"] == 6
-    assert by_prefix["mcp"] == 5
-    assert by_prefix["kyc"] == 30
+    assert by_prefix["external"] == 7
+    assert by_prefix["mcp"] == 6
+    assert by_prefix["kyc"] == 31
     assert by_prefix["offers"] == 4
     assert by_prefix["payments"] == 5
     assert by_prefix["invoices"] == 9

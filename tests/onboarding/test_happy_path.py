@@ -48,23 +48,18 @@ async def _drive_to_completion(harness):
     )
     assert after_prequal.prompt == {"waiting_for": "upload", "step": "documents"}
 
-    # Upload required docs in one turn → documents_complete → PARK at payment_wait.
+    # Bug #10a + Bug #12 (2026-06-09): docs loop is strict, and a single
+    # ``madad_score.ready`` event (mapped to QUALIFIED by the translator)
+    # exits the docs loop AND fast-forwards through payment_wait into
+    # the payment chain on the SAME resume — backend only fires once.
+    await resume(
+        {"attachments": [{"filename": "Establishment_Card.pdf", "content_base64": "ZHVtbXk="}]}
+    )
+    harness.identity.journey_status = "QUALIFIED"
     after_docs = await resume(
-        {
-            "attachments": [
-                {"filename": "Trade_License.pdf", "content_base64": "ZHVtbXk="},
-                {"filename": "Tax_Card.pdf", "content_base64": "ZHVtbXk="},
-            ]
-        }
+        {"event": "madad_score.ready", "journey_status": "QUALIFIED", "madadScore": 78}
     )
-    assert after_docs.prompt == {"waiting_for": "payment_ready", "step": "payment_wait"}
-
-    # Backend fires madad_score.ready (or status=PRE_QUALIFIED) → payment chain.
-    harness.identity.journey_status = "PRE_QUALIFIED"
-    after_status1 = await resume(
-        {"event": "madad_score.ready", "journey_status": "PRE_QUALIFIED", "madadScore": 78}
-    )
-    assert after_status1.prompt == {"waiting_for": "payment", "step": "payment"}
+    assert after_docs.prompt == {"waiting_for": "payment", "step": "payment"}
 
     # Mark monetization fee paid → lender_wait.
     after_pay = await resume({"type": "payment", "paid": True})
@@ -98,19 +93,24 @@ async def test_messages_sent_once_in_order(harness):
     # fires after audited upload; documents.complete fires before payment_wait.
     # Main uses `payment.request.button` (interactive CTA) instead of plain
     # `payment.request`, and `documents.single_received` is sent per upload.
+    # Ishan refinement (2026-06-09): ``documents.complete`` is intentionally
+    # skipped on the QUALIFY-mid-docs path the helper drives — the
+    # checklist isn't naturally complete, admin overrode it, and the
+    # coffee message would misrepresent the SME's state.
     expected_subset = [
         "onboarding.campaign.intro",
         "onboarding.consent.request",
         "onboarding.financials.request",
         "onboarding.account.created",
         "onboarding.documents.checklist",
-        "onboarding.documents.complete",
         "onboarding.payment.request.button",
         "onboarding.offers.preview",
         "onboarding.offer.handoff.button",
     ]
     for tpl in expected_subset:
         assert tpl in templates, f"expected {tpl} in {templates}"
+    # Coffee message must NOT fire on admin override.
+    assert "onboarding.documents.complete" not in templates
 
 
 async def test_mcp_tool_calls_happen_in_order(harness):
@@ -162,9 +162,11 @@ async def test_existing_user_skips_collect_details_branch(make_harness):
     assert after_yes.prompt == {"waiting_for": "upload", "step": "consent_cr"}
 
     identity_calls = [name for name, _ in harness.identity.calls]
-    # check_contact + open_session (single bridge call for existing user, no
+    # check_contact + check_registration (read-only, returns
+    # registered=False by default — fall through to existing path) +
+    # open_session (single bridge call for existing user, no
     # complete_onboarding, no second session).
-    assert identity_calls == ["check_contact", "open_session"]
+    assert identity_calls == ["check_contact", "check_registration", "open_session"]
 
 
 async def test_locale_propagates(make_harness):

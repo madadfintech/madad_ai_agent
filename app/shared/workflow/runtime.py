@@ -111,6 +111,17 @@ class WorkflowRuntime:
             channel, identity, message=message, correlation_id=correlation_id
         )
 
+    async def revive_failed_run(self, run: Any) -> None:
+        """Transition a terminally-failed run back to RUNNING so the next
+        ``resume()`` can replay an inbound at the last checkpoint
+        (QA #2, 2026-06-09). The audit transition records the revive
+        action so the failure → recovery sequence is traceable."""
+
+        from .enums import RunStatus
+        await self.executor._transitions.transition(  # noqa: SLF001 — intentional cross-package access
+            run, RunStatus.RUNNING, action="revive"
+        )
+
     async def recover(self, limit: int | None = None) -> list[ExecutionResult]:
         return await self.recovery.recover_pending(limit)
 

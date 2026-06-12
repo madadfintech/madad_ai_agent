@@ -74,22 +74,22 @@ def test_full_flow_over_http() -> None:
     )
     assert advanced.json()["prompt"]["step"] == "documents"
 
-    docs = _inbound(
+    # Bug #10a + Bug #12 (2026-06-09): the docs loop is strict, and one
+    # ``madad_score.ready`` event exits docs AND fast-forwards through
+    # payment_wait into the payment chain on the same resume — backend
+    # only fires the score event once.
+    _inbound(
         attachments=[
-            {"filename": "Trade_License.pdf", "content_base64": DOC},
-            {"filename": "Tax_Card.pdf", "content_base64": DOC},
-            {"filename": "Bank_Statement.pdf", "content_base64": DOC},
+            {"filename": "Establishment_Card.pdf", "content_base64": DOC}
         ]
     )
-    # After docs the workflow PARKs at payment_wait (not journey_wait — main
-    # restructured the flow so payment gate fires off madad_score.ready /
-    # payment.requested events, not status_update).
-    assert docs.json()["prompt"]["step"] == "payment_wait"
-
-    # Backend fires the payment-gate trigger → payment chain → payment_await.
     platform = get_onboarding_platform()
-    platform.workflow._identity.journey_status = "PRE_QUALIFIED"  # type: ignore[union-attr]
-    advanced = _backend_event("madad_score.ready", {"madadScore": 78}, event_id="evt-score")
+    platform.workflow._identity.journey_status = "QUALIFIED"  # type: ignore[union-attr]
+    advanced = _backend_event(
+        "madad_score.ready",
+        {"journey_status": "QUALIFIED", "madadScore": 78},
+        event_id="evt-score",
+    )
     assert advanced.json()["prompt"]["step"] == "payment"
 
     # Payment paid → lender_wait.

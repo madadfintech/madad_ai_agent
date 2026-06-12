@@ -43,6 +43,7 @@ from app.shared.workflow.persistence import WorkflowRun
 POLLABLE_STEPS: frozenset[str] = frozenset({"journey_wait_await", "lender_wait_await"})
 
 # Cadence per journey-status group, expressed as a timedelta.
+CADENCE_OFFER = timedelta(seconds=60)   # ACCEPTED/OFFER_ACCEPTED — see below
 CADENCE_FAST = timedelta(minutes=5)     # ELIGIBLE post-payment (close to ready)
 CADENCE_MEDIUM = timedelta(minutes=15)  # PRE_QUALIFIED / QUALIFIED (lender phase)
 CADENCE_SLOW = timedelta(hours=1)       # everything else (default backstop)
@@ -55,6 +56,14 @@ def cadence_for(status: JourneyStatus | str | None) -> timedelta:
         return CADENCE_MEDIUM
     if status == JourneyStatus.ELIGIBLE:
         return CADENCE_FAST
+    # Offer phase: the SME selects an offer / the line is activated on the
+    # PORTAL, and the backend's offer.selected webhook can't reach us (it's not
+    # allow-listed there). Poll fast (≈1 min, matching the beat tick) so the ✅
+    # "offer selected" confirmation and 🎊 activation fire promptly off /me's
+    # journey_status instead of waiting up to an hour. Short-lived phase, so the
+    # extra auth_me calls are bounded.
+    if status in (JourneyStatus.ACCEPTED, JourneyStatus.OFFER_ACCEPTED):
+        return CADENCE_OFFER
     return CADENCE_SLOW
 
 

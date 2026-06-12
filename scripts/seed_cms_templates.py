@@ -52,7 +52,7 @@ _TEMPLATE_BODIES = {
     ),
     "onboarding.campaign.awaiting_yes_no": (
         "Are you interested in taking financing for your business?\n"
-        "Please reply YES or NO. For any query call 72773652."
+        "Please reply YES or NO. For any query call +974 3017 3888."
     ),
     "onboarding.help.what_is_madad": (
         "Hello! 👋\n\n"
@@ -62,23 +62,23 @@ _TEMPLATE_BODIES = {
         "✅ Fast financing — funds within 5 working days of approval\n"
         "✅ Multiple bank offers — you choose\n"
         "✅ Sharia-compliant · Regulated by Qatar Central Bank\n\n"
-        "You can verify us at madadfintech.com or call 72773652."
+        "You can verify us at madadfintech.com or call +974 3017 3888."
     ),
     "onboarding.help.security": (
         "Absolutely — your data is completely safe with us. 🔒\n\n"
         "We are a regulated entity under Qatar Central Bank. The consent simply "
         "means you agree that Madad may access your business information to "
         "assess eligibility and use the document for financing purposes. That's all.\n\n"
-        "You can verify us at madadfintech.com or call 72773652."
+        "You can verify us at madadfintech.com or call +974 3017 3888."
     ),
     "onboarding.help.contextual": (
         "{{ answer }}\n\n"
         "{{ next_step }}\n\n"
-        "For any query call 72773652."
+        "For any query call +974 3017 3888."
     ),
     "onboarding.declined": (
         "No problem at all! If you ever need working capital support in the future, "
-        "we're here. Reach us at madadfintech.com or call 72773652. Have a great day! 👋"
+        "we're here. Reach us at madadfintech.com or call +974 3017 3888. Have a great day! 👋"
     ),
     "onboarding.domain_blocked": (
         "It looks like {{ domain }} is already registered with another team. "
@@ -93,6 +93,18 @@ _TEMPLATE_BODIES = {
         "4) Is your business based in Qatar?\n"
         "5) Your role at the business (FOUNDER / DIRECTOR / SHAREHOLDER / ...)"
     ),
+    # Business-email step — asked right after YES / account creation, before
+    # the consent/CR step. Capturing it makes the lead portal-loginable.
+    "onboarding.business_email.ask": (
+        "Your Madad account is all set! 🎉\n\n"
+        "What's your business email? We'll use it for your account and to keep "
+        "you updated on your application. 📧"
+    ),
+    "onboarding.business_email.conflict": (
+        "Looks like a business is already registered with that email.\n\n"
+        "Please reply with a different business email, or contact our support "
+        "team at contactus@madadfintech.com and we'll help you out. 📧"
+    ),
     "onboarding.consent.request": (
         "Great to know! 🎉 We have financed many businesses like yours in Qatar.\n\n"
         "To start the journey we need to first verify that your business is in Qatar "
@@ -104,7 +116,7 @@ _TEMPLATE_BODIES = {
         "🔒 Terms & Conditions: https://www.madadfintech.com/en/terms-and-conditions\n\n"
         "By sharing your CR you agree to the above. Please go ahead and share "
         "your CR document as a PDF or photo in this chat.\n\n"
-        "Any questions? Reply here or call us on 72773652."
+        "Any questions? Reply here or call us on +974 3017 3888."
     ),
     "onboarding.eligibility.intake.request": (
         "Quick business questionnaire — please share: "
@@ -125,7 +137,7 @@ _TEMPLATE_BODIES = {
         "We can see that your business is registered in Qatar — all good so far! ✅\n\n"
         "To further assess your eligibility we need to know your financials. "
         "Please share your last Audited Financial Statement.\n\n"
-        "For any query call us on 72773652."
+        "For any query call us on +974 3017 3888."
     ),
     "onboarding.buyers.request": (
         "Please share your main buyer's details (name, country, contact)."
@@ -158,7 +170,9 @@ _TEMPLATE_BODIES = {
         "9. Interim Financial Statement\n"
         "10. Bank Statement (last 6 months)\n\n"
         "👤 Shareholder Documents (per shareholder from CR)\n"
-        "11. QID   12. Passport   13. Proof of Address\n\n"
+        "11. QID   12. Passport\n\n"
+        "ℹ️ Optional: Shareholder Proof of Address — send if you have it, "
+        "but not required to proceed.\n\n"
         "📤 Share the documents here or login at madadfintech.com to complete "
         "your application.\n\n"
         "Please share your documents to move forward!"
@@ -185,17 +199,49 @@ _TEMPLATE_BODIES = {
         "We will share your assessment report within 24 hours. If all looks good, "
         "we will forward your application to our banking partners in Qatar.\n\n"
         "Meanwhile, enjoy your coffee ☕\n\n"
-        "For any query call 72773652 or visit madadfintech.com"
+        "For any query call +974 3017 3888 or visit madadfintech.com"
     ),
     "onboarding.upload.required": (
         "Whenever you're ready, please share {{ document }} as a PDF or photo here "
         "and I'll take it from there. 🙂\n\n"
-        "Have a question? Just ask — happy to help. For any query call 72773652."
+        "Have a question? Just ask — happy to help. For any query call +974 3017 3888."
+    ),
+    # Per user (UAT 2026-06-10): after the coffee message we explicitly ask
+    # the SME whether they have any more documents to send (classifier
+    # failures + the "I forgot one" case). Reply YES / NO; existing
+    # synonym set covers Ok / Sure / Nope / etc. WhatsApp interactive
+    # reply-button send is on the cluster's backlog; until that ships,
+    # this is plain-text + the synonym-aware matcher.
+    "onboarding.documents.more_docs_prompt": (
+        "📄 Do you have any more documents to upload?\n\n"
+        "Reply YES if you'd like to send more, or NO if you're done — "
+        "we'll proceed with the next step."
+    ),
+    # Immediate ack the instant a valid CR attachment arrives — guarantees the
+    # user always sees a response even if the downstream upload + financials
+    # prompt fails (QA Bug #1 + Ishan handover §9 / 2026-06-09).
+    "onboarding.cr.received": (
+        "📄 Got your CR — processing it now…"
+    ),
+    # Immediate ack on any document upload in the post-prequal docs loop.
+    # Rewritten 2026-06-09 (UAT feedback): the previous copy assumed the
+    # SME sent a ZIP and was wordy / unprofessional. Now generic, short,
+    # and channel-agnostic so it fits both single-file and ZIP uploads.
+    "onboarding.documents.processing": (
+        "📄 Got it — validating your document(s) now…"
+    ),
+    # Final fallback sent at the end of the docs loop when neither the
+    # classifier nor the local-unzip pipeline could land a single file the
+    # backend accepted. Keeps the SME informed instead of dropping silent.
+    "onboarding.documents.upload_failed": (
+        "I received your file(s) but couldn't process them right now. "
+        "Please resend any failed documents as separate PDF/photo uploads, "
+        "or call +974 3017 3888 if it keeps happening."
     ),
     "onboarding.status.pending": (
         "Hi! Your application is currently under review with Madad. 👍\n\n"
         "I'll notify you as soon as the next update is available. You can also "
-        "track your status at madadfintech.com. For queries call 72773652."
+        "track your status at madadfintech.com. For queries call +974 3017 3888."
     ),
     "onboarding.payment.awaiting": (
         "Your application is ready to move forward. Please complete the secure "
@@ -264,6 +310,16 @@ _TEMPLATE_BODIES = {
         "finalise your offer — this is where you'll also manage your invoices "
         "going forward."
     ),
+    # Step 8.5 — the SME selected/accepted an offer in the Madad portal
+    # (backend offer.selected webhook). One-time ✅ confirmation; the run then
+    # parks for the credit-line activation message below.
+    "onboarding.offer.confirmed": (
+        "✅ Confirmed — {{ lender }} selected!\n\n"
+        "Madad and {{ lender }} will now coordinate the formalities.\n"
+        "You'll hear from us within 2 business days. 🤝\n\n"
+        "Once your credit line is active, you can submit invoices right here on "
+        "WhatsApp — I'll guide you through that step too."
+    ),
     # PDF Step 9 — credit line activated, surfaces the accepted offer details
     # (bank, limit, rate, tenure) inline so the SME has the key numbers in
     # hand without opening the platform.
@@ -290,7 +346,7 @@ _NUDGE_TEMPLATE_BODIES = {
     ),
     "nudge.financials_pending.2": (
         "Need help? Our team can guide you through the next step — "
-        "call us on 72773652 or reply here. 📞"
+        "call us on +974 3017 3888 or reply here. 📞"
     ),
     "nudge.financials_pending.3": (
         "Final reminder: your Madad application will be marked inactive if "
@@ -306,7 +362,7 @@ _NUDGE_TEMPLATE_BODIES = {
     "nudge.incomplete_docs.2": (
         "Quick reminder — we still need: {{ documents }}.\n\n"
         "Reply here with the documents attached, or upload via "
-        "madadfintech.com. Need help? Call 72773652."
+        "madadfintech.com. Need help? Call +974 3017 3888."
     ),
     "nudge.incomplete_docs.3": (
         "Final reminder — your application is at risk of being marked "
@@ -326,7 +382,7 @@ _NUDGE_TEMPLATE_BODIES = {
         "expires.\n\n"
         "Pay QAR {{ amount }} →\n"
         "{{ payment_link }}\n\n"
-        "Questions? Reply here or call 72773652."
+        "Questions? Reply here or call +974 3017 3888."
     ),
     "nudge.payment_pending.3": (
         "Final reminder — your slot will be released if payment is not "

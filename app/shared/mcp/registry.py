@@ -64,9 +64,16 @@ class Tools:
     # report upload + account.created message. ``get`` is the resume read.
     MCP_UPDATE_ONBOARDING_PROGRESS = "madad_mcp_update_onboarding_progress"
     MCP_GET_ONBOARDING_PROGRESS = "madad_mcp_get_onboarding_progress"
+    # Per Ishan (cluster commit e6ea5d2, 2026-06-10): read-only existing-user
+    # lookup. Called BEFORE ``create_channel_session`` on the campaign-entry
+    # path so a returning user is routed (re-send offer, payment link,
+    # invoice prompt, portal login, etc.) instead of being silently re-
+    # onboarded. Closes Bug #2 + Bug #6.
+    MCP_CHECK_REGISTRATION = "madad_mcp_check_registration"
     # Business-email capture step (right after YES). Backend returns
-    # {ok, conflict, alreadyPortalUser}: conflict -> offer different-email /
-    # contact-support; otherwise attach the email and continue to the CR step.
+    # {ok, conflict, alreadyPortalUser}: conflict -> ask for a different email /
+    # contact support; otherwise attach the email (also makes the lead a
+    # normal, portal-loginable user) and continue to the CR step.
     MCP_SET_BUSINESS_EMAIL = "madad_mcp_set_business_email"
 
     # -- KYC (30; ``madad_kyc_complete_stage`` deliberately omitted) ---------

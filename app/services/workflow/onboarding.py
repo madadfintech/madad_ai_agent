@@ -67,12 +67,14 @@ between turns.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import io
 import os
 import re
 import zipfile
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -123,6 +125,10 @@ TEMPLATE_KEYS = [
     "onboarding.documents.single_received",
     "onboarding.documents.complete",
     "onboarding.upload.required",
+    "onboarding.cr.received",
+    "onboarding.documents.processing",
+    "onboarding.documents.more_docs_prompt",
+    "onboarding.documents.upload_failed",
     "onboarding.status.pending",
     "onboarding.payment.awaiting",
     "onboarding.payment.confirmed",
@@ -132,6 +138,7 @@ TEMPLATE_KEYS = [
     "onboarding.offers.preview",
     "onboarding.offer.handoff",
     "onboarding.offer.handoff.button",
+    "onboarding.offer.confirmed",
     "onboarding.activated",
 ]
 
@@ -187,6 +194,20 @@ PORTAL_KEYWORDS = (
     "madad id",
     "application id",
     "reference",
+    # Bug #7+#8 (2026-06-09): natural portal queries the QA testers
+    # actually wrote ("how do I login to madadfintech?") were falling
+    # through to the generic fallback because none of the original
+    # keywords matched. Widen the net.
+    "login",
+    "log in",
+    "logging in",
+    "sign in",
+    "signin",
+    "website",
+    "madadfintech",
+    "madad fintech",
+    "madad.com",
+    "madadfintech.com",
 )
 
 CASUAL_KEYWORDS = (
@@ -221,6 +242,61 @@ def _is_portal_query(value: Any) -> bool:
 def _is_casual_message(value: Any) -> bool:
     text = reply_text(value).lower().strip()
     return any(text == keyword or text.startswith(f"{keyword} ") for keyword in CASUAL_KEYWORDS)
+
+
+# Bug #16 (UAT 2026-06-09): self-service "what am I still missing?" intent
+# matches the spec page 8 "PENDING DOCS" sample queries plus the
+# colloquial variants the SME actually types in WhatsApp. Whole-word /
+# phrase matching so a stray "list" inside a longer sentence doesn't
+# misfire — full text equality OR a clear phrase.
+_PENDING_DOCS_PHRASES = (
+    "what am i still missing",
+    "what's still missing",
+    "whats still missing",
+    "what is still missing",
+    "what's missing",
+    "whats missing",
+    "what is missing",
+    "what's left",
+    "whats left",
+    "what is left",
+    "what's still needed",
+    "whats still needed",
+    "what's needed",
+    "whats needed",
+    "what do i still need",
+    "what do i need",
+    "still needed",
+    "still need",
+    "pending documents",
+    "pending docs",
+    "remaining documents",
+    "remaining docs",
+    "documents checklist",
+    "docs checklist",
+)
+_PENDING_DOCS_SHORT_TOKENS = frozenset(
+    {
+        "list",
+        "checklist",
+        "status",
+        "pending",
+        "missing",
+        "remaining",
+        "left",
+    }
+)
+
+
+def _is_pending_docs_query(value: Any) -> bool:
+    """True when the SME is asking for the running pending-docs list."""
+
+    text = reply_text(value).strip().lower()
+    if not text:
+        return False
+    if text in _PENDING_DOCS_SHORT_TOKENS:
+        return True
+    return any(phrase in text for phrase in _PENDING_DOCS_PHRASES)
 
 
 def _is_short_negative(value: Any) -> bool:
@@ -464,6 +540,32 @@ def _parse_shareholder_text(text: str, fallback_phone: str | None) -> list[dict[
     return [{"name": name, "phoneNumber": fallback_phone or "+97400000000"}]
 
 
+# Bug #11 (UAT 2026-06-09): debounce window for the documents.processing
+# ack. Madad's bridge POSTs each ZIP-member as a separate inbound; without
+# the debounce we sent 8 "📦 Got it — processing your documents now…"
+# messages in 3 seconds. 30s covers a typical multi-file burst plus a small
+# buffer; anything older is treated as a fresh batch and re-fires the ack.
+DOCS_PROCESSING_ACK_TTL_SECONDS = 30.0
+
+# Bug #15 (UAT 2026-06-09): same debounce shape but for the full
+# "📋 Application checklist" body. Per-file POSTs land as separate
+# inbounds; without the debounce the SME got the 15-line ✅/⚠️
+# checklist after EVERY file upload. 60s is longer than the processing
+# ack so the SME sees one full checklist per upload session — the
+# per-file brief receipt (✅ X — Received & Validated) still fires
+# every time so progress is visible.
+DOCS_CHECKLIST_TTL_SECONDS = 60.0
+
+
+def _parse_iso_or_none(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
 DEFAULT_WHATSAPP_REQUIRED_DOCS = [
     # Business documents (Trade License + Tax Card are NOT collected by Madad)
     "national_address_certificate",
@@ -478,6 +580,14 @@ DEFAULT_WHATSAPP_REQUIRED_DOCS = [
     # Shareholder documents
     "qid",
     "passport",
+]
+
+# Per user 2026-06-10: optional shareholder docs the SME MAY send but MUST NOT
+# block completion on. If uploaded the agent acknowledges + validates them like
+# any required doc; if never sent, the docs loop still naturally exhausts when
+# every entry in ``DEFAULT_WHATSAPP_REQUIRED_DOCS`` is in. See
+# [[project_optional_docs]].
+DEFAULT_WHATSAPP_OPTIONAL_DOCS = [
     "proof_of_address",
 ]
 
@@ -562,6 +672,138 @@ def _format_banks_list(banks: list[str]) -> str:
     return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
 
 
+def _extract_offers_from_me(info: Any) -> list[dict[str, Any]]:
+    """Read the offer list off an ``auth_me`` response.
+
+    Per Ishan's handover §8 (2026-06-09): the field on the enriched
+    ``/me`` payload is ``offersReceived``, not ``offers``. Earlier code
+    only checked ``info.get("offers")`` and silently rendered empty
+    offer cards in the WhatsApp "Exciting news — your financing offers
+    are ready!" template (UAT screenshot 2026-06-10). Try every shape
+    the backend is known to use so a one-off field rename can't drop
+    offers on the floor again.
+    """
+
+    if not isinstance(info, dict):
+        return []
+    for owner in (info, info.get("user") if isinstance(info.get("user"), dict) else None):
+        if not isinstance(owner, dict):
+            continue
+        for key in ("offersReceived", "offers", "offer_list"):
+            raw = owner.get(key)
+            if isinstance(raw, list):
+                return [o for o in raw if isinstance(o, dict)]
+    return []
+
+
+def _extract_reference_from_me(info: Any) -> str | None:
+    """Read the application reference number off ``auth_me``.
+
+    The backend exposes the same value under several field names across
+    `user.uniqueId` / `user.referenceNumber` / top-level `referenceNumber`.
+    Falls back to None when none are populated so callers can keep their
+    existing ``or state.application_ref`` chain."""
+
+    if not isinstance(info, dict):
+        return None
+    candidates = (info, info.get("user") if isinstance(info.get("user"), dict) else None)
+    for owner in candidates:
+        if not isinstance(owner, dict):
+            continue
+        for key in (
+            "referenceNumber", "reference_number",
+            "uniqueId", "unique_id", "applicationRef", "application_ref",
+        ):
+            value = owner.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _extract_credit_line_from_me(info: Any) -> dict[str, Any]:
+    """Read the active credit line off ``auth_me``.
+
+    Per Ishan's handover §8: ``creditLines`` is a list (one per active
+    line). For the activation message (PDF Step 9) we want the most
+    recent active entry. Returns an empty dict when none are present so
+    the caller can fall back to its existing offer-derived fields.
+    """
+
+    if not isinstance(info, dict):
+        return {}
+    candidates = (info, info.get("user") if isinstance(info.get("user"), dict) else None)
+    for owner in candidates:
+        if not isinstance(owner, dict):
+            continue
+        raw = owner.get("creditLines") or owner.get("credit_lines")
+        if isinstance(raw, list) and raw:
+            for entry in raw:
+                if isinstance(entry, dict):
+                    status = str(
+                        entry.get("status") or entry.get("state") or ""
+                    ).upper()
+                    if not status or "ACTIVE" in status:
+                        return entry
+            first = raw[0]
+            if isinstance(first, dict):
+                return first
+    return {}
+
+
+def _offers_sig(offers: list[dict[str, Any]]) -> str:
+    """Stable signature of the offer set (lender + key terms), so we re-send the
+    offer cards only when a lender actually adds/changes an offer — not on every
+    routine status poll while the SME is deciding."""
+    parts = sorted(
+        f"{_lender_name(o) or '?'}|{o.get('creditLimit') or o.get('credit_limit')}"
+        f"|{o.get('interestRate') or o.get('interest_rate')}"
+        f"|{o.get('tenureDays') or o.get('tenure_days')}"
+        for o in (offers or [])
+        if isinstance(o, dict)
+    )
+    return ";".join(parts)
+
+
+def _selected_offer_from_payload(payload: Any) -> dict[str, Any] | None:
+    """Pull the lender + terms off an offer.selected / credit_line.activated
+    webhook payload so the confirmation/activation messages can name the bank."""
+    if not isinstance(payload, dict):
+        return None
+    name = payload.get("lenderName") or payload.get("bankName")
+    if not name:
+        return None
+    return {
+        "lenderName": name,
+        "creditLimit": payload.get("creditLimit"),
+        "interestRate": payload.get("interestRate"),
+        "tenureDays": payload.get("tenureDays"),
+        "currency": payload.get("currency"),
+    }
+
+
+def _lender_name(offer: dict[str, Any]) -> str | None:
+    """Extract a lender's display NAME from an offer across every shape the
+    backend uses: ``lenderName`` (webhook payload), ``lender`` as a plain
+    string, or ``lender`` / ``financialInstitution`` as a nested object with a
+    ``name``. Prevents rendering the raw ``{id, name}`` object in the message.
+    """
+    if not isinstance(offer, dict):
+        return None
+    for key in ("lenderName", "bankName", "lender_name", "bank_name"):
+        v = offer.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for key in ("lender", "financialInstitution", "bank"):
+        v = offer.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, dict):
+            name = v.get("name") or v.get("displayName")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return None
+
+
 def _format_offer_cards(offers: list[dict[str, Any]]) -> str:
     """Render the offer set as PDF Step 8-style cards (one block per offer).
 
@@ -603,7 +845,7 @@ def _format_offer_cards(offers: list[dict[str, Any]]) -> str:
 
     lines: list[str] = []
     for idx, offer in enumerate(offers, start=1):
-        lender = _g(offer, "lender", "bank_name", "bankName") or "Lender"
+        lender = _lender_name(offer) or "Lender"
         limit = _fmt_qar(_g(offer, "creditLimit", "credit_limit", "limit"))
         rate = _fmt_pct(_g(offer, "interestRate", "interest_rate", "rate"))
         tenure = _fmt_days(_g(offer, "tenureDays", "tenure_days", "tenure"))
@@ -689,12 +931,24 @@ class OnboardingWorkflow(WorkflowDefinition):
             "check_contact_send": self._check_contact_send,
             "check_contact_await": self._check_contact_await,
             "domain_blocked": self._domain_blocked,
+            "registered_route_send": self._registered_route_send,
+            # Returning-user resume: open session → fetch live status → re-enter
+            # the exact step the SME left off at (instead of greet-and-end).
+            "channel_session_resume": self._channel_session_resume,
+            "resume_status_fetch": self._resume_status_fetch,
+            "resume_rejected": self._resume_rejected,
+            "resume_offer_expired": self._resume_offer_expired,
+            "resume_application_open": self._resume_application_open,
             "channel_session_first": self._channel_session_first,
             "channel_session_create_user": self._channel_session_create_user,
             "collect_onboarding_details_send": self._collect_onboarding_details_send,
             "collect_onboarding_details_await": self._collect_onboarding_details_await,
             "complete_onboarding_send": self._complete_onboarding_send,
             "channel_session_second": self._channel_session_second,
+            # Step 1b: business email (right after YES / account creation)
+            "business_email_send": self._business_email_send,
+            "business_email_await": self._business_email_await,
+            "business_email_conflict_send": self._business_email_conflict_send,
             # Step 2: consent + CR
             "consent_send": self._consent_send,
             "consent_await": self._consent_await,
@@ -717,6 +971,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             "documents_upload_loop_send": self._documents_upload_loop_send,
             "documents_upload_loop_await": self._documents_upload_loop_await,
             "documents_complete": self._documents_complete,
+            "more_docs_prompt_send": self._more_docs_prompt_send,
+            "more_docs_prompt_await": self._more_docs_prompt_await,
             # Postman-triggered gates (demo): pre-qualification (after audit)
             # and payment (after coffee) are released by an external trigger.
             "prequalify_wait_await": self._prequalify_wait_await,
@@ -736,6 +992,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "offers_fetch": self._offers_fetch,
             "offer_view_send": self._offer_view_send,
             "offer_handoff_to_madad": self._offer_handoff_to_madad,
+            "offer_confirmed": self._offer_confirmed,
             "activated": self._activated,
             "invoice_collect_await": self._invoice_collect_await,
         }
@@ -764,32 +1021,89 @@ class OnboardingWorkflow(WorkflowDefinition):
                 # mints SIGN_UP + access_token in one round-trip.
                 "new_whatsapp": "channel_session_create_user",
                 "blocked": "domain_blocked",
+                # Per Ishan (cluster e6ea5d2, 2026-06-10): returning users
+                # routed by check_registration are existing accounts mid/post
+                # journey — open a session (mint access_token) then RESUME at
+                # their exact step via resume_status_fetch, instead of the old
+                # greet-and-end. Closes Bug #2 + Bug #6 and the "bot doesn't
+                # continue the journey" gap (user 2026-06-12). NOTE: the plain
+                # "existing" path (contact exists but check_registration gave no
+                # route) keeps the original continue-at-consent behaviour.
+                "registered_routed": "channel_session_resume",
             },
         )
 
-        # Existing-user path converges at consent_send via one session call.
+        # Plain existing-user path converges at consent_send via one session call
+        # (unchanged — early-stage contacts continue onboarding from consent/CR).
         graph.add_conditional_edges(
             "channel_session_first",
             self._route_channel_session,
             {"consent": "consent_send"},
         )
+        # Returning-user RESUME path: a dedicated session call mints the
+        # access_token, then resume_status_fetch reads the live journey_status
+        # and drops the run back into the exact node the SME left off at.
+        graph.add_edge("channel_session_resume", "resume_status_fetch")
+        graph.add_conditional_edges(
+            "resume_status_fetch",
+            self._route_resume_by_status,
+            {
+                # SIGN_UP / ONBOARDED: no email yet → collect it; else consent/CR.
+                "email": "business_email_send",
+                "consent": "consent_send",
+                # ELIGIBLE: right after CR → ask for the audited financials.
+                "financials": "financials_send",
+                # INCOMPLETE / UNVERIFIED / VERIFIED / PRE_QUALIFIED: all the
+                # document-submission phase — the checklist loop asks for what's
+                # missing or shows the "under review" coffee message when full.
+                "documents": "documents_list_fetch",
+                # QUALIFIED: initiate the onboarding-fee payment.
+                "payment": "business_details_fetch",
+                "offers": "offers_fetch",
+                "offer_confirmed": "offer_confirmed",
+                "activated": "activated",
+                "rejected": "resume_rejected",
+                "offer_expired": "resume_offer_expired",
+                "application_open": "resume_application_open",
+                "ineligible": "not_eligible",
+                "unqualified": "not_qualified",
+                # Unknown / unreadable status → safe greet-and-end fallback.
+                "welcome": "registered_route_send",
+            },
+        )
         # New-lead path: the spec says NO form-filling — we never ask the SME to
         # type their name/CR/role. The account is created up front with safe
         # placeholders (complete_onboarding fills sensible defaults) and the real
         # business details are extracted from the CR document they upload next.
+        # NEW: right after the account exists we collect the BUSINESS email
+        # (business_email_send) before consent/CR — this makes the lead a
+        # normal, portal-loginable user and catches a duplicate business early.
         graph.add_edge("complete_onboarding_send", "channel_session_second")
         graph.add_conditional_edges(
             "channel_session_second",
             self._route_channel_session,
-            {"consent": "consent_send"},
+            {"consent": "business_email_send"},
         )
-        # WhatsApp organic-entry converges at consent_send via the
-        # create_user_if_missing fast-path — no complete_onboarding hop.
+        # WhatsApp organic-entry: create_user_if_missing fast-path -> email step.
         graph.add_conditional_edges(
             "channel_session_create_user",
             self._route_channel_session,
-            {"consent": "consent_send"},
+            {"consent": "business_email_send"},
         )
+
+        # Business-email step. proceed -> consent/CR; conflict -> ask again;
+        # await_again -> keep waiting for a valid email.
+        graph.add_edge("business_email_send", "business_email_await")
+        graph.add_conditional_edges(
+            "business_email_await",
+            self._route_business_email,
+            {
+                "proceed": "consent_send",
+                "conflict": "business_email_conflict_send",
+                "await_again": "business_email_await",
+            },
+        )
+        graph.add_edge("business_email_conflict_send", "business_email_await")
 
         graph.add_edge("consent_send", "consent_await")
         graph.add_conditional_edges(
@@ -828,14 +1142,35 @@ class OnboardingWorkflow(WorkflowDefinition):
             self._route_documents,
             {
                 "complete": "documents_complete",
+                # Refinement per Ishan (2026-06-09): when admin QUALIFIES
+                # mid-docs-loop, jump STRAIGHT to the payment chain —
+                # bypass the misleading "all documents received" coffee
+                # message (the checklist isn't actually complete) and
+                # the now-redundant payment_wait_await stop.
+                "payment": "business_details_fetch",
                 "missing": "documents_upload_loop_send",
                 "await_again": "documents_upload_loop_await",
             },
         )
-        # Spec Step 5 → payment: after the coffee message, PARK until the payment
-        # step is triggered (via Postman in the demo). On trigger → Madad score +
-        # the "Pay QAR 6,000 →" button.
-        graph.add_edge("documents_complete", "payment_wait_await")
+        # Per user (UAT 2026-06-10): after the coffee message, ask whether
+        # the SME wants to send more documents. Classifier failures and
+        # post-prequal "I forgot one" cases need an explicit way back into
+        # the upload loop instead of being forced past it. NO routes on to
+        # payment_wait_await; YES loops back to documents_upload_loop_await.
+        graph.add_edge("documents_complete", "more_docs_prompt_send")
+        graph.add_edge("more_docs_prompt_send", "more_docs_prompt_await")
+        graph.add_conditional_edges(
+            "more_docs_prompt_await",
+            self._route_more_docs,
+            {
+                "yes": "documents_upload_loop_await",
+                "no": "payment_wait_await",
+                "await_again": "more_docs_prompt_await",
+            },
+        )
+        # Spec Step 5 → payment: after the coffee message + more-docs prompt,
+        # PARK until the payment step is triggered (via Postman in the demo).
+        # On trigger → Madad score + the "Pay QAR 6,000 →" button.
         graph.add_conditional_edges(
             "payment_wait_await",
             self._route_payment_wait,
@@ -850,6 +1185,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "ineligible": "not_eligible",
                 "unqualified": "not_qualified",
                 "offers": "offers_fetch",
+                "offer_confirmed": "offer_confirmed",
                 "activated": "activated",
                 "wait": "journey_wait_await",
             },
@@ -880,6 +1216,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "ineligible": "not_qualified",
                 "unqualified": "not_qualified",
                 "offers": "offers_fetch",
+                "offer_confirmed": "offer_confirmed",
                 "activated": "activated",
                 "wait": "lender_wait_await",
             },
@@ -892,6 +1229,14 @@ class OnboardingWorkflow(WorkflowDefinition):
 
         graph.add_edge("offers_fetch", "offer_view_send")
         graph.add_edge("offer_view_send", "offer_handoff_to_madad")
+        # Step 8 → 9: after showing offers + the "Login to Madad" button the run
+        # must NOT terminate — it parks in journey_wait_await so the post-handoff
+        # webhooks can resume it: another lender's offers.available (re-show ALL
+        # offers), offer.selected (✅ confirmation), credit_line.activated
+        # (activation message). Previously offer_handoff was a finish node, so
+        # every one of those events hit a dead run and no message was sent.
+        graph.add_edge("offer_handoff_to_madad", "journey_wait_await")
+        graph.add_edge("offer_confirmed", "journey_wait_await")
 
         # Step 9 → 10-13: after the credit-line activation message, the run no
         # longer terminates — it parks to collect invoices for financing. Each
@@ -909,7 +1254,15 @@ class OnboardingWorkflow(WorkflowDefinition):
             "domain_blocked",
             "not_eligible",
             "not_qualified",
-            "offer_handoff_to_madad",
+            # Returning-user route per Ishan's check_registration tool —
+            # the SME has been re-greeted with the right message, no
+            # further onboarding work is needed in this run.
+            "registered_route_send",
+            # Returning-user resume terminals (status-specific messages that
+            # have no in-chat next action — contact support / log in to portal).
+            "resume_rejected",
+            "resume_offer_expired",
+            "resume_application_open",
         ):
             graph.set_finish(terminal)
 
@@ -930,7 +1283,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                     identity=ctx.identity,
                     template_name="initiate",
                     template_key="onboarding.campaign.intro",
-                    language_code="en",
+                    # Per locale-propagation contract: thread state.locale
+                    # through to Meta's language_code so Arabic / English
+                    # template variants resolve correctly.
+                    language_code=locale,
                 )
             except Exception as exc:  # noqa: BLE001 — fall back to free text
                 ctx.logger.warning("campaign_send.template_failed", error=str(exc)[:200])
@@ -970,11 +1326,36 @@ class OnboardingWorkflow(WorkflowDefinition):
             result = await self._identity.check_contact(phone=ctx.identity)
         else:
             result = await self._identity.check_contact(email=ctx.identity)
+        # Per Ishan (cluster commit e6ea5d2, 2026-06-10): also fire the
+        # read-only registration lookup — it returns the full registered
+        # shape (route hint, journey status, fee paid, credit line,
+        # offers…) so the dispatcher can skip SIGN_UP for returning
+        # users and re-send the appropriate message instead of
+        # silently re-onboarding (Bug #2 + Bug #6). Best-effort: a
+        # failure here must not break the SIGN_UP path.
+        route: str | None = None
+        payload: dict[str, Any] = {}
+        try:
+            reg = await self._identity.check_registration(
+                identifier=ctx.identity,
+                channel=_channel(ctx),
+            )
+            if isinstance(reg, dict) and reg.get("registered"):
+                payload = reg
+                raw_route = reg.get("route")
+                if isinstance(raw_route, str):
+                    route = raw_route
+        except Exception as exc:  # noqa: BLE001 — non-fatal, fall through
+            ctx.logger.warning(
+                "check_registration.failed", error=str(exc)[:200]
+            )
         return self._step(
             "check_contact_send",
             ctx,
             check_contact_result=result,
             channel_identity=ctx.identity,
+            registration_route=route,
+            registration_payload=payload,
         )
 
     async def _check_contact_await(
@@ -997,6 +1378,228 @@ class OnboardingWorkflow(WorkflowDefinition):
             outcome="domain_blocked",
             domain_block_reason=domain,
         )
+
+    async def _registered_route_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """Returning-user landing per Ishan's check_registration route.
+
+        Cluster commit ``e6ea5d2`` (2026-06-10): a single
+        ``madad_mcp_check_registration`` call before SIGN_UP returns a
+        ``route`` enum that says which message to send to a returning user
+        — portal login, payment link re-send, offers re-display, invoice
+        upload invite, etc. Closes Bug #2 (existing account not detected
+        at sign-up) and Bug #6 (portal login creating a duplicate).
+
+        This node picks a friendly route-specific answer and completes the
+        run — we don't restart onboarding for someone whose application is
+        already in flight on the portal / awaiting payment / has offers in
+        flight. The full payload remains on ``state.registration_payload``
+        for any downstream node that wants the credit-line / offer details.
+        """
+
+        route = state.registration_route or "continue_step"
+        payload = state.registration_payload or {}
+        ref = payload.get("referenceNumber") or ""
+
+        answer_by_route: dict[str, str] = {
+            "portal_login_required": (
+                "👋 Welcome back! Your application is being managed on the "
+                "Madad portal. Please log in at uat-portal.madadfintech.com to continue."
+                + (f" (Ref: {ref})" if ref else "")
+            ),
+            "invoice_discounting": (
+                "🎉 Welcome back! Your credit line is already active — "
+                "send any invoice you'd like to finance here as a PDF or "
+                "photo and I'll submit it right away."
+            ),
+            "offer_accepted_confirmation": (
+                "✅ Welcome back! You've already accepted an offer with us — "
+                "our team is coordinating the next steps and we'll be in "
+                "touch shortly."
+            ),
+            "offers_available": (
+                "🎉 Welcome back — your financing offers are ready to "
+                "review. Log in at uat-portal.madadfintech.com to compare them side "
+                "by side and pick the one you want."
+            ),
+            "payment_received": (
+                "💚 Welcome back! Your onboarding fee is already in and "
+                "your application is with our banking partners — we'll "
+                "ping you the moment they respond (typically 3–5 business "
+                "days)."
+            ),
+            "payment_link": (
+                "👋 Welcome back! You're qualified for financing — please "
+                "complete the QAR 6,000 onboarding fee to forward your "
+                "application to the banks. Log in at uat-portal.madadfintech.com to "
+                "pay or reply 'pay' and I'll re-send the link."
+            ),
+            "continue_step": (
+                "👋 Welcome back! Picking up where you left off — share "
+                "the next document we asked for whenever you're ready, "
+                "or reply 'list' to see what's still pending."
+            ),
+        }
+        answer = answer_by_route.get(route, answer_by_route["continue_step"])
+        await self._send(
+            ctx, state, "onboarding.help.contextual",
+            {"answer": answer, "next_step": ""},
+        )
+        return self._step(
+            "registered_route_send",
+            ctx,
+            outcome="returning_user",
+            application_ref=ref or state.application_ref,
+        )
+
+    # -- Returning-user RESUME (continue the journey at the exact step) -------
+
+    async def _channel_session_resume(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """Returning user (check_registration returned a route): open a channel
+        session to mint a fresh access_token, then resume_status_fetch reads the
+        live journey_status off it. Mirrors _channel_session_first but feeds the
+        RESUME branch instead of consent/CR."""
+        session = await self._identity.open_session(
+            channel=_channel(ctx),
+            identifier=ctx.identity,
+            create_onboarding_token=False,
+        )
+        # Prefer the authoritative referenceNumber from check_registration's
+        # payload (the SME's real application ref) over the freshly-minted
+        # session ref, so status queries / payment re-sends use the right one.
+        ref = (state.registration_payload or {}).get("referenceNumber")
+        return self._step(
+            "channel_session_resume",
+            ctx,
+            channel_session_response=session,
+            session_type=session.session_type,
+            access_token=session.access_token,
+            refresh_token=session.refresh_token,
+            token_expires_at=session.token_expires_at,
+            madad_user_id=session.user_or_lead_ref,
+            application_ref=ref or session.reference_number or state.application_ref,
+        )
+
+    async def _resume_status_fetch(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """Returning user: read the authoritative ``journeyStatus`` (and whether
+        the account has an email) so ``_route_resume_by_status`` can drop the
+        LIVE run back into the exact step the SME left off at — rather than the
+        old greet-and-end behaviour. ``channel_session_first`` has just minted
+        the ``access_token`` we poll with. Tolerant: any failure leaves
+        ``journey_status`` unset and the router falls back to a safe greeting.
+        """
+        status = await self._poll_journey_status(state)
+        has_email: bool | None = None
+        if state.access_token:
+            try:
+                info = await self._identity.me(access_token=state.access_token)
+                if isinstance(info, dict):
+                    nested = info.get("user")
+                    user = nested if isinstance(nested, dict) else info
+                    has_email = bool(user.get("email"))
+            except Exception as exc:  # noqa: BLE001 — tolerate; default routing
+                ctx.logger.warning(
+                    "resume_status_fetch.me_failed", error=str(exc)[:200]
+                )
+        return self._step(
+            "resume_status_fetch",
+            ctx,
+            journey_status=status,
+            account_has_email=has_email,
+        )
+
+    def _route_resume_by_status(self, state: OnboardingState) -> str:
+        """Map the canonical journey status → the node that re-enters the SME's
+        current step. Spec confirmed with the user (2026-06-12), aligned to the
+        MCP cluster README's 16-status reference. INCOMPLETE/UNVERIFIED/
+        VERIFIED/PRE_QUALIFIED are all the document-submission phase (the loop
+        asks for missing docs or shows the under-review message); payment is
+        triggered at QUALIFIED, not before."""
+        s = state.journey_status
+        JS = JourneyStatus
+        if s is None:
+            return "welcome"
+        if s in (JS.SIGN_UP, JS.ONBOARDED):
+            return "consent" if state.account_has_email else "email"
+        if s == JS.ELIGIBLE:
+            return "financials"
+        if s in (JS.INCOMPLETE, JS.UNVERIFIED, JS.VERIFIED, JS.PRE_QUALIFIED):
+            return "documents"
+        if s == JS.QUALIFIED:
+            return "payment"
+        if s == JS.ACCEPTED:
+            return "offers"
+        if s == JS.OFFER_ACCEPTED:
+            return "offer_confirmed"
+        if s == JS.OFFER_EXPIRED:
+            return "offer_expired"
+        if s == JS.ACTIVATED:
+            return "activated"
+        if s == JS.NOT_ACCEPTED:
+            return "rejected"
+        if s == JS.OPEN:
+            return "application_open"
+        if s == JS.IN_ELIGIBLE:
+            return "ineligible"
+        if s == JS.UNQUALIFIED:
+            return "unqualified"
+        return "welcome"
+
+    async def _resume_rejected(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        await self._send(
+            ctx, state, "onboarding.help.contextual",
+            {
+                "answer": (
+                    "We're sorry — after review by our banking partners your "
+                    "application was not accepted this time. Please contact "
+                    "Madad support at support@madadfintech.com or "
+                    "madadfintech.com and our team will talk you through your "
+                    "options."
+                ),
+                "next_step": "",
+            },
+        )
+        return self._step("resume_rejected", ctx, outcome="returning_user")
+
+    async def _resume_offer_expired(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        await self._send(
+            ctx, state, "onboarding.help.contextual",
+            {
+                "answer": (
+                    "Your financing offer(s) have expired. Please contact Madad "
+                    "support at support@madadfintech.com (or madadfintech.com) "
+                    "and we'll have fresh offers issued for you."
+                ),
+                "next_step": "",
+            },
+        )
+        return self._step("resume_offer_expired", ctx, outcome="returning_user")
+
+    async def _resume_application_open(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        await self._send(
+            ctx, state, "onboarding.help.contextual",
+            {
+                "answer": (
+                    "Your application is open — we need a little more "
+                    "information to proceed. Please log in to the Madad portal "
+                    "at uat-portal.madadfintech.com to see what's required, or "
+                    "contact support@madadfintech.com and our team will help."
+                ),
+                "next_step": "",
+            },
+        )
+        return self._step("resume_application_open", ctx, outcome="returning_user")
 
     async def _channel_session_first(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -1200,6 +1803,67 @@ class OnboardingWorkflow(WorkflowDefinition):
 
     # -- Step 2: consent + CR upload -----------------------------------------
 
+    async def _business_email_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """Right after the lead says YES and the account is created, ask for
+        their BUSINESS email. Capturing it makes the lead a normal,
+        portal-loginable user and lets us detect a duplicate business before
+        the CR step."""
+        await self._send(ctx, state, "onboarding.business_email.ask")
+        return self._step("business_email_send", ctx, business_email_status=None)
+
+    async def _business_email_await(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        reply = await_input({"waiting_for": "email", "step": "business_email"})
+        email = _extract_email(reply_text(reply))
+        if not email:
+            # Off-script / not an email — clarify in context and keep waiting.
+            await self._smart_contextual(
+                ctx, state, reply,
+                "Please reply with your business email (e.g. name@company.com) "
+                "so we can set up your account. 📧",
+            )
+            return self._step("business_email_await", ctx, business_email_status="await")
+        try:
+            result = await self._identity.set_business_email(
+                email=email,
+                user_id=state.madad_user_id,
+                channel=_channel(ctx),
+                identifier=ctx.identity,
+            )
+        except Exception as exc:  # noqa: BLE001 — transport error -> let them retry
+            ctx.logger.warning("business_email.set_failed", error=str(exc)[:200])
+            return self._step("business_email_await", ctx, business_email_status="await")
+        if result.get("conflict"):
+            return self._step(
+                "business_email_await", ctx,
+                business_email=email, business_email_status="conflict",
+            )
+        # ok (or the unlikely alreadyPortalUser) — proceed; record step 2.
+        await self._update_progress(state, ctx, step=2)
+        return self._step(
+            "business_email_await", ctx,
+            business_email=email, business_email_status="proceed",
+        )
+
+    def _route_business_email(self, state: OnboardingState) -> str:
+        status = (state.business_email_status or "").lower()
+        if status == "proceed":
+            return "proceed"
+        if status == "conflict":
+            return "conflict"
+        return "await_again"
+
+    async def _business_email_conflict_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """The email is already registered to another account — ask for a
+        different business email, or to contact support."""
+        await self._send(ctx, state, "onboarding.business_email.conflict")
+        return self._step("business_email_conflict_send", ctx, business_email_status=None)
+
     async def _consent_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
@@ -1248,6 +1912,12 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             return self._step("consent_await", ctx, consent=False)
         first = attachments[0]
+        # Immediate ack so the user always sees a response — even if the
+        # downstream cr_upload_base64 / financials_send chain hiccups (Bug #1).
+        try:
+            await self._send(ctx, state, "onboarding.cr.received")
+        except Exception as exc:  # noqa: BLE001 — ack failure must not kill the run
+            ctx.logger.warning("cr_received_ack.failed", error=str(exc)[:200])
         return self._step(
             "consent_await",
             ctx,
@@ -1413,13 +2083,23 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _financials_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        await self._send(ctx, state, "onboarding.financials.request")
-        await self._reminders.schedule(
-            "financials_pending",
-            channel=_channel(ctx),
-            identity=ctx.identity,
-            target_ref=state.madad_user_id or ctx.session_id,
-        )
+        # Bug #1 (2026-06-09): the financials prompt is the next user-facing
+        # message after CR upload. A transient messenger / reminder failure
+        # used to kill the run silently — guard so we always progress to
+        # financials_await and let the SME's next reply re-trigger the prompt.
+        try:
+            await self._send(ctx, state, "onboarding.financials.request")
+        except Exception as exc:  # noqa: BLE001 — degrade gracefully
+            ctx.logger.warning("financials_request.send_failed", error=str(exc)[:200])
+        try:
+            await self._reminders.schedule(
+                "financials_pending",
+                channel=_channel(ctx),
+                identity=ctx.identity,
+                target_ref=state.madad_user_id or ctx.session_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — nudges are non-critical
+            ctx.logger.warning("financials_pending.schedule_failed", error=str(exc)[:200])
         return self._step("financials_send", ctx)
 
     async def _financials_await(
@@ -1768,16 +2448,57 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-            return self._step(
-                "documents_upload_loop_await",
-                ctx,
-                missing_documents=list(state.missing_documents),
-                documents_received=True,
-                journey_status=forced_status,
-                last_status_source=_extract_status_source(reply),
-            )
+            # Bug #12 (UAT 2026-06-09, Ishan diagnosis): when QUALIFIED+
+            # arrives mid-docs-loop, the SAME event must fast-forward
+            # through ``payment_wait_await`` too — backend only fires
+            # ``madad_score.ready`` once, so requiring a second trigger
+            # left the run stuck at payment_wait until the admin re-fired.
+            # Capture payment_ready + madad_score on the same resume.
+            fast_forward = forced_status in {
+                JourneyStatus.QUALIFIED,
+                JourneyStatus.ACCEPTED,
+                JourneyStatus.OFFER_ACCEPTED,
+                JourneyStatus.ACTIVATED,
+            }
+            score = _extract_madad_score(reply)
+            fields: dict[str, Any] = {
+                "missing_documents": list(state.missing_documents),
+                "documents_received": True,
+                "journey_status": forced_status,
+                "last_status_source": _extract_status_source(reply),
+            }
+            if fast_forward:
+                fields["payment_ready"] = True
+                if score is not None:
+                    fields["madad_score"] = score
+                # Refinement (2026-06-09): when admin overrides the
+                # checklist, the natural ``documents_complete`` node is
+                # skipped — so its progress=5 marker would never fire on
+                # this path. Fire it here so the backend gets the full
+                # ordered sequence regardless of route.
+                progress_step = await self._update_progress(state, ctx, step=5)
+                if progress_step is not None:
+                    fields["onboarding_progress_step"] = progress_step
+            return self._step("documents_upload_loop_await", ctx, **fields)
         attachments = _valid_upload_attachments(reply)
         if not attachments:
+            # Bug #16 (UAT 2026-06-09): per spec page 8 "PENDING DOCS",
+            # the SME can ask "what am I still missing?" anytime and the
+            # agent answers with the running list. With Bug #16's brief-
+            # receipt design (no proactive checklist body during uploads)
+            # this self-service path is the SME's only on-demand way to
+            # see what's left — handle the intent before falling through
+            # to the generic _smart_contextual reply.
+            if _is_pending_docs_query(reply):
+                await self._send_pending_docs(
+                    ctx, state, list(state.missing_documents)
+                )
+                return self._step(
+                    "documents_upload_loop_await",
+                    ctx,
+                    missing_documents=list(state.missing_documents),
+                    documents_received=False,
+                )
             # No file — it's a question, a "no", or chit-chat. Answer it in
             # context (the agent must actually understand, not robotically nag
             # "text alone is not enough"), then stay parked for the upload.
@@ -1793,6 +2514,29 @@ class OnboardingWorkflow(WorkflowDefinition):
                 missing_documents=list(state.missing_documents),
                 documents_received=False,
             )
+        # Bug #1b (2026-06-09): immediate ack the instant valid attachments
+        # land — large ZIPs can keep the classify+upload chain busy for
+        # tens of seconds; mirrors the CR ack so the SME never sits in
+        # silence. The ack itself is wrapped — its failure must not regress
+        # the upload pipeline below.
+        #
+        # Bug #11 (UAT 2026-06-09): debounce — Madad's bridge POSTs each
+        # ZIP-member as a SEPARATE inbound (8+ messages in a few seconds
+        # for a typical doc batch). Without the debounce the SME saw the
+        # ack 8 times in a row. Re-fire only if the previous ack is older
+        # than DOCS_PROCESSING_ACK_TTL_SECONDS.
+        now = ctx.clock.now()
+        prior_ack = _parse_iso_or_none(state.documents_processing_ack_at)
+        ack_age = (now - prior_ack).total_seconds() if prior_ack else None
+        processing_ack_at: str | None = state.documents_processing_ack_at
+        if ack_age is None or ack_age >= DOCS_PROCESSING_ACK_TTL_SECONDS:
+            try:
+                await self._send(ctx, state, "onboarding.documents.processing")
+                processing_ack_at = now.isoformat()
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "documents_processing_ack.failed", error=str(exc)[:200]
+                )
         # A7 (Ishan 2026-06-07): ZIP attachments now route through the
         # backend's ``classify_and_upload_zip_base64`` tool. The backend
         # unzips server-side, classifies every member, and returns the
@@ -1802,8 +2546,21 @@ class OnboardingWorkflow(WorkflowDefinition):
         # The previous local-unzipping path stays as a fallback for when
         # the backend tool errors.
         pending: list[str] = list(state.missing_documents)
-        validated: list[str] = []  # uploaded + accepted by backend → ✅
-        unprocessed: list[str] = []  # backend rejected / no token → ⏳ honest
+        # Bug #10b (2026-06-09): snapshot the set we ASKED the SME for so a
+        # classifier mis-label (e.g. backend tagged a passport as CR — Madad
+        # QA screenshot 2026-06-09) cannot legitimize an unrelated upload
+        # as a ✅ validated entry. Only docs that were on this batch's
+        # pending list earn the ✅; anything else lands as ⏳ "received,
+        # team will review" — honest, never a false validation.
+        #
+        # Optional shareholder docs (2026-06-10): include them in the
+        # ``expected`` set so an upload still earns ✅ when classified —
+        # but they're NOT in ``pending``, so they never count toward
+        # remaining-required and the loop can naturally exhaust without
+        # them. See [[project_optional_docs]].
+        expected: set[str] = set(pending) | set(DEFAULT_WHATSAPP_OPTIONAL_DOCS)
+        validated: list[str] = []  # uploaded + classified into expected → ✅
+        unprocessed: list[str] = []  # uploaded but off-checklist / failed → ⏳
         saw_zip = False
 
         # Mint a live backend token from the verified WhatsApp identity. A run
@@ -1826,10 +2583,19 @@ class OnboardingWorkflow(WorkflowDefinition):
                 non_zip.append(att)
                 continue
             try:
-                zip_response = await self._kyc.classify_and_upload_zip_base64(
-                    access_token=token,
-                    content_base64=att.get("content_base64") or "",
-                    filename=att.get("filename") or "",
+                # Hard wall-clock cap so a hung Cloud-Run ZIP processor
+                # can't trap the node behind the workflow runtime's own
+                # 60s-per-attempt budget (Bug #1b 2026-06-09 forensic:
+                # one ZIP call hung 3 minutes before the run timed out
+                # silently). 25s is enough for normal traffic and falls
+                # back to the local-unzip + per-file path on overrun.
+                zip_response = await asyncio.wait_for(
+                    self._kyc.classify_and_upload_zip_base64(
+                        access_token=token,
+                        content_base64=att.get("content_base64") or "",
+                        filename=att.get("filename") or "",
+                    ),
+                    timeout=25.0,
                 )
             except Exception as exc:  # noqa: BLE001 — fall back to local unzip
                 ctx.logger.warning(
@@ -1862,76 +2628,136 @@ class OnboardingWorkflow(WorkflowDefinition):
                 if not isinstance(backend_type, str) or not backend_type:
                     continue
                 zip_doc_type = _workflow_doc_type(backend_type)
-                if zip_doc_type in pending:
-                    pending.remove(zip_doc_type)
-                if zip_doc_type not in validated:
-                    validated.append(zip_doc_type)
+                # Bug #10b: only docs that match the asked-for list earn ✅;
+                # otherwise show ⏳ so a classifier mislabel never claims a
+                # checklist slot the SME hasn't actually filled.
+                if zip_doc_type in expected:
+                    if zip_doc_type in pending:
+                        pending.remove(zip_doc_type)
+                    if zip_doc_type not in validated:
+                        validated.append(zip_doc_type)
+                elif zip_doc_type not in unprocessed:
+                    unprocessed.append(zip_doc_type)
 
         # Pass 2 — non-ZIP attachments (and any ZIP that fell back to local).
-        for att in non_zip:
+        # A5 (Ishan 2026-06-07): prefer the classify-and-upload tool over our
+        # own filename-keyword inference. Bug #17 (UAT 2026-06-09): run all
+        # files CONCURRENTLY — sequential per-file processing accumulated
+        # to >60s when one file (AoA) timed out at the 25s cap, blowing
+        # past the workflow runtime's step_timeout and triggering a full
+        # node retry × 3 → RetryExhaustedError → run died with the rest of
+        # the batch unprocessed. With asyncio.gather the wall-clock is
+        # max(per-file) ≈ 25s regardless of how many files are in the batch.
+        async def _classify_one(att: dict[str, Any]) -> tuple[bool, str | None]:
+            if not token:
+                return False, None
             filename = att.get("filename") or ""
-            # A5 (Ishan 2026-06-07): prefer the classify-and-upload tool
-            # over our own filename-keyword inference + manual doc_type
-            # mapping. The backend classifier picks the type and routes to
-            # the right entity slot; the response carries the resolved
-            # ``document_type`` so we can track validated/missing without
-            # guessing on filenames like ``IMG_001.jpg``.
-            uploaded_ok = False
-            resolved_doc_type: str | None = None
-            if token:
-                try:
-                    classify_response = await self._kyc.classify_and_upload_document_base64(
+            try:
+                classify_response = await asyncio.wait_for(
+                    self._kyc.classify_and_upload_document_base64(
                         access_token=token,
                         content_base64=att.get("content_base64") or "",
                         filename=filename,
                         mime_type=att.get("mime_type"),
-                    )
-                    uploaded_ok = True
-                    if isinstance(classify_response, dict):
-                        backend_type = (
-                            classify_response.get("document_type")
-                            or classify_response.get("documentType")
-                            or classify_response.get("resolved_document_type")
-                        )
-                        if isinstance(backend_type, str):
-                            resolved_doc_type = _workflow_doc_type(backend_type)
-                except Exception as exc:  # noqa: BLE001 — degrade in staging
-                    ctx.logger.warning(
-                        "classify_and_upload.failed",
-                        filename=filename,
-                        error=str(exc)[:200],
-                        note="staging-tolerant: continuing without this doc",
-                    )
-            # Fall back to the filename inference / pending hint when the
-            # classifier didn't return a usable type (rare — happens when
-            # the backend stores as ADDITIONAL_DOCUMENT). This keeps the
-            # missing-docs accounting honest without dropping the file.
+                    ),
+                    timeout=25.0,
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade in staging
+                ctx.logger.warning(
+                    "classify_and_upload.failed",
+                    filename=filename,
+                    error=str(exc)[:200],
+                    note="staging-tolerant: continuing without this doc",
+                )
+                return False, None
+            resolved: str | None = None
+            if isinstance(classify_response, dict):
+                backend_type = (
+                    classify_response.get("document_type")
+                    or classify_response.get("documentType")
+                    or classify_response.get("resolved_document_type")
+                )
+                if isinstance(backend_type, str):
+                    resolved = _workflow_doc_type(backend_type)
+            return True, resolved
+
+        if non_zip:
+            classify_results = await asyncio.gather(
+                *[_classify_one(att) for att in non_zip]
+            )
+        else:
+            classify_results = []
+
+        for att, (uploaded_ok, resolved_doc_type) in zip(
+            non_zip, classify_results, strict=False
+        ):
+            filename = att.get("filename") or ""
+            # QA #3 refinement (2026-06-09): two failure modes from the
+            # classifier need different handling:
+            #
+            #   * Classifier returned a SPECIFIC wrong type (e.g. backend
+            #     tagged a passport upload as "commercial_registration"):
+            #     resolved_doc_type is set, but it's not on the asked-for
+            #     list. Land as ⏳ "received, team will review" — never
+            #     ✅ a false validation.
+            #
+            #   * Classifier said "additional_document" / returned nothing:
+            #     we genuinely don't know what it is. Per QA: "don't block
+            #     the user — assign to a required slot, Madad's team can
+            #     re-assign later." Fall back to filename inference, then
+            #     to the next pending slot. The slot earns ✅ provisionally.
             doc_type: str | None = resolved_doc_type
-            if not doc_type:
-                doc_type = att.get("document_type") or _infer_doc_type(filename)
-            if not doc_type and pending:
-                doc_type = pending[0]
+            classifier_unknown = (
+                not doc_type or doc_type == "additional_document"
+            )
+            if classifier_unknown:
+                inferred = att.get("document_type") or _infer_doc_type(filename)
+                if inferred:
+                    doc_type = inferred
+                elif pending:
+                    # Last-resort hint per QA #3: take the next required
+                    # slot so the SME isn't stuck. Madad-side review will
+                    # re-bucket if needed.
+                    doc_type = pending[0]
             if not doc_type:
                 continue
-            if uploaded_ok:
+            # Bug #10b: only docs on the asked-for list earn ✅. Backend
+            # picked a wrong type? → land as ⏳ "received, team will
+            # review". The SME sees an honest receipt, never a false
+            # validation that fast-forwards the checklist.
+            if uploaded_ok and doc_type in expected:
                 if doc_type in pending:
                     pending.remove(doc_type)
                 if doc_type not in validated:
                     validated.append(doc_type)
             elif doc_type not in unprocessed and doc_type not in validated:
                 unprocessed.append(doc_type)
-        # Acknowledge exactly what landed: ✅ per accepted document, ⏳ per one we
-        # received but couldn't auto-validate (kept honest — no false ✅). A ZIP
-        # gets the "📦 Extracting…" header; loose files just get their lines. The
-        # lenient coffee message follows in documents_complete.
+        # Acknowledge exactly what landed: ✅ per accepted document, ⏳ per
+        # one we received but couldn't auto-validate (kept honest — no
+        # false ✅). The cumulative ⚠️ checklist body is NO LONGER rendered
+        # here (Bug #16 design): the spec only shows it on the first batch
+        # / on demand, the coffee message marks "all done", and the user's
+        # literal feedback was "one checklist at the end, not the start."
+        # The pending-docs self-service query (handled in the no-attachments
+        # branch above) covers the "what's missing?" case.
         await self._acknowledge_uploads(
-            ctx, state, validated, unprocessed, saw_zip=saw_zip
+            ctx, state, validated, unprocessed,
+            saw_zip=saw_zip,
+            missing_after=list(pending),
         )
         # Remaining = required docs this batch did not land. Tracked locally so
         # generic-filename uploads reliably complete the checklist (we do not
         # re-query the backend's requested-docs list, which kept returning the
         # just-uploaded docs as still-missing and caused the loop).
         missing = pending
+        # Per Ishan + user (UAT 2026-06-10): classifier hangs (e.g. AoA)
+        # leave required slots permanently "still needed" even when the
+        # SME has uploaded enough total files. Track every attachment we
+        # processed this turn (validated, ⏳, or even unclassifiable);
+        # ``_route_documents`` exits when the cumulative count meets the
+        # required count regardless of pending slots. Mirrors the doc-
+        # service's count-based unblock (PR #4, commit 6c05b1c).
+        new_uploaded_count = state.docs_uploaded_count + len(attachments)
         if not missing:
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
@@ -1941,9 +2767,72 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx,
             missing_documents=missing,
             documents_received=bool(attachments),
+            docs_uploaded_count=new_uploaded_count,
             access_token=token,
             refresh_token=refresh,
             token_expires_at=expires,
+            documents_processing_ack_at=processing_ack_at,
+        )
+
+    async def _send_pending_docs(
+        self,
+        ctx: WorkflowContext,
+        state: OnboardingState,
+        missing: list[str],
+    ) -> None:
+        """Reply to the SME's "what's still missing?" query with the
+        running pending-docs list (spec page 8 PENDING DOCS self-service).
+
+        Format mirrors the per-upload checklist body so it's familiar but
+        scoped to the on-demand path — no batch receipts, just the
+        current state.
+        """
+
+        def _label(doc: str) -> str:
+            return DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title())
+
+        all_required = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+        still_missing = list(missing)
+        already_validated = [d for d in all_required if d not in still_missing]
+
+        if not still_missing:
+            # SME asked but everything's already in — short, honest reply.
+            await self._send(
+                ctx, state, "onboarding.help.contextual",
+                {
+                    "answer": (
+                        "🎉 All your documents are in! Our team is reviewing "
+                        "them — we'll be in touch shortly."
+                    ),
+                    "next_step": "",
+                },
+            )
+            return
+
+        rows = [f"✅ {_label(d)}" for d in already_validated]
+        rows += [f"⚠️ {_label(d)} — still needed" for d in still_missing]
+        body = "📋 Application checklist:\n" + "\n".join(rows)
+        noun = "document" if len(still_missing) == 1 else "documents"
+        body += (
+            f"\n\n📤 Please share the remaining {len(still_missing)} "
+            f"{noun} to move forward."
+        )
+        # Per project_optional_docs (2026-06-10): surface optional docs as a
+        # separate "Optional" section so the SME knows they can send them but
+        # isn't pressured to. Validated optionals appear up in the ✅ list
+        # above (the expected set in the docs loop already includes them).
+        optional_unsent = [
+            d for d in DEFAULT_WHATSAPP_OPTIONAL_DOCS
+            if d not in already_validated
+        ]
+        if optional_unsent:
+            body += "\n\nℹ️ Optional (send if you have them):"
+            for d in optional_unsent:
+                body += f"\n• {_label(d)}"
+        # Reuse the existing single_received template ({{ results }}) — it
+        # already renders the body verbatim.
+        await self._send(
+            ctx, state, "onboarding.documents.single_received", {"results": body}
         )
 
     async def _acknowledge_uploads(
@@ -1954,31 +2843,67 @@ class OnboardingWorkflow(WorkflowDefinition):
         unprocessed: list[str],
         *,
         saw_zip: bool,
+        missing_after: list[str],
     ) -> None:
-        """Send the per-document checklist for this upload batch.
+        """Send a brief per-document receipt for this batch.
 
-        ✅ for docs the backend accepted; ⏳ for ones we received but couldn't
-        auto-validate — honest, never a false ✅.
+        Bug #16 design (UAT 2026-06-09, in-depth user analysis): per spec
+        page 4 (Full Document Submission, second batch sample) and the
+        user's literal preference, every upload turn shows only the
+        ✅/⏳ batch receipts — never the cumulative ⚠️ checklist body.
+        The full checklist appears in two places, both off this hot
+        path:
+
+          * ``documents_complete`` coffee message when the checklist
+            naturally exhausts (the "end of upload session" the user
+            asked for).
+          * Self-service "what am I still missing?" reply (spec page 8
+            "PENDING DOCS") wired in _documents_upload_loop_await.
+
+        Genuine end-to-end failure (nothing ever validated AND this
+        batch produced nothing) falls to ``documents.upload_failed``
+        so the SME isn't silently dropped.
         """
-
-        if not validated and not unprocessed:
-            return
 
         def _label(doc: str) -> str:
             return DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title())
 
-        rows = [f"✅ {_label(doc)} — Received & Validated" for doc in validated]
-        rows += [
-            f"⏳ {_label(doc)} — received, our team will review it"
-            for doc in unprocessed
+        all_required = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+        still_missing = list(missing_after)
+        already_validated = [d for d in all_required if d not in still_missing]
+
+        # Bug #1b (2026-06-09): if literally NOTHING has ever validated
+        # AND this batch produced nothing either, the upload genuinely
+        # failed end-to-end — send the honest "couldn't process" fallback.
+        if not validated and not unprocessed and not already_validated:
+            try:
+                await self._send(ctx, state, "onboarding.documents.upload_failed")
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "documents_upload_failed_ack.failed", error=str(exc)[:200]
+                )
+            return
+
+        # Edge: every upload in this batch was a duplicate of an
+        # already-validated doc. Stay silent (the SME will hear the next
+        # ack when they send a NEW doc) — they can ask "what's missing?"
+        # anytime to get the full state.
+        if not validated and not unprocessed:
+            return
+
+        batch_rows = [f"✅ {_label(d)} — Received & Validated" for d in validated]
+        batch_rows += [
+            f"⏳ {_label(d)} — received, our team will review it"
+            for d in unprocessed
         ]
-        lines = "\n".join(rows)
+        body = "\n".join(batch_rows)
+
         template_key = (
             "onboarding.documents.zip_received"
             if saw_zip
             else "onboarding.documents.single_received"
         )
-        await self._send(ctx, state, template_key, {"results": lines})
+        await self._send(ctx, state, template_key, {"results": body})
 
     async def _documents_complete(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -1991,6 +2916,45 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
+
+    async def _more_docs_prompt_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        """Per user (UAT 2026-06-10): after the coffee message, ask the SME
+        whether they have any more documents to send. Covers the classifier-
+        failure case (e.g. AoA hangs → marked unprocessed → count-based
+        unblock advanced us anyway) and the "I forgot one" case so the SME
+        can keep sending docs even after the loop has provisionally
+        completed. YES → loops back to the upload-await node; NO → run
+        proceeds to payment_wait.
+        """
+
+        await self._send(ctx, state, "onboarding.documents.more_docs_prompt")
+        # Clear any stale decision from a previous trip through this prompt
+        # so the router waits for THIS turn's reply.
+        return self._step("more_docs_prompt_send", ctx, more_docs_decision=None)
+
+    async def _more_docs_prompt_await(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        reply = await_input({"waiting_for": "reply", "step": "more_docs_prompt"})
+        if is_yes(reply):
+            # Reset the upload counter so the count-based unblock fires
+            # again only after this fresh batch meets the threshold.
+            return self._step(
+                "more_docs_prompt_await", ctx,
+                more_docs_decision="yes",
+                docs_uploaded_count=0,
+            )
+        if is_no(reply):
+            return self._step("more_docs_prompt_await", ctx, more_docs_decision="no")
+        # Off-script reply — answer in context and re-prompt.
+        await self._smart_contextual(
+            ctx, state, reply,
+            "No problem — just reply YES if you have more documents to send, "
+            "or NO if you're done. 🙂",
+        )
+        return self._step("more_docs_prompt_await", ctx, more_docs_decision=None)
 
     # -- Postman-triggered gates (pre-qualification + payment) ----------------
 
@@ -2032,18 +2996,34 @@ class OnboardingWorkflow(WorkflowDefinition):
                 prequalified=True,
                 onboarding_progress_step=progress_step or state.onboarding_progress_step,
             )
-        await self._smart_contextual(
+        # Bug #7+#8 (2026-06-09): intent-route every off-script reply so each
+        # type of question gets a meaningful answer instead of the same
+        # canned "still pending" fallback every time the LLM is unavailable
+        # (OpenAI 401 in QA showed this clearly).
+        await self._contextual_off_script(
             ctx,
             state,
             payload,
-            "Thanks! 🙌 Your pre-qualification result will be ready soon — I’ll "
-            "share your document checklist here the moment it’s confirmed.",
+            default_answer=(
+                "Thanks! 🙌 Your pre-qualification result will be ready soon — "
+                "I’ll share your document checklist here the moment it’s confirmed."
+            ),
         )
         return self._step("prequalify_wait_await", ctx, prequalified=False)
 
     async def _payment_wait_await(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
+        # Bug #12 (UAT 2026-06-09, Ishan diagnosis): when QUALIFIED+
+        # arrived mid-docs-loop, the upstream docs-loop handler set
+        # ``payment_ready=True`` on the SAME resume — but this node
+        # used to call ``await_input`` unconditionally, parking until
+        # a second event that backend never fires. Short-circuit when
+        # we already have the trigger so the same event continues
+        # straight into the payment chain (business_details_fetch →
+        # products_list_fetch → payment_create → payment_send_link).
+        if state.payment_ready:
+            return self._step("payment_wait_await", ctx, payment_ready=True)
         # PARK after the coffee message until the payment step is triggered
         # (Postman in the demo). Capture the Madad score from the trigger payload.
         payload = await_input({"waiting_for": "payment_ready", "step": "payment_wait"})
@@ -2055,12 +3035,14 @@ class OnboardingWorkflow(WorkflowDefinition):
                 payment_ready=True,
                 **({"madad_score": score} if score is not None else {}),
             )
-        await self._smart_contextual(
+        await self._contextual_off_script(
             ctx,
             state,
             payload,
-            "You’re all set — our team is finalising your assessment. I’ll share "
-            "your Madad score and the next step here shortly. 🙂",
+            default_answer=(
+                "You’re all set — our team is finalising your assessment. I’ll "
+                "share your Madad score and the next step here shortly. 🙂"
+            ),
         )
         return self._step("payment_wait_await", ctx, payment_ready=False)
 
@@ -2149,6 +3131,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         forced = _extract_journey_status(payload)
         if forced is not None:
             fields["journey_status"] = forced
+        # The offer.selected / credit_line.activated webhooks carry the
+        # lender + terms; capture them so the ✅ confirmation and 🎊 activation
+        # messages can name the bank without an extra /me round-trip.
+        sel = _selected_offer_from_payload(payload)
+        if sel:
+            fields["selected_offer"] = sel
         return self._step("journey_wait_await", ctx, **fields)
 
     async def _not_qualified(
@@ -2160,24 +3148,40 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _business_details_fetch(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        if not state.access_token:
-            return self._step("business_details_fetch", ctx)
-        result = await self._pay.get_business_details(access_token=state.access_token)
+        # Bug #13 (UAT 2026-06-09, Ishan diagnosis): the payment branch
+        # used to read ``state.access_token`` directly, which is the same
+        # token minted ~15 minutes earlier at the doc-upload phase. After
+        # the docs review + admin qualify window the token had expired,
+        # the backend returned HTTP 401, retries exhausted, the run
+        # died, no payment link reached the SME. Mint on demand here
+        # (and in every other payment-branch node) so the credentials
+        # are always live by the time we hit Madad's APIs.
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not token:
+            return self._step(
+                "business_details_fetch", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+        result = await self._pay.get_business_details(access_token=token)
         business_id = (
             result.get("business_details_id") if isinstance(result, dict) else None
         )
         return self._step(
-            "business_details_fetch", ctx, business_details_id=business_id
+            "business_details_fetch", ctx,
+            business_details_id=business_id,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
         )
 
     async def _products_list_fetch(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        if not state.access_token:
-            return self._step("products_list_fetch", ctx)
-        result = await self._pay.list_monetization_products(
-            access_token=state.access_token
-        )
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not token:
+            return self._step(
+                "products_list_fetch", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+        result = await self._pay.list_monetization_products(access_token=token)
         products = (
             list(result.get("products", [])) if isinstance(result, dict) else []
         )
@@ -2186,20 +3190,21 @@ class OnboardingWorkflow(WorkflowDefinition):
             "products_list_fetch",
             ctx,
             payment_product_id=product.get("product_id"),
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
         )
 
     async def _payment_create(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        if not (
-            state.access_token
-            and state.business_details_id
-            and state.payment_product_id
-        ):
-            return self._step("payment_create", ctx)
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not (token and state.business_details_id and state.payment_product_id):
+            return self._step(
+                "payment_create", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
         key = f"{ctx.run_id}:create_monetization_payment"
         result = await self._pay.create_monetization_payment(
-            access_token=state.access_token,
+            access_token=token,
             business_details_id=state.business_details_id,
             product_id=state.payment_product_id,
             amount_qar=ONBOARDING_FEE_QAR,
@@ -2226,6 +3231,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             payment_status=payment_status,
             payment_link=payment_link,
             payment_provider_ref=provider_ref,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
             idempotency_keys={
                 **state.idempotency_keys,
                 "create_monetization_payment": key,
@@ -2292,11 +3298,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         # ALSO fire the backend's notification trigger as a side-channel —
         # if it succeeds the SME gets a Madad-branded copy of the link too,
         # if it fails (502 in current UAT) we already sent our own.
-        if state.access_token and state.payment_id:
+        # Bug #13 (UAT 2026-06-09): mint a fresh token first — the cached
+        # token may be ~15 minutes old by now.
+        token, refresh, expires = await self._live_token(state, ctx)
+        if token and state.payment_id:
             key = f"{ctx.run_id}:send_monetization_payment_link"
             try:
                 await self._pay.send_monetization_payment_link(
-                    access_token=state.access_token,
+                    access_token=token,
                     payment_id=state.payment_id,
                     channel=_channel(ctx),
                     identity=ctx.identity,
@@ -2304,6 +3313,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 )
                 return self._step(
                     "payment_send_link", ctx,
+                    access_token=token, refresh_token=refresh, token_expires_at=expires,
                     idempotency_keys={
                         **state.idempotency_keys,
                         "send_monetization_payment_link": key,
@@ -2315,7 +3325,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                     error=str(exc)[:200],
                     note="primary link already sent via messenger — continuing",
                 )
-        return self._step("payment_send_link", ctx)
+        return self._step(
+            "payment_send_link", ctx,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
 
     async def _payment_await(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -2347,15 +3360,37 @@ class OnboardingWorkflow(WorkflowDefinition):
             # forwards). Fail-safe to the empty list so the message still goes
             # out — minus the bank-list line.
             banks = await self._fetch_banks_to_send(state, ctx)
+            # UAT 2026-06-10 screenshot: "(Ref: )" rendered empty because
+            # state.application_ref was never populated for the SIGN_UP
+            # paths that don't capture session.reference_number. Fetch
+            # from /me as a fallback so the SME always sees their ref
+            # number on the payment-confirmed message.
+            ref = state.application_ref
+            if not ref:
+                token = (await self._live_token(state, ctx))[0]
+                if token:
+                    try:
+                        info = await self._identity.me(access_token=token)
+                        ref = _extract_reference_from_me(info)
+                    except Exception as exc:  # noqa: BLE001
+                        ctx.logger.warning(
+                            "payment_confirmed.ref_fetch_failed",
+                            error=str(exc)[:200],
+                        )
             await self._send(
                 ctx,
                 state,
                 "onboarding.payment.confirmed",
                 {
                     "banks":     _format_banks_list(banks),
-                    "ref":       state.application_ref or "",
+                    "ref":       ref or "",
                     "bank_count": len(banks),
                 },
+            )
+            return self._step(
+                "payment_await", ctx,
+                paid=paid,
+                application_ref=ref or state.application_ref,
             )
         return self._step("payment_await", ctx, paid=paid)
 
@@ -2479,20 +3514,33 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         # The backend embeds the lender offer set on the user record once the
-        # journey reaches ACCEPTED. Pull it off the latest auth_me response.
+        # journey reaches ACCEPTED. UAT 2026-06-10: the enriched /me payload
+        # exposes them under ``offersReceived`` (Ishan handover §8), not
+        # ``offers`` — earlier code rendered the offers template with empty
+        # cards because the field name didn't match. Try the registered
+        # payload first (already on state if check_registration ran),
+        # otherwise fetch fresh.
         offers: list[dict[str, Any]] = []
-        if state.access_token:
-            info = await self._identity.me(access_token=state.access_token)
-            if isinstance(info, dict):
-                raw = info.get("offers")
-                if isinstance(raw, list):
-                    offers = list(raw)
+        if isinstance(state.registration_payload, dict):
+            raw = state.registration_payload.get("offers")
+            if isinstance(raw, list):
+                offers = [o for o in raw if isinstance(o, dict)]
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not offers and token:
+            try:
+                info = await self._identity.me(access_token=token)
+                offers = _extract_offers_from_me(info)
+            except Exception as exc:  # noqa: BLE001 — degrade gracefully
+                ctx.logger.warning(
+                    "offers_fetch.me_failed", error=str(exc)[:200]
+                )
         # Step 8 — offers ready, handing off to platform.
         progress_step = await self._update_progress(state, ctx, step=8)
         return self._step(
             "offers_fetch",
             ctx,
             offers=offers,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
 
@@ -2503,6 +3551,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         # one block per offer with lender + credit limit + interest rate +
         # tenure + processing fee. Falls back to a count-only line if the
         # offer list is empty (auth_me hasn't surfaced offers yet).
+        #
+        # Re-send only when the offer SET changed (a new lender made an offer) —
+        # the fast status poller re-enters this route ~every minute while the SME
+        # is deciding, and we must not re-spam the same cards each tick.
+        if _offers_sig(state.offers) == state.offers_shown_sig:
+            return self._step("offer_view_send", ctx)
         await self._send(
             ctx,
             state,
@@ -2517,10 +3571,15 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _offer_handoff_to_madad(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
+        # Skip the whole handoff block on a routine poll where the offer set is
+        # unchanged (the run just passed through offer_view_send without
+        # re-sending). Only (re)send the button when new offers were just shown.
+        if _offers_sig(state.offers) == state.offers_shown_sig:
+            return self._step("offer_handoff_to_madad", ctx, outcome="offer_handoff")
         # PDF Step 8 — tappable "Login to Madad →" CTA-URL button on WhatsApp
         # (Meta caps the label at 20 chars). Falls back to the plain-text
         # template (with the URL inline) if the interactive path fails.
-        portal_url = "https://madadfintech.com"
+        portal_url = "https://uat-portal.madadfintech.com"
         sent_as_button = False
         if ctx.channel is Channel.WHATSAPP:
             try:
@@ -2541,33 +3600,63 @@ class OnboardingWorkflow(WorkflowDefinition):
                 )
         if not sent_as_button:
             await self._send(ctx, state, "onboarding.offer.handoff")
-        return self._step("offer_handoff_to_madad", ctx, outcome="offer_handoff")
+        # Record the shown offer set so routine polls don't re-send these cards.
+        return self._step(
+            "offer_handoff_to_madad", ctx, outcome="offer_handoff",
+            offers_shown_sig=_offers_sig(state.offers),
+        )
+
+    async def _offer_confirmed(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        # The SME selected an offer in the Madad portal (backend offer.selected
+        # webhook → OFFER_ACCEPTED). Send the one-time ✅ confirmation, then park
+        # (the edge back to journey_wait_await) for the credit-line activation.
+        # Guarded so a later background poll that still reports OFFER_ACCEPTED
+        # can't re-send the confirmation.
+        if state.offer_confirmed_sent:
+            return self._step("offer_confirmed", ctx)
+        offer = state.selected_offer or {}
+        lender = _lender_name(offer) or "your selected bank"
+        await self._send(
+            ctx, state, "onboarding.offer.confirmed", {"lender": lender}
+        )
+        return self._step("offer_confirmed", ctx, offer_confirmed_sent=True)
 
     async def _activated(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        # A8b: PDF Step 9 — render the accepted offer's lender / limit / rate /
-        # tenure on the activation message. Prefer state.selected_offer if set
-        # (offer-handoff flow); otherwise look at state.offers (offers_fetch
-        # may have populated it from auth_me); otherwise call auth_me directly
-        # for the latest offer set.
-        offer = state.selected_offer or {}
+        # A8b: PDF Step 9 — render the lender / limit / rate / tenure on the
+        # activation message. UAT 2026-06-10: the prior code only inspected
+        # ``offers`` on /me which is the wrong field name (it's
+        # ``offersReceived``), and didn't read the actual ``creditLines``
+        # entry at all — so the activated message showed empty details
+        # even when the line was active. Preference order now:
+        #   1. state.selected_offer (offer-handoff flow set it)
+        #   2. state.registration_payload.creditLine (if check_registration
+        #      already returned an active line)
+        #   3. /me creditLines (most authoritative for an ACTIVE state)
+        #   4. /me offersReceived → look for an ACCEPTED offer / fall back to first
+        offer: dict[str, Any] = state.selected_offer or {}
         offers = list(state.offers)
-        if not offer and not offers and state.access_token:
+        credit_line: dict[str, Any] = {}
+        if isinstance(state.registration_payload, dict):
+            cl = state.registration_payload.get("creditLine")
+            if isinstance(cl, dict):
+                credit_line = cl
+
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not (offer or credit_line) and token:
             try:
-                info = await self._identity.me(access_token=state.access_token)
-                if isinstance(info, dict):
-                    raw = info.get("offers")
-                    if isinstance(raw, list):
-                        offers = raw
+                info = await self._identity.me(access_token=token)
+                credit_line = credit_line or _extract_credit_line_from_me(info)
+                if not offers:
+                    offers = _extract_offers_from_me(info)
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
-                    "activated.offers_fetch_failed",
-                    error=str(exc)[:200],
-                    note="continuing with generic activation message",
+                    "activated.me_failed", error=str(exc)[:200]
                 )
         if not offer and offers:
-            # Look for an explicitly-accepted offer; fall back to the first.
             for cand in offers:
                 if isinstance(cand, dict):
                     status = str(
@@ -2580,23 +3669,26 @@ class OnboardingWorkflow(WorkflowDefinition):
                 first = offers[0] if offers else {}
                 offer = first if isinstance(first, dict) else {}
 
-        def _g(key_camel: str, key_snake: str) -> Any:
-            value = offer.get(key_camel)
-            if value is None:
-                value = offer.get(key_snake)
-            return value
+        # Read each field from credit_line first (Step 9 ground truth),
+        # offer second (handoff time), then fall back to "—".
+        def _from_any(*keys: str) -> Any:
+            for src in (credit_line, offer):
+                for k in keys:
+                    if k in src and src[k] is not None:
+                        return src[k]
+            return None
 
-        lender = _g("lender", "lender") or "your bank"
+        lender = _from_any("lender", "lenderName", "bank_name", "bankName") or "your bank"
         try:
-            limit = f"QAR {int(_g('creditLimit', 'credit_limit') or 0):,}"
+            limit = f"QAR {int(_from_any('creditLimit', 'credit_limit', 'limit') or 0):,}"
         except (TypeError, ValueError):
             limit = "QAR —"
         try:
-            rate = f"{float(_g('interestRate', 'interest_rate') or 0):g}%"
+            rate = f"{float(_from_any('interestRate', 'interest_rate', 'rate') or 0):g}%"
         except (TypeError, ValueError):
             rate = "—"
         try:
-            tenure = f"{int(_g('tenureDays', 'tenure_days') or 0)} days"
+            tenure = f"{int(_from_any('tenureDays', 'tenure_days', 'tenure') or 0)} days"
         except (TypeError, ValueError):
             tenure = "—"
 
@@ -2612,7 +3704,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "ref": state.application_ref or "",
             },
         )
-        return self._step("activated", ctx, outcome="completed")
+        return self._step(
+            "activated", ctx,
+            outcome="completed",
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
 
     async def _invoice_collect_await(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -2697,6 +3793,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "ask_again"
 
     def _route_check_contact(self, state: OnboardingState) -> str:
+        # Per Ishan (cluster e6ea5d2, 2026-06-10): if
+        # ``madad_mcp_check_registration`` returned a route hint, the lead
+        # is a returning user — re-send the appropriate message instead
+        # of silently re-onboarding them (Bug #2 + Bug #6).
+        if state.registration_route:
+            return "registered_routed"
         result: Any = state.check_contact_result
         if result is None:
             return self._new_lead_route(state)
@@ -2751,15 +3853,70 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "received" if state.shareholders else "missing"
 
     def _route_documents(self, state: OnboardingState) -> str:
-        # Lenient: SMEs send many docs at once and won't upload every item, so as
-        # soon as ANY document arrives we move on ("our team will review them").
-        return "complete" if state.documents_received else "await_again"
+        # Refinement per Ishan (UAT 2026-06-09): when admin QUALIFIES
+        # mid-docs-loop, jump STRAIGHT to the payment chain. The
+        # ``documents_complete`` coffee message ("🎊 all documents
+        # received") is misleading in that case — the checklist isn't
+        # actually complete; admin overrode it. ``payment_ready`` is
+        # set on the same forced-status branch in
+        # _documents_upload_loop_await, so this route catches the
+        # override and bypasses both ``documents_complete`` and the
+        # short-circuited ``payment_wait_await`` stop.
+        if state.payment_ready or state.journey_status in {
+            JourneyStatus.QUALIFIED,
+            JourneyStatus.ACCEPTED,
+            JourneyStatus.OFFER_ACCEPTED,
+            JourneyStatus.ACTIVATED,
+        }:
+            return "payment"
+        # Natural completion path: the SME uploaded every required doc.
+        # The coffee message IS accurate here, so the original flow
+        # (documents_complete → more_docs_prompt) stays.
+        if not state.missing_documents:
+            return "complete"
+        # Per Ishan + user (UAT 2026-06-10): the classifier hangs (notably
+        # AoA) leave required slots permanently "still needed" even when
+        # the SME has uploaded enough total files. Count-based unblock:
+        # if the cumulative attachment count meets the required count, the
+        # SME has done their part — proceed to the coffee message with the
+        # current state and let the "any more documents?" prompt cover the
+        # tail. Guarded so 1 upload vs 10 required stays incomplete.
+        required = len(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+        if required and state.docs_uploaded_count >= required:
+            return "complete"
+        return "await_again"
+
+    def _route_more_docs(self, state: OnboardingState) -> str:
+        decision = (state.more_docs_decision or "").lower()
+        if decision == "yes":
+            return "yes"
+        if decision == "no":
+            return "no"
+        return "await_again"
 
     def _route_prequalify_wait(self, state: OnboardingState) -> str:
         return "go" if state.prequalified else "wait"
 
     def _route_payment_wait(self, state: OnboardingState) -> str:
-        return "go" if state.payment_ready else "wait"
+        # Bug #12 (UAT 2026-06-09): the payment trigger is the same
+        # ``madad_score.ready`` event that exits the docs loop. When it
+        # arrives mid-docs-loop, the docs-loop handler consumes it,
+        # parks here, and the SME used to be stuck until a second
+        # qualify fired. payment_ready is now set on that same
+        # transition (see _documents_upload_loop_await); the journey-
+        # status check below is a belt-and-braces safety net for any
+        # other arrival path that advanced the journey past pre-qual
+        # without explicitly toggling payment_ready.
+        if state.payment_ready:
+            return "go"
+        if state.journey_status in {
+            JourneyStatus.QUALIFIED,
+            JourneyStatus.ACCEPTED,
+            JourneyStatus.OFFER_ACCEPTED,
+            JourneyStatus.ACTIVATED,
+        }:
+            return "go"
+        return "wait"
 
     def _route_payment(self, state: OnboardingState) -> str:
         return "paid" if state.paid else "unpaid"
@@ -2772,8 +3929,13 @@ class OnboardingWorkflow(WorkflowDefinition):
             return "ineligible"
         if s in (JourneyStatus.UNQUALIFIED, JourneyStatus.NOT_ACCEPTED):
             return "unqualified"
-        if s in (JourneyStatus.ACCEPTED, JourneyStatus.OFFER_ACCEPTED):
+        # ACCEPTED = a lender just made (another) offer → (re)show ALL offers.
+        # OFFER_ACCEPTED = the SME picked one in the portal → ✅ confirmation.
+        # Split so a portal selection doesn't re-spam the offer list.
+        if s == JourneyStatus.ACCEPTED:
             return "offers"
+        if s == JourneyStatus.OFFER_ACCEPTED:
+            return "offer_confirmed"
         if s == JourneyStatus.ACTIVATED:
             return "activated"
         return "wait"
@@ -2931,6 +4093,62 @@ class OnboardingWorkflow(WorkflowDefinition):
         if parts:
             return parts[0], ""
         return "", ""
+
+    async def _contextual_off_script(
+        self,
+        ctx: WorkflowContext,
+        state: OnboardingState,
+        reply: Any,
+        *,
+        default_answer: str,
+    ) -> None:
+        """Bug #7+#8 (2026-06-09): route off-script chat by intent BEFORE
+        falling back to the LLM/canned line.
+
+        QA reported every question while parked at prequal_wait /
+        payment_wait got the SAME generic reply (the OpenAI key was 401-ing
+        so the canned fallback fired every time). The wait nodes already
+        own typed answers (``_safe_status_answer`` / ``_safe_portal_answer``
+        / off-script help templates) — wire them in first so a status
+        question gets a status answer even with the LLM offline."""
+
+        help_template = _off_script_template(reply)
+        if help_template is not None:
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": self._answer_for(help_template),
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return
+        if _is_portal_query(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": await self._safe_portal_answer(state),
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return
+        if _is_status_query(reply):
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": await self._safe_status_answer(state),
+                    "next_step": _next_step_hint(state),
+                },
+            )
+            return
+        # Fall through to the smart/LLM path with the wait-node-specific
+        # canned line; preserves the existing UX when intent isn't typed.
+        await self._smart_contextual(ctx, state, reply, default_answer)
 
     async def _smart_contextual(
         self,

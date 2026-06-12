@@ -14,14 +14,28 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from app.shared.workflow import Channel, ExecutionResult, WorkflowRuntime
-from app.shared.workflow.enums import TERMINAL_STATUSES
+from app.shared.workflow.enums import TERMINAL_STATUSES, RunStatus
+from app.shared.workflow.errors import WorkflowExecutionError
 
 from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
 
 DEFAULT_WORKFLOW = "onboarding"
+
+# QA #2 (2026-06-09): runs that died from a transient failure (network
+# blip, backend 403, MCP timeout) should be revived on the next user
+# message instead of starting from scratch. The LangGraph checkpoint
+# still holds the last parked-step state — we just need to re-transition
+# the run to RUNNING and let the executor replay the new inbound at the
+# pending interrupt. COMPLETED / CANCELLED / DEAD_LETTERED are intentionally
+# NOT in this set (the first is success, the other two are operator-set
+# kills that should not silently un-do themselves).
+REVIVABLE_TERMINAL_STATUSES: frozenset[RunStatus] = frozenset(
+    {RunStatus.FAILED, RunStatus.TIMED_OUT}
+)
 
 
 # -- Canonical backend event types -------------------------------------------
@@ -114,6 +128,30 @@ class OnboardingDispatcher:
         self._allowed = frozenset(
             allowed_event_types if allowed_event_types is not None else ALL_BACKEND_EVENTS
         )
+        # Bug #11 (UAT 2026-06-09): Madad's bridge POSTs each ZIP-member /
+        # multi-file upload as a SEPARATE inbound, sometimes within a few
+        # hundred milliseconds. The workflow's run was getting hit by
+        # several concurrent resumes that all transitioned the run
+        # ``running→running`` and raced on ``state.missing_documents``
+        # (each saw a stale snapshot, claimed the same slot, fired its
+        # own "processing now" ack — user got 8 acks + duplicate ✅
+        # entries). Per-(channel, identity) asyncio.Lock serialises the
+        # concurrent posts so they queue cleanly instead of racing.
+        self._locks: dict[tuple[Channel, str], asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
+
+    async def _identity_lock(
+        self, channel: Channel, identity: str
+    ) -> asyncio.Lock:
+        key = (channel, identity)
+        # Two-level guarded creation so two concurrent callers don't race
+        # to install distinct locks for the same key.
+        async with self._locks_guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[key] = lock
+        return lock
 
     @property
     def allowed_event_types(self) -> frozenset[str]:
@@ -212,11 +250,46 @@ class OnboardingDispatcher:
     ) -> ExecutionResult | None:
         if message_id is not None and not await self._dedupe.claim(f"inbound:{message_id}"):
             return None
+        # Bug #11 (UAT 2026-06-09): hold the per-identity lock around the
+        # whole dispatch so the bridge's per-file POST burst can't drive
+        # multiple concurrent resumes against the same parked run. The
+        # second post waits for the first to finish (state.missing_documents
+        # update committed) before reading its own snapshot.
+        lock = await self._identity_lock(channel, identity)
+        async with lock:
+            return await self._dispatch_locked(
+                channel, identity, payload, message_id=message_id
+            )
+
+    async def _dispatch_locked(
+        self,
+        channel: Channel,
+        identity: str,
+        payload: dict[str, Any],
+        *,
+        message_id: str | None = None,
+    ) -> ExecutionResult | None:
         session = await self._runtime.sessions.get(channel, identity)
         if session is not None and session.active_run_id:
             run = await self._runtime.run_store.get_or_none(session.active_run_id)
-            if run is not None and run.status not in TERMINAL_STATUSES:
-                return await self._runtime.resume(channel, identity, message=payload)
+            if run is not None:
+                if run.status not in TERMINAL_STATUSES:
+                    return await self._runtime.resume(channel, identity, message=payload)
+                if run.status in REVIVABLE_TERMINAL_STATUSES:
+                    # QA #2: a transient failure left this run terminally
+                    # dead in the store, but the LangGraph checkpoint at
+                    # the last successful interrupt is still intact. Flip
+                    # the run record back to RUNNING and replay the new
+                    # inbound — if the resume itself errors (genuinely
+                    # broken state), fall through to a fresh start so the
+                    # SME is never stuck.
+                    try:
+                        await self._runtime.revive_failed_run(run)
+                        return await self._runtime.resume(
+                            channel, identity, message=payload
+                        )
+                    except (WorkflowExecutionError, Exception):  # noqa: BLE001
+                        pass
         return await self._runtime.start(self._workflow, channel, identity, input=payload)
 
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import String, select
+from sqlalchemy import String, delete, select
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.shared.db import Base, Database
@@ -113,6 +113,39 @@ class PostgresWorkflowRunStore(WorkflowRunStore):
                     data=entry.model_dump(mode="json"),
                 )
             )
+
+    async def delete_by_session(self, session_id: str) -> list[str]:
+        async with self._db.session() as session:
+            # Load all rows + filter in Python — the JSON column isn't
+            # mapped as JSONB so a `data["session_id"].astext` predicate
+            # is rejected by SQLAlchemy. Admin reset is one-shot, so a
+            # full scan is fine; pulls the matching subset, captures
+            # their thread ids for checkpoint cleanup, then deletes the
+            # rows + their audit trail in the same transaction.
+            all_rows = (
+                await session.execute(select(WorkflowRunRow))
+            ).scalars().all()
+            run_ids: list[str] = []
+            thread_ids: list[str] = []
+            for row in all_rows:
+                data = row.data if isinstance(row.data, dict) else {}
+                if data.get("session_id") != session_id:
+                    continue
+                run_ids.append(row.run_id)
+                tid = data.get("thread_id")
+                if isinstance(tid, str) and tid:
+                    thread_ids.append(tid)
+            if not run_ids:
+                return []
+            await session.execute(
+                delete(WorkflowRunAuditRow).where(
+                    WorkflowRunAuditRow.run_id.in_(run_ids)
+                )
+            )
+            await session.execute(
+                delete(WorkflowRunRow).where(WorkflowRunRow.run_id.in_(run_ids))
+            )
+        return thread_ids
 
     async def list_audit(self, run_id: str) -> list[AuditEntry]:
         async with self._db.session() as session:

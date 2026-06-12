@@ -2504,13 +2504,15 @@ class OnboardingWorkflow(WorkflowDefinition):
             # more documents?" prompt, so a stray "no" earlier in the phase
             # can't skip the document step.
             if is_no(reply) and state.more_docs_prompt_at:
-                await self._send(
-                    ctx, state, "onboarding.help.contextual",
-                    {"answer": "Got it — moving you to the next step. 👍", "next_step": ""},
-                )
+                # Per user (2026-06-12): on NO, send the coffee / "all received,
+                # we'll review within 24h" message (once) so the SME gets a
+                # clear next-step confirmation — not a bare "moving on".
+                if not state.documents_complete_sent:
+                    await self._send(ctx, state, "onboarding.documents.complete")
                 return self._step(
                     "documents_upload_loop_await", ctx,
                     docs_proceed=True,
+                    documents_complete_sent=True,
                     missing_documents=list(state.missing_documents),
                     documents_received=False,
                 )

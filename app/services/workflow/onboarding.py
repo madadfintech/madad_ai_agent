@@ -2027,14 +2027,37 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         token, refresh, expires = await self._live_token(state, ctx)
+        # Classify-and-upload (not the forced CR upload) so we learn what the
+        # doc ACTUALLY is. A real CR classifies as commercial_registration and
+        # lands in the CR slot exactly as before; a random doc classifies as
+        # something else and we suppress the "registered in Qatar — all good"
+        # affirmation downstream (user 2026-06-13: demo can't claim Qatar
+        # registration when the SME uploaded a non-CR). Default stays True so a
+        # classifier miss never drops the line on a genuine CR.
+        cr_verified = state.cr_verified
         if token and state.cr_ref:
             try:
-                await self._kyc.upload_commercial_registration(
+                resp = await self._kyc.classify_and_upload_document_base64(
                     access_token=token,
                     content_base64=state.cr_content_base64 or "",
                     filename=state.cr_ref,
                     mime_type=state.cr_mime_type,
                 )
+                detected: str | None = None
+                if isinstance(resp, dict):
+                    raw = (
+                        resp.get("document_type")
+                        or resp.get("documentType")
+                        or resp.get("resolved_document_type")
+                    )
+                    if isinstance(raw, str) and raw:
+                        detected = _workflow_doc_type(raw)
+                # Only flip the verdict when the classifier confidently named a
+                # type: a CONFIRMED non-CR (and not the catch-all
+                # "additional_document") → not a CR. Unknown / no type → keep the
+                # default so a real CR is never wrongly downgraded.
+                if detected and detected != "additional_document":
+                    cr_verified = detected == "commercial_registration"
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
                     "cr_upload.failed", error=str(exc)[:200],
@@ -2044,6 +2067,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         progress_step = await self._update_progress(state, ctx, step=2)
         return self._step(
             "cr_upload_base64", ctx,
+            cr_verified=cr_verified,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
@@ -2182,8 +2206,19 @@ class OnboardingWorkflow(WorkflowDefinition):
         # message after CR upload. A transient messenger / reminder failure
         # used to kill the run silently — guard so we always progress to
         # financials_await and let the SME's next reply re-trigger the prompt.
+        # Only assert "registered in Qatar — all good" when the CR step's upload
+        # actually classified as a Commercial Registration (user 2026-06-13).
+        cr_affirmation = (
+            "We can see that your business is registered in Qatar — all good "
+            "so far! ✅\n\n"
+            if state.cr_verified
+            else ""
+        )
         try:
-            await self._send(ctx, state, "onboarding.financials.request")
+            await self._send(
+                ctx, state, "onboarding.financials.request",
+                {"cr_affirmation": cr_affirmation},
+            )
         except Exception as exc:  # noqa: BLE001 — degrade gracefully
             ctx.logger.warning("financials_request.send_failed", error=str(exc)[:200])
         try:

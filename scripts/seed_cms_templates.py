@@ -133,7 +133,10 @@ _TEMPLATE_BODIES = {
     ),
     "onboarding.financials.request": (
         "Awesome, thanks for sharing! 🙌\n\n"
-        "We can see that your business is registered in Qatar — all good so far! ✅\n\n"
+        # {{ cr_affirmation }} is the "registered in Qatar — all good" line, sent
+        # ONLY when the CR step's upload classified as a real CR (else empty, so a
+        # random/non-CR upload doesn't get a false Qatar-registration claim).
+        "{{ cr_affirmation }}"
         "To further assess your eligibility we need to know your financials. "
         "Please share your last Audited Financial Statement.\n\n"
         "For any query call us on +974 3017 3888."

@@ -128,6 +128,13 @@ class OnboardingState(WorkflowState):
     cr_filename: str | None = None
     cr_content_base64: str | None = None
     cr_mime_type: str | None = None
+    # Whether the document uploaded at the CR step actually classified as a
+    # Commercial Registration. Gates the "registered in Qatar — all good"
+    # affirmation: defaults True so a classifier hiccup never drops it on a real
+    # CR, set False only when the classifier confidently reports a NON-CR type
+    # (so a random doc in the demo doesn't get a false "we detected your business
+    # in Qatar"). (user 2026-06-13)
+    cr_verified: bool = True
 
     # Step 3–4: eligibility + financials.
     eligibility_form_data: dict[str, Any] = Field(default_factory=dict)

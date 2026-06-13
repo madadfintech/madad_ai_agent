@@ -1,6 +1,15 @@
 """Celery task wrappers around the async platform jobs.
 
-Each task bridges the sync Celery worker to an async job via ``asyncio.run``.
+Each task runs on a PERSISTENT per-process event loop (not ``asyncio.run`` per
+tick). The async SQLAlchemy engine and the LangGraph Postgres checkpointer are
+both event-loop-bound: with a fresh loop per tick they raised
+``RuntimeError: ... attached to a different loop`` / ``the connection is
+closed`` / ``PostgresCheckpointerProvider.setup() not called``, which silently
+broke the nudge + status-poller jobs (UAT 2026-06-13). Keeping one loop per
+worker process — and running ``runtime.setup()`` once on it — lets those pooled
+connections be reused across ticks. (Celery prefork: each fork is its own
+process, so each keeps its own loop + setup.)
+
 Beat schedules these by name (see :mod:`app.workers.celery_app`).
 """
 
@@ -8,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from . import jobs
 from .celery_app import (
@@ -22,81 +31,70 @@ from .status_poller import run_status_poller
 
 _T = TypeVar("_T")
 
-
-async def _dispose_db() -> None:
-    """Dispose the process-singleton DB engine pool.
-
-    Bug (UAT 2026-06-13): each celery tick runs in a FRESH event loop via
-    ``asyncio.run``, but the ``@lru_cache`` :class:`Database` pools connections
-    bound to the loop that first created them. Reusing it on the next tick's
-    loop raised ``RuntimeError: ... attached to a different loop`` /
-    ``Event loop is closed``, so the nudge + status jobs silently failed every
-    other tick. Disposing the pool at the end of each run — inside this loop,
-    before ``asyncio.run`` closes it — lets the next tick reconnect cleanly.
-    """
-
-    try:
-        from app.shared.db.provider import get_database
-
-        await get_database().dispose()
-    except Exception:  # noqa: BLE001 — cleanup must never raise
-        pass
+# Persistent event loop for THIS worker process + whether the workflow runtime
+# (Postgres checkpointer) has been set up on it yet.
+_loop: asyncio.AbstractEventLoop | None = None
+_workflow_setup_done = False
 
 
-async def _run_then_dispose(coro: Awaitable[_T]) -> _T:
-    """Await ``coro`` then dispose the DB engine (for DB-only jobs)."""
+def _get_loop() -> asyncio.AbstractEventLoop:
+    global _loop, _workflow_setup_done
+    if _loop is None or _loop.is_closed():
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
+        _workflow_setup_done = False  # a new loop needs the checkpointer set up
+    return _loop
 
-    try:
-        return await coro
-    finally:
-        await _dispose_db()
 
+async def _ensure_workflow_setup() -> None:
+    """Provision the LangGraph Postgres checkpointer once per loop (the celery
+    worker never runs the web app's startup ``runtime.setup()``)."""
 
-async def _run_workflow_job(coro: Awaitable[_T]) -> _T:
-    """Run a job that touches workflow run state.
-
-    On top of the per-tick DB dispose, the LangGraph Postgres checkpointer must
-    be (re)bound to THIS event loop before any ``aget_state`` / resume — the
-    celery worker never ran the web app's startup ``runtime.setup()``, so reading
-    run state raised ``PostgresCheckpointerProvider.setup() not called`` and the
-    docs settle sweep / workflow recovery never advanced any run. setup() here +
-    aclose() in finally keeps each fresh-loop tick self-contained.
-    """
-
+    global _workflow_setup_done
+    if _workflow_setup_done:
+        return
     from app.services.workflow.deps import get_onboarding_platform
 
-    platform = get_onboarding_platform()
-    await platform.runtime.setup()
-    try:
-        return await coro
-    finally:
-        try:
-            await platform.runtime.aclose()
-        except Exception:  # noqa: BLE001 — cleanup must never raise
-            pass
-        await _dispose_db()
+    await get_onboarding_platform().runtime.setup()
+    _workflow_setup_done = True
+
+
+def _run(coro: Awaitable[_T]) -> _T:
+    return _get_loop().run_until_complete(coro)
 
 
 @celery_app.task(name=TASK_NUDGE_RUN_DUE)  # type: ignore[untyped-decorator]
 def nudge_run_due() -> int:
-    return asyncio.run(_run_then_dispose(jobs.run_due_nudges()))
+    return _run(jobs.run_due_nudges())
 
 
 @celery_app.task(name=TASK_WORKFLOW_RECOVER)  # type: ignore[untyped-decorator]
 def workflow_recover() -> int:
-    return asyncio.run(_run_workflow_job(jobs.recover_workflows()))
+    async def _go() -> int:
+        await _ensure_workflow_setup()
+        return await jobs.recover_workflows()
+
+    return _run(_go())
 
 
 @celery_app.task(name=TASK_WORKFLOW_TIMEOUT_SWEEP)  # type: ignore[untyped-decorator]
 def workflow_timeout_sweep() -> int:
-    return asyncio.run(_run_workflow_job(jobs.sweep_workflow_timeouts()))
+    async def _go() -> int:
+        await _ensure_workflow_setup()
+        return await jobs.sweep_workflow_timeouts()
+
+    return _run(_go())
 
 
 @celery_app.task(name=TASK_STATUS_POLLER)  # type: ignore[untyped-decorator]
 def status_poller() -> dict[str, int]:
     """Tick the journey-status polling worker. Returns the per-bucket counts."""
 
-    stats = asyncio.run(_run_workflow_job(run_status_poller()))
+    async def _go() -> Any:
+        await _ensure_workflow_setup()
+        return await run_status_poller()
+
+    stats = _run(_go())
     return {
         "polled": stats.polled,
         "skipped_step": stats.skipped_step,

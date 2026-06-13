@@ -149,7 +149,7 @@ _TEMPLATE_BODIES = {
         "Perfect! 🙌\n\n"
         "You will receive your pre-qualification result within 24 hours.\n\n"
         "Meanwhile, your account has been created on Madad with reference number "
-        "#{{ ref }}. You can login at madadfintech.com and track your status anytime."
+        "#{{ ref }}. You can login at uat-portal.madadfintech.com and track your status anytime."
     ),
     "onboarding.documents.checklist": (
         "🎉 Congratulations! Your business is pre-qualified for financing.\n\n"
@@ -173,7 +173,7 @@ _TEMPLATE_BODIES = {
         "11. QID   12. Passport\n\n"
         "ℹ️ Optional: Shareholder Proof of Address — send if you have it, "
         "but not required to proceed.\n\n"
-        "📤 Share the documents here or login at madadfintech.com to complete "
+        "📤 Share the documents here or login at uat-portal.madadfintech.com to complete "
         "your application.\n\n"
         "Please share your documents to move forward!"
     ),
@@ -241,7 +241,7 @@ _TEMPLATE_BODIES = {
     "onboarding.status.pending": (
         "Hi! Your application is currently under review with Madad. 👍\n\n"
         "I'll notify you as soon as the next update is available. You can also "
-        "track your status at madadfintech.com. For queries call +974 3017 3888."
+        "track your status at uat-portal.madadfintech.com. For queries call +974 3017 3888."
     ),
     "onboarding.payment.awaiting": (
         "Your application is ready to move forward. Please complete the secure "
@@ -256,7 +256,7 @@ _TEMPLATE_BODIES = {
         "{{ banks }}.\n\n"
         "We will update you as soon as financing offers are received — typically "
         "within 3–5 business days. 📲\n\n"
-        "Track your status at madadfintech.com (Ref: {{ ref }})"
+        "Track your status at uat-portal.madadfintech.com (Ref: {{ ref }})"
     ),
     "onboarding.not_qualified": (
         "Unfortunately your application wasn't accepted by our lender "
@@ -296,16 +296,14 @@ _TEMPLATE_BODIES = {
         "💬 Feel free to ask me anything about these offers right here!"
     ),
     "onboarding.offer.handoff": (
-        "💬 Feel free to ask me anything about these offers right here!\n\n"
         "When you're ready to select, please login to your Madad account to finalise "
         "your offer — this is where you'll also manage your invoices going forward.\n\n"
-        "Login to Madad Platform → madadfintech.com"
+        "Login to Madad Platform → uat-portal.madadfintech.com"
     ),
     # Spec Step 8 button variant — body for the WhatsApp interactive CTA-URL
     # message. The button label ("Login to Madad →") is supplied at send-time
     # (capped at 20 chars by Meta); this body is what shows above the button.
     "onboarding.offer.handoff.button": (
-        "💬 Feel free to ask me anything about these offers right here!\n\n"
         "When you're ready to select, please login to your Madad account to "
         "finalise your offer — this is where you'll also manage your invoices "
         "going forward."
@@ -328,7 +326,7 @@ _TEMPLATE_BODIES = {
         "🏦 {{ lender }} · 💰 {{ limit }} · 📈 {{ rate }} · ⏱ {{ tenure }}\n\n"
         "You can now submit invoices for financing right here — send a single "
         "PDF or multiple invoices at once. 📄\n\n"
-        "Track at madadfintech.com (Ref: {{ ref }})"
+        "Track at uat-portal.madadfintech.com (Ref: {{ ref }})"
     ),
 }
 
@@ -351,23 +349,23 @@ _NUDGE_TEMPLATE_BODIES = {
     "nudge.financials_pending.3": (
         "Final reminder: your Madad application will be marked inactive if "
         "we don't receive your Audited Financial Statement soon. Reply here "
-        "or visit madadfintech.com to continue."
+        "or visit uat-portal.madadfintech.com to continue."
     ),
     # Nudge — Partial Documents
     "nudge.incomplete_docs.1": (
         "Hi! You're almost there. 🚀\n\n"
         "Still needed: {{ documents }}.\n\n"
-        "Share here or at madadfintech.com to keep moving."
+        "Share here or at uat-portal.madadfintech.com to keep moving."
     ),
     "nudge.incomplete_docs.2": (
         "Quick reminder — we still need: {{ documents }}.\n\n"
         "Reply here with the documents attached, or upload via "
-        "madadfintech.com. Need help? Call +974 3017 3888."
+        "uat-portal.madadfintech.com. Need help? Call +974 3017 3888."
     ),
     "nudge.incomplete_docs.3": (
         "Final reminder — your application is at risk of being marked "
         "inactive. Missing: {{ documents }}. Please complete soon at "
-        "madadfintech.com or by replying here."
+        "uat-portal.madadfintech.com or by replying here."
     ),
     # Nudge — Payment Not Received  (link re-sent every step per PDF spec)
     "nudge.payment_pending.1": (

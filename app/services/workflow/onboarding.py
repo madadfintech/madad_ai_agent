@@ -305,6 +305,13 @@ def _is_short_negative(value: Any) -> bool:
     return is_no(value) or text in {"nope", "not now", "skip", "later"}
 
 
+def _is_docs_settle(value: Any) -> bool:
+    """True for the synthetic ``{"type": "docs_settle"}`` event the status-poller
+    sweep delivers once an upload burst has gone quiet — the cue to send the
+    end-of-batch checklist + tappable YES/NO button prompt."""
+    return isinstance(value, dict) and value.get("type") == "docs_settle"
+
+
 # -- Smart (LLM) off-script replies ---------------------------------------
 # When the SME asks something off-script ("why do you need my CR?", "is this
 # safe?", "I already sent everything") we answer it in context with a small
@@ -2538,6 +2545,32 @@ class OnboardingWorkflow(WorkflowDefinition):
                 if progress_step is not None:
                     fields["onboarding_progress_step"] = progress_step
             return self._step("documents_upload_loop_await", ctx, **fields)
+        # End-of-upload settle (UAT 2026-06-13): the status-poller sweep resumes
+        # this run with a synthetic ``docs_settle`` event once the SME has stopped
+        # uploading for the quiet window. THIS is where the checklist + the
+        # tappable YES/NO button prompt are sent — from the workflow, so the
+        # buttons are interactive — exactly once per quiet period, at the very
+        # end of the batch (never mid-upload). Re-armed by each new upload wave
+        # (which clears docs_settle_prompted).
+        if _is_docs_settle(reply):
+            if state.missing_documents and not state.docs_settle_prompted:
+                try:
+                    await self._send_pending_docs(
+                        ctx, state, list(state.missing_documents)
+                    )
+                    await self._send_more_docs_prompt(ctx, state)
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning(
+                        "docs_settle_prompt.failed", error=str(exc)[:200]
+                    )
+            return self._step(
+                "documents_upload_loop_await",
+                ctx,
+                docs_settle_prompted=True,
+                more_docs_prompt_at=ctx.clock.now().isoformat(),
+                missing_documents=list(state.missing_documents),
+                documents_received=False,
+            )
         attachments = _valid_upload_attachments(reply)
         if not attachments:
             # Bug #16 (UAT 2026-06-09): per spec page 8 "PENDING DOCS",
@@ -2866,32 +2899,13 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-        else:
-            # End-of-upload "settle" prompt (UAT 2026-06-13). WhatsApp delivers a
-            # multi-file upload as many overlapping inbound waves and a parked
-            # workflow has no "uploads finished" signal (await_input is a plain
-            # interrupt). So we (re)arm a short nudge on EVERY wave and suppress
-            # the prior one: the checklist + "any more documents?" prompt fire as
-            # ONE message ONCE, only after the SME stops uploading for ~the nudge
-            # delay (≈25-85s) — never mid-batch, identical for 1 doc / many /
-            # zip. The nudge carries the CURRENT checklist body (the last wave to
-            # arm it wins → the fired checklist is accurate). NO/"done" is honoured
-            # any time a doc has been uploaded (is_no branch). The nudge worker's
-            # event-loop bug that made this unreliable is fixed in tasks.py.
-            try:
-                target = state.madad_user_id or ctx.session_id
-                await self._reminders.suppress(target_ref=target)
-                await self._reminders.schedule(
-                    "docs_more_prompt",
-                    channel=_channel(ctx),
-                    identity=ctx.identity,
-                    target_ref=target,
-                    variables={"results": _pending_checklist_body(list(missing))},
-                )
-            except Exception as exc:  # noqa: BLE001
-                ctx.logger.warning(
-                    "docs_settle_nudge.schedule_failed", error=str(exc)[:200]
-                )
+        # When docs are still missing we do NOT prompt inline — WhatsApp splits a
+        # bulk upload into many waves and a parked workflow has no "uploads
+        # finished" signal. Instead the status-poller settle sweep resumes this
+        # run with a ``docs_settle`` event once uploads go quiet (~25-85s), and
+        # the checklist + tappable YES/NO button prompt is sent then (handled at
+        # the top of this node). docs_settle_prompted is reset to False on every
+        # upload wave (in the return below) so each new batch re-arms it.
         return self._step(
             "documents_upload_loop_await",
             ctx,
@@ -2905,6 +2919,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             more_docs_prompt_at=more_docs_prompt_at,
             docs_last_upload_at=last_upload_at,
             docs_acked=docs_acked,
+            docs_settle_prompted=False,
         )
 
     async def _send_pending_docs(

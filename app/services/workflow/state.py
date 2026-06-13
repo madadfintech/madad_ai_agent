@@ -175,6 +175,10 @@ class OnboardingState(WorkflowState):
     # previously produced contradictory "✅ X validated" then "⏳ X received"
     # receipts and repeated ⏳ for the same file (UAT 2026-06-13).
     docs_acked: list[str] = []
+    # Set once the end-of-upload settle prompt (checklist + tappable YES/NO
+    # buttons) has been sent for the current quiet period; reset on each new
+    # upload wave so a later batch re-arms it (UAT 2026-06-13).
+    docs_settle_prompted: bool = False
     # Deprecated (2026-06-12): replaced by the in-loop is_no/is_yes handling.
     # Retained for checkpoint back-compat; no longer read.
     more_docs_decision: str | None = None  # "yes" | "no" | None (not asked yet)

@@ -111,6 +111,8 @@ TEMPLATE_KEYS = [
     "onboarding.help.contextual",
     "onboarding.declined",
     "onboarding.domain_blocked",
+    "onboarding.business_email.ask",
+    "onboarding.business_email.conflict",
     "onboarding.collect_details.request",
     "onboarding.consent.request",
     "onboarding.eligibility.intake.request",

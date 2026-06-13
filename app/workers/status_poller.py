@@ -51,7 +51,13 @@ POLLABLE_STEPS: frozenset[str] = frozenset({"journey_wait_await", "lender_wait_a
 # tappable YES/NO button prompt (UAT 2026-06-13).
 DOCS_UPLOAD_STEP = "documents_upload_loop_await"
 # How long the upload stream must be quiet before we fire the settle prompt.
-DOCS_SETTLE_QUIET = timedelta(seconds=25)
+# A ZIP (or multi-file bulk) reaches us as separate inbound waves, and each
+# member's classify+upload can take up to ~25s — so consecutive waves can be
+# >25s apart. At 25s the sweep fired BETWEEN waves and rendered a stale partial
+# checklist ("all but 2 still missing" right after a full upload — UAT
+# 2026-06-13). 45s comfortably absorbs the inter-wave gap so the checklist
+# reflects the whole batch, while staying well inside the SME's attention span.
+DOCS_SETTLE_QUIET = timedelta(seconds=45)
 
 # Cadence per journey-status group, expressed as a timedelta.
 CADENCE_OFFER = timedelta(seconds=60)   # ACCEPTED/OFFER_ACCEPTED — see below

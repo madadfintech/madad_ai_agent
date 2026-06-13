@@ -96,7 +96,6 @@ _TEMPLATE_BODIES = {
     # Business-email step — asked right after YES / account creation, before
     # the consent/CR step. Capturing it makes the lead portal-loginable.
     "onboarding.business_email.ask": (
-        "Your Madad account is all set! 🎉\n\n"
         "What's your business email? We'll use it for your account and to keep "
         "you updated on your application. 📧"
     ),

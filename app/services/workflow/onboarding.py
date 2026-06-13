@@ -312,6 +312,28 @@ def _is_docs_settle(value: Any) -> bool:
     return isinstance(value, dict) and value.get("type") == "docs_settle"
 
 
+def _is_inert_system_resume(value: Any) -> bool:
+    """True for workflow-internal resume events that carry NO SME-typed text —
+    the status-poller's ``status_update`` tick and the docs-settle sweep.
+
+    These are background heartbeats, not chat. A parked wait node that owns a
+    canned off-script reply (``payment_wait_await`` / ``prequalify_wait_await``)
+    must re-park SILENTLY on them rather than answer every poll cycle: UAT
+    2026-06-13 saw ``payment_wait_await`` reply "You're all set…" once a minute
+    because the poll tick fell through its trigger check into the off-script
+    path. Real backend webhooks carry a ``journey_status`` / ``event`` payload
+    and are consumed by each node's trigger checks BEFORE this guard is reached,
+    so an actionable resume is never swallowed here."""
+
+    if not isinstance(value, dict):
+        return False
+    if value.get("type") not in {"status_update", "docs_settle"}:
+        return False
+    # An SME message riding a ``status_update`` envelope (text present) is real
+    # chat — let it reach the contextual responder. Only a bare tick is inert.
+    return not reply_text(value).strip()
+
+
 # -- Smart (LLM) off-script replies ---------------------------------------
 # When the SME asks something off-script ("why do you need my CR?", "is this
 # safe?", "I already sent everything") we answer it in context with a small
@@ -3177,6 +3199,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                 prequalified=True,
                 onboarding_progress_step=progress_step or state.onboarding_progress_step,
             )
+        # Background poll / docs-settle tick (no SME text) — re-park silently so
+        # a status_update heartbeat doesn't re-send the canned "pre-qualification
+        # result will be ready soon" line every poll cycle (UAT 2026-06-13).
+        if _is_inert_system_resume(payload):
+            return self._step("prequalify_wait_await", ctx, prequalified=False)
         # Bug #7+#8 (2026-06-09): intent-route every off-script reply so each
         # type of question gets a meaningful answer instead of the same
         # canned "still pending" fallback every time the LLM is unavailable
@@ -3216,6 +3243,12 @@ class OnboardingWorkflow(WorkflowDefinition):
                 payment_ready=True,
                 **({"madad_score": score} if score is not None else {}),
             )
+        # Background poll / docs-settle tick (no SME text) — re-park silently.
+        # Without this the status-poller's ~60s status_update resume fell into
+        # the off-script reply below and re-sent "You're all set…" every minute
+        # after the coffee message (UAT 2026-06-13).
+        if _is_inert_system_resume(payload):
+            return self._step("payment_wait_await", ctx, payment_ready=False)
         await self._contextual_off_script(
             ctx,
             state,

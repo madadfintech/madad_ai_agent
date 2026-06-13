@@ -370,13 +370,20 @@ _SMART_SYSTEM_PROMPT = (
     "don't know, reassure them the team is reviewing and it will update soon. "
     "End by gently nudging them toward the current step. Never include a phone "
     "number.\n\n"
-    "GUARDRAILS: ONLY answer questions related to Madad, business/invoice "
-    "financing, or this onboarding process. If the message is unrelated (general "
-    "knowledge, math, coding, news, politics, etc.) or is abusive/profane, do "
-    "NOT answer it — instead reply with ONE polite, professional sentence such "
-    "as: \"That's outside what I can help with here — I'm your Madad onboarding "
+    "GUARDRAILS: Be genuinely helpful. You CAN answer anything reasonably "
+    "related to Madad, business or invoice financing, the application/onboarding "
+    "process, the documents we ask for (what each one is, why it's needed, what "
+    "file formats are accepted like PDF or a clear photo, and broadly HOW or "
+    "WHERE a Qatar business owner can obtain them — e.g. a CR from the Ministry "
+    "of Commerce and Industry), and account/status questions. Answer these "
+    "practically, even basic ones like 'what is an email' or 'how do I get my "
+    "CR'. ONLY decline if the message is CLEARLY UNRELATED to Madad or business "
+    "financing (general trivia, math problems, coding, recipes, news, politics, "
+    "sport) or is abusive/profane — then reply with ONE polite sentence like: "
+    "\"That's outside what I can help with here — I'm your Madad onboarding "
     "assistant, so feel free to ask me anything about your application or "
-    "financing 🙂\". Never produce profanity or offensive content."
+    "financing 🙂\" and do not answer it. Never produce profanity or offensive "
+    "content."
 )
 
 
@@ -1448,7 +1455,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         elif is_no(reply):
             entry_reply = "NO"
         else:
-            await self._send(ctx, state, "onboarding.campaign.awaiting_yes_no")
+            # A question/chat before they say YES/NO — answer it (Groq) and end
+            # on the YES/NO nudge, instead of robotically re-asking. The Groq
+            # fallback default already carries the YES/NO prompt. (user 2026-06-14)
+            await self._contextual_off_script(
+                ctx, state, reply,
+                "Are you interested in financing for your business? "
+                "Please reply YES or NO.",
+            )
             entry_reply = "ASK"
         return self._step("campaign_await", ctx, entry_reply=entry_reply)
 
@@ -2041,11 +2055,12 @@ class OnboardingWorkflow(WorkflowDefinition):
             return self._step("consent_await", ctx, consent=False)
         attachments = _valid_upload_attachments(reply)
         if not attachments:
-            await self._send(
-                ctx,
-                state,
-                "onboarding.upload.required",
-                {"document": "Commercial Registration (CR)"},
+            # No document — it's a question or chit-chat. Answer it in context
+            # (Groq), falling back to the upload nudge. (user 2026-06-14)
+            await self._contextual_off_script(
+                ctx, state, reply,
+                "Whenever you're ready, please share your Commercial "
+                "Registration (CR) as a PDF or a clear photo. 🙂",
             )
             return self._step("consent_await", ctx, consent=False)
         first = attachments[0]
@@ -2171,7 +2186,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         if not form_data:
             form_data = _parse_eligibility_text(reply_text(reply))
         if not form_data:
-            await self._send(ctx, state, "onboarding.eligibility.intake.request")
+            # Couldn't read it as the eligibility details — answer it as an
+            # off-script question/chat (Groq) instead of re-sending the form
+            # prompt verbatim. (user 2026-06-14)
+            await self._contextual_off_script(
+                ctx, state, reply,
+                "When you're ready, please share the quick business details we "
+                "asked for so we can check your eligibility. 🙂",
+            )
         await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
         return self._step(
             "eligibility_intake_await", ctx, eligibility_form_data=form_data
@@ -2309,11 +2331,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         attachments = _valid_upload_attachments(reply)
         await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
         if not attachments:
-            await self._send(
-                ctx,
-                state,
-                "onboarding.upload.required",
-                {"document": "Audited Financial Statement"},
+            # No document — answer the question/chat in context (Groq), falling
+            # back to the upload nudge. (user 2026-06-14)
+            await self._contextual_off_script(
+                ctx, state, reply,
+                "Whenever you're ready, please share your latest Audited "
+                "Financial Statement as a PDF or a clear photo. 🙂",
             )
             return self._step("financials_await", ctx, financials_received=False)
         first = attachments[0]
@@ -2446,7 +2469,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         }
         data = {k: v for k, v in buyer.items() if k in allowed}
         if not data:
-            await self._send(ctx, state, "onboarding.buyers.request")
+            # Not buyer details — answer the off-script question/chat (Groq),
+            # falling back to the buyer-details nudge. (user 2026-06-14)
+            await self._contextual_off_script(
+                ctx, state, reply,
+                "When you're ready, please share your main buyer's details "
+                "(name, country, and contact). 🙂",
+            )
             return self._step("buyers_collect_await", ctx, buyers=list(state.buyers))
         if data and state.access_token:
             try:
@@ -2546,7 +2575,13 @@ class OnboardingWorkflow(WorkflowDefinition):
                     continue
             sanitized.append(record)
         if not sanitized:
-            await self._send(ctx, state, "onboarding.shareholders.request")
+            # Not shareholder details — answer the off-script question/chat
+            # (Groq), falling back to the shareholder-details nudge.
+            await self._contextual_off_script(
+                ctx, state, reply,
+                "When you're ready, please share your shareholders' details "
+                "(name and percentage). 🙂",
+            )
             return self._step(
                 "shareholders_collect_await", ctx, shareholders=list(state.shareholders)
             )

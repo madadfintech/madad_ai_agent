@@ -211,7 +211,12 @@ class WorkflowSettings(BaseModel):
     checkpoint_backend: str = "memory"  # memory | postgres
 
     # Single-step execution budget (seconds) before a step is timed out.
-    step_timeout_seconds: float = 60.0
+    # Raised 60→120 (UAT 2026-06-14): the doc classify-and-upload can take >25s
+    # per file when the classifier is slow; the per-call wait_for is now 50s, so
+    # the node (zip pass + per-file fallback) needs headroom under this budget —
+    # otherwise the backend finishes the upload but the agent times out at the
+    # old 60s step cap and wrongly reports the docs as still missing.
+    step_timeout_seconds: float = 120.0
     # How long a session may wait for inbound input before it is considered
     # lapsed (drives nudge/timeout sweeps). 0 disables.
     session_ttl_seconds: int = 60 * 60 * 24 * 14  # 14 days

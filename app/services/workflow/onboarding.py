@@ -2885,7 +2885,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                         content_base64=att.get("content_base64") or "",
                         filename=att.get("filename") or "",
                     ),
-                    timeout=25.0,
+                    timeout=50.0,
                 )
             except Exception as exc:  # noqa: BLE001 — fall back to local unzip
                 ctx.logger.warning(
@@ -2950,7 +2950,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                         filename=filename,
                         mime_type=att.get("mime_type"),
                     ),
-                    timeout=25.0,
+                    timeout=50.0,
                 )
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(

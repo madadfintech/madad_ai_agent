@@ -853,8 +853,29 @@ def _format_offer_cards(offers: list[dict[str, Any]]) -> str:
         limit = _fmt_qar(_g(offer, "creditLimit", "credit_limit", "limit"))
         rate = _fmt_pct(_g(offer, "interestRate", "interest_rate", "rate"))
         tenure = _fmt_days(_g(offer, "tenureDays", "tenure_days", "tenure"))
-        fee_value = _g(offer, "processingFee", "processing_fee", "fee")
-        fee = _fmt_qar(fee_value) + " fee" if fee_value is not None else "no fee"
+        # Total fees = sum of every fee component the lender set (processing +
+        # other charges + brokerage + feasibility + other fees/commissions).
+        # The backend field is ``processingFeeValue`` (NOT ``processingFee``) —
+        # reading the wrong key made every offer show "no fee" even when fees
+        # existed (UAT 2026-06-13). Show ONE combined total per the user's ask.
+        _fee_total = 0.0
+        _saw_fee = False
+        for _fee_keys in (
+            ("processingFeeValue", "processing_fee_value", "processingFee", "processing_fee", "fee"),
+            ("otherCharges", "other_charges"),
+            ("brokerageFees", "brokerage_fees"),
+            ("feasibilityStudyFees", "feasibility_study_fees"),
+            ("otherFeesAndCommissions", "other_fees_and_commissions"),
+        ):
+            _v = _g(offer, *_fee_keys)
+            if _v is None:
+                continue
+            try:
+                _fee_total += float(_v)
+                _saw_fee = True
+            except (TypeError, ValueError):
+                continue
+        fee = f"{_fmt_qar(_fee_total)} total fees" if _saw_fee and _fee_total > 0 else "no fee"
         lines.append(
             f"🏦 Offer {idx} — {lender}\n"
             f"💰 {limit} · 📈 {rate} · ⏱ {tenure} · 💳 {fee}"
@@ -2503,7 +2524,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             # 2026-06-12). Only honoured once we've actually shown the "any
             # more documents?" prompt, so a stray "no" earlier in the phase
             # can't skip the document step.
-            if is_no(reply) and state.more_docs_prompt_at:
+            if is_no(reply) and (state.more_docs_prompt_at or state.docs_uploaded_count > 0):
                 # Per user (2026-06-12): on NO, send the coffee / "all received,
                 # we'll review within 24h" message (once) so the SME gets a
                 # clear next-step confirmation — not a bare "moving on".
@@ -2792,26 +2813,27 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-        else:
-            # Still incomplete after this batch → (1) show the checklist of
-            # which docs are STILL missing, then (2) ask "any more documents?"
-            # as a separate message so a frustrated SME can reply NO to
-            # proceed. Both are debounced together to ONCE per upload burst (a
-            # ZIP / 20-doc upload arrives as many inbounds — never one prompt
-            # per file, user 2026-06-12). NOT sent when the checklist is
-            # complete (``missing`` empty) — that path shows the coffee message
-            # and moves on instead.
-            prior_prompt = _parse_iso_or_none(state.more_docs_prompt_at)
-            prompt_age = (now - prior_prompt).total_seconds() if prior_prompt else None
-            if prompt_age is None or prompt_age >= MORE_DOCS_PROMPT_TTL_SECONDS:
-                try:
-                    # 1) "Still missing" checklist.
-                    await self._send_pending_docs(ctx, state, list(missing))
-                    # 2) Separate "any more documents?" prompt (YES/NO buttons).
-                    await self._send_more_docs_prompt(ctx, state)
-                    more_docs_prompt_at = now.isoformat()
-                except Exception as exc:  # noqa: BLE001
-                    ctx.logger.warning("more_docs_prompt.send_failed", error=str(exc)[:200])
+        elif not state.more_docs_prompt_at and validated:
+            # Incomplete, but at least one document VALIDATED in this wave → ask
+            # "any more documents?" exactly ONCE (latched on more_docs_prompt_at).
+            #
+            # Why this shape (UAT 2026-06-13): WhatsApp delivers a multi-file
+            # upload (5–20 docs) as many SEPARATE, overlapping /workflow/inbound
+            # waves spanning >1 min. The old per-wave time-debounce (45s) fired
+            # the prompt AND a cumulative ⚠️ checklist 3–4× mid-batch. There is
+            # no reliable "uploads finished" signal in a parked workflow, so we:
+            #   • no longer render the ⚠️ checklist during uploads (receipts
+            #     only — the on-demand "what's missing?" path still has it), and
+            #   • send the prompt a single time, only once a doc has actually
+            #     validated (so an off-checklist-only first wave — e.g. a
+            #     re-uploaded Audited Report — doesn't trigger it prematurely).
+            # The SME replies NO whenever they're done (NO is honoured once any
+            # doc has been uploaded — see the is_no branch above).
+            try:
+                await self._send_more_docs_prompt(ctx, state)
+                more_docs_prompt_at = now.isoformat()
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning("more_docs_prompt.send_failed", error=str(exc)[:200])
         return self._step(
             "documents_upload_loop_await",
             ctx,

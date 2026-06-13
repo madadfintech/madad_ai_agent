@@ -170,6 +170,11 @@ class OnboardingState(WorkflowState):
     # session (a gap since the last wave) so the checklist + "any more?" prompt
     # fires once per session — not per wave (UAT 2026-06-13).
     docs_last_upload_at: str | None = None
+    # Doc types we've already sent a receipt for (✅ validated or ⏳ received), so
+    # a multi-wave bulk upload never re-acknowledges the same doc — which
+    # previously produced contradictory "✅ X validated" then "⏳ X received"
+    # receipts and repeated ⏳ for the same file (UAT 2026-06-13).
+    docs_acked: list[str] = []
     # Deprecated (2026-06-12): replaced by the in-loop is_no/is_yes handling.
     # Retained for checkpoint back-compat; no longer read.
     more_docs_decision: str | None = None  # "yes" | "no" | None (not asked yet)

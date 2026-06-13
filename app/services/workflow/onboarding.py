@@ -2795,8 +2795,22 @@ class OnboardingWorkflow(WorkflowDefinition):
         # literal feedback was "one checklist at the end, not the start."
         # The pending-docs self-service query (handled in the no-attachments
         # branch above) covers the "what's missing?" case.
+        # Receipt dedup (UAT 2026-06-13): a multi-file bulk arrives as many
+        # overlapping inbound waves, and a doc validated in an earlier wave is no
+        # longer in ``pending`` when a later wave re-encounters it → it would
+        # land in ``unprocessed`` and get a contradictory "⏳ received" after its
+        # "✅ validated" (and Audited Report got ⏳'d on every wave). Acknowledge
+        # each doc type EXACTLY ONCE across the whole upload phase.
+        already_acked = set(state.docs_acked)
+        new_validated = [d for d in validated if d not in already_acked]
+        new_unprocessed = [
+            d for d in unprocessed if d not in already_acked and d not in new_validated
+        ]
+        docs_acked = list(
+            dict.fromkeys([*state.docs_acked, *new_validated, *new_unprocessed])
+        )
         await self._acknowledge_uploads(
-            ctx, state, validated, unprocessed,
+            ctx, state, new_validated, new_unprocessed,
             saw_zip=saw_zip,
             missing_after=list(pending),
         )
@@ -2857,6 +2871,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             documents_processing_ack_at=processing_ack_at,
             more_docs_prompt_at=more_docs_prompt_at,
             docs_last_upload_at=last_upload_at,
+            docs_acked=docs_acked,
         )
 
     async def _send_pending_docs(

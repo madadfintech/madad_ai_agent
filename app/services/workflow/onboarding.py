@@ -364,10 +364,15 @@ _SMART_SYSTEM_PROMPT = (
     "HOW TO ANSWER: read the message and answer directly, warmly and briefly — "
     "1 to 3 short WhatsApp-style sentences; an emoji is fine. NEVER invent "
     "specific rates, limits, fees, approvals, timelines or offer numbers — speak "
-    "generally and point them to their Madad account for exact figures. If they "
+    "generally and say the exact figures will be shared with them here. If they "
     "ask why a document or detail is needed, explain simply that it verifies the "
     "business and assesses financing eligibility. For account-specific status you "
     "don't know, reassure them the team is reviewing and it will update soon.\n\n"
+    "EVERYTHING HAPPENS HERE IN WHATSAPP: Do NOT tell the user to log in, visit a "
+    "website/portal, or 'check your Madad account' — the entire application is "
+    "handled right here in this chat. If they ask which documents are still "
+    "needed or which they've already sent, answer from the document list provided "
+    "in the step context below (do NOT redirect them elsewhere).\n\n"
     "CRITICAL — STAY IN YOUR LANE: Answer ONLY the question the user asked, then "
     "STOP. Do NOT tell the user what to do next, do NOT ask them to upload, share "
     "or provide anything, do NOT ask follow-up questions, and do NOT describe, "
@@ -2796,12 +2801,27 @@ class OnboardingWorkflow(WorkflowDefinition):
         # ack 8 times in a row. Re-fire only if the previous ack is older
         # than DOCS_PROCESSING_ACK_TTL_SECONDS.
         now = ctx.clock.now()
+        has_zip = any(_is_zip_attachment(a) for a in attachments)
         prior_ack = _parse_iso_or_none(state.documents_processing_ack_at)
         ack_age = (now - prior_ack).total_seconds() if prior_ack else None
         processing_ack_at: str | None = state.documents_processing_ack_at
         if ack_age is None or ack_age >= DOCS_PROCESSING_ACK_TTL_SECONDS:
             try:
-                await self._send(ctx, state, "onboarding.documents.processing")
+                if has_zip:
+                    # A ZIP is classified document-by-document server-side, which
+                    # can take a while — set expectations so the SME doesn't think
+                    # we went silent (user 2026-06-14). ZIP-only message.
+                    await self._send(
+                        ctx, state, "onboarding.documents.single_received",
+                        {"results": (
+                            "📦 Got your ZIP — classifying every document and "
+                            "checking they're the right type. This can take up to "
+                            "~5 minutes; I'll send the full checklist here as soon "
+                            "as it's ready. ⏳"
+                        )},
+                    )
+                else:
+                    await self._send(ctx, state, "onboarding.documents.processing")
                 processing_ack_at = now.isoformat()
             except Exception as exc:  # noqa: BLE001
                 ctx.logger.warning(
@@ -4566,7 +4586,26 @@ class OnboardingWorkflow(WorkflowDefinition):
         canned line — never the robotic "text alone is not enough" nag."""
 
         hint = _next_step_hint(state)
-        answer = await _llm_answer(reply_text(reply), hint)
+        # At the documents step, hand the model the REAL doc state so it can
+        # answer "what have I sent / what's still needed" accurately, in-chat,
+        # without redirecting to a portal or guessing (user 2026-06-14). This
+        # enriches only the LLM context; the user-facing nudge stays concise.
+        llm_hint = hint
+        last_step = state.history[-1].step if state.history else ""
+        if last_step in {"documents_upload_loop_send", "documents_upload_loop_await"}:
+            _missing = list(state.missing_documents or [])
+            _received = [d for d in DEFAULT_WHATSAPP_REQUIRED_DOCS if d not in _missing]
+            _recv_str = ", ".join(
+                DOCUMENT_LABELS.get(d, d.replace("_", " ").title()) for d in _received
+            ) or "none yet"
+            _miss_str = ", ".join(
+                DOCUMENT_LABELS.get(d, d.replace("_", " ").title()) for d in _missing
+            ) or "none"
+            llm_hint = (
+                f"{hint}\nDocuments already received: {_recv_str}. "
+                f"Documents still needed: {_miss_str}."
+            )
+        answer = await _llm_answer(reply_text(reply), llm_hint)
         if answer:
             # The model answers ONLY the question (told not to invent/restate
             # steps); WE append the deterministic current-step nudge so guidance

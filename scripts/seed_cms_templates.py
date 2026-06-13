@@ -467,6 +467,23 @@ _NUDGE_SCHEDULES: dict[str, dict[str, Any]] = {
         ],
         "max_attempts": 3,
     },
+    # Trailing-edge "any more documents?" prompt (UAT 2026-06-13). A multi-file
+    # WhatsApp upload arrives as many SEPARATE inbound waves; there is no
+    # in-workflow "uploads finished" signal. The documents loop (re)arms this
+    # single short nudge on every upload wave and suppresses it on the next, so
+    # the prompt fires ONCE — only after the SME has been quiet for ~the delay
+    # below — never mid-batch. The worker tick is 60s, so effective quiet window
+    # is ≈ 40–100s.
+    "docs_more_prompt": {
+        "schedule": [
+            {
+                "offset": 40,
+                "channels": ["whatsapp"],
+                "template_key": "onboarding.documents.more_docs_prompt",
+            },
+        ],
+        "max_attempts": 1,
+    },
 }
 
 

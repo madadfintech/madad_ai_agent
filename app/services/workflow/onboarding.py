@@ -2538,7 +2538,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                     documents_received=False,
                 )
             # "YES" → they have more to send; acknowledge and stay parked.
-            if is_yes(reply) and state.more_docs_prompt_at:
+            if is_yes(reply) and (state.more_docs_prompt_at or state.docs_uploaded_count > 0):
                 await self._send(
                     ctx, state, "onboarding.help.contextual",
                     {"answer": "Sure — send the rest whenever you're ready, "
@@ -2813,27 +2813,33 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-        elif not state.more_docs_prompt_at and validated:
-            # Incomplete, but at least one document VALIDATED in this wave → ask
-            # "any more documents?" exactly ONCE (latched on more_docs_prompt_at).
-            #
-            # Why this shape (UAT 2026-06-13): WhatsApp delivers a multi-file
-            # upload (5–20 docs) as many SEPARATE, overlapping /workflow/inbound
-            # waves spanning >1 min. The old per-wave time-debounce (45s) fired
-            # the prompt AND a cumulative ⚠️ checklist 3–4× mid-batch. There is
-            # no reliable "uploads finished" signal in a parked workflow, so we:
-            #   • no longer render the ⚠️ checklist during uploads (receipts
-            #     only — the on-demand "what's missing?" path still has it), and
-            #   • send the prompt a single time, only once a doc has actually
-            #     validated (so an off-checklist-only first wave — e.g. a
-            #     re-uploaded Audited Report — doesn't trigger it prematurely).
-            # The SME replies NO whenever they're done (NO is honoured once any
-            # doc has been uploaded — see the is_no branch above).
+        else:
+            # Trailing-edge "any more documents?" prompt (UAT 2026-06-13).
+            # WhatsApp delivers a multi-file upload (5–20 docs) as many SEPARATE,
+            # overlapping inbound waves over >1 min, and a parked workflow has NO
+            # "uploads finished" signal (await_input is a plain interrupt — no
+            # timeout). Two earlier shapes both failed: prompting per wave
+            # spammed it 3–4×; latching to fire once fired it too early (after a
+            # single doc) and then never again after a later batch. So we (re)arm
+            # a single short nudge on EVERY upload wave and suppress the prior
+            # one — the prompt fires ONCE, only after the SME stops uploading for
+            # ~40-100s, never mid-batch. NO/"done" is honoured anytime (is_no
+            # branch, gated on docs_uploaded_count), so even a missed nudge can
+            # never strand the SME.
             try:
-                await self._send_more_docs_prompt(ctx, state)
-                more_docs_prompt_at = now.isoformat()
+                await self._reminders.suppress(
+                    target_ref=state.madad_user_id or ctx.session_id
+                )
+                await self._reminders.schedule(
+                    "docs_more_prompt",
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    target_ref=state.madad_user_id or ctx.session_id,
+                )
             except Exception as exc:  # noqa: BLE001
-                ctx.logger.warning("more_docs_prompt.send_failed", error=str(exc)[:200])
+                ctx.logger.warning(
+                    "docs_more_prompt.schedule_failed", error=str(exc)[:200]
+                )
         return self._step(
             "documents_upload_loop_await",
             ctx,

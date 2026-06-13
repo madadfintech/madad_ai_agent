@@ -343,17 +343,40 @@ def _is_inert_system_resume(value: Any) -> bool:
 # whenever the key is unset or the call fails, so the flow never breaks.
 
 _SMART_SYSTEM_PROMPT = (
-    "You are Madad's friendly WhatsApp onboarding assistant. Madad is a "
-    "regulated business-finance company in Qatar that helps SMEs unlock cash "
-    "tied up in unpaid invoices owed by enterprise or government buyers. You are "
-    "chatting with a business owner during their onboarding. Read their message "
-    "and answer it directly, warmly and briefly — 1 to 3 short WhatsApp-style "
-    "sentences, an emoji is fine. Never invent rates, terms, approvals or "
-    "timelines. If they ask why a document or detail is needed, explain simply "
-    "that it is to verify the business and assess financing eligibility. For "
-    "account-specific status you don't know, reassure them the team is reviewing "
-    "and it will update soon. End by gently nudging them toward the current step. "
-    "Do NOT include any phone number."
+    "You are Madad's friendly, professional WhatsApp onboarding assistant, "
+    "chatting with a Qatar business owner during their application.\n\n"
+    "ABOUT MADAD: Madad Financial Technologies LLC is a Qatar fintech and a "
+    "registered participant in the Qatar Central Bank (QCB) Sandbox, operating "
+    "within its regulatory framework (and QFC-registered). Madad helps SMEs "
+    "unlock working capital tied up in unpaid invoices owed by enterprise or "
+    "government buyers: the business uploads an invoice, Madad assesses the "
+    "business, and connects it with credit-line offers from multiple trusted "
+    "financial institutions — faster and simpler than traditional financing.\n\n"
+    "TERMS you may be asked to explain (explain clearly, in general terms):\n"
+    "- Tenure: the financing period before the buyer's (paymaster's) repayment "
+    "is expected, e.g. 30 vs 45 days. A SHORTER tenure usually means lower total "
+    "profit/fee cost (good when the buyer pays quickly); a LONGER tenure gives "
+    "more flexibility, and sometimes a higher limit, if the buyer takes longer "
+    "to pay.\n"
+    "- Profit rate / p.a.: the annualised cost of the financing.\n"
+    "- Fee: the one-time processing charge shown on an offer.\n"
+    "- Credit line / limit: the maximum amount a lender offers.\n\n"
+    "HOW TO ANSWER: read the message and answer directly, warmly and briefly — "
+    "1 to 3 short WhatsApp-style sentences; an emoji is fine. NEVER invent "
+    "specific rates, limits, fees, approvals, timelines or offer numbers — speak "
+    "generally and point them to their Madad account for exact figures. If they "
+    "ask why a document or detail is needed, explain simply that it verifies the "
+    "business and assesses financing eligibility. For account-specific status you "
+    "don't know, reassure them the team is reviewing and it will update soon. "
+    "End by gently nudging them toward the current step. Never include a phone "
+    "number.\n\n"
+    "GUARDRAILS: ONLY answer questions related to Madad, business/invoice "
+    "financing, or this onboarding process. If the message is unrelated (general "
+    "knowledge, math, coding, news, politics, etc.) or is abusive/profane, do "
+    "NOT answer it — instead reply with ONE polite, professional sentence such "
+    "as: \"That's outside what I can help with here — I'm your Madad onboarding "
+    "assistant, so feel free to ask me anything about your application or "
+    "financing 🙂\". Never produce profanity or offensive content."
 )
 
 
@@ -365,16 +388,35 @@ async def _llm_answer(user_text: str, step_hint: str) -> str | None:
     fall back to a canned line — the onboarding flow must never break on this.
     """
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
     text = (user_text or "").strip()
-    if not api_key or not text:
+    if not text:
         return None
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
-    base_url = (
-        os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
-    )
+    # Prefer Groq (OpenAI-compatible, free, fast) when its key is present —
+    # configured independently so a stale OPENAI_MODEL (e.g. gpt-4.1-mini) can't
+    # leak into a Groq call. Falls back to OpenAI config, then to None (canned
+    # reply) so the onboarding flow never breaks on an LLM hiccup.
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if groq_key:
+        api_key = groq_key
+        base_url = (
+            os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+            .strip()
+            .rstrip("/")
+        )
+        model = (
+            os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+            or "llama-3.3-70b-versatile"
+        )
+    else:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        base_url = (
+            os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+        )
+        model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    if not api_key:
+        return None
     try:
-        timeout = float(os.getenv("OPENAI_TIMEOUT", "15") or "15")
+        timeout = float(os.getenv("LLM_TIMEOUT", os.getenv("OPENAI_TIMEOUT", "15")) or "15")
     except ValueError:
         timeout = 15.0
     payload = {

@@ -167,6 +167,13 @@ async def _maybe_settle_docs(
     )
     if not missing:
         return False  # checklist complete → the coffee/complete path handles it
+    if not values.get("docs_acked"):
+        # Nothing actually received yet (an upload wave that classified to
+        # nothing usable can stamp docs_last_upload_at without acking a doc).
+        # Firing here re-sent the full "all N still needed" checklist — a
+        # verbatim repeat of the pre-qualified doc list, mid-batch (user
+        # 2026-06-13, ZIP flow). Wait until at least one doc has landed.
+        return False
     if values.get("docs_settle_prompted"):
         return False  # already prompted for this quiet period
     if last_upload is None or quiet_for is None or quiet_for < DOCS_SETTLE_QUIET.total_seconds():

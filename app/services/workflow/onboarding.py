@@ -2923,13 +2923,28 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-        # When docs are still missing we do NOT prompt inline — WhatsApp splits a
-        # bulk upload into many waves and a parked workflow has no "uploads
-        # finished" signal. Instead the status-poller settle sweep resumes this
-        # run with a ``docs_settle`` event once uploads go quiet (~25-85s), and
-        # the checklist + tappable YES/NO button prompt is sent then (handled at
-        # the top of this node). docs_settle_prompted is reset to False on every
-        # upload wave (in the return below) so each new batch re-arms it.
+        # ZIP end-of-batch prompt (user 2026-06-13): a ZIP is a SINGLE upload we
+        # process FULLY in one server-side classify call — so the moment we reach
+        # here the whole batch is done and we don't need to guess when uploads
+        # "finished". Send the checklist + tappable YES/NO prompt ONCE, inline,
+        # right now — received-aware so uploaded-but-⏳ docs show as "received,
+        # under review" instead of being re-listed as "still needed" — and
+        # suppress the settle sweep for this run so it can't fire a premature or
+        # duplicate checklist mid-batch. NON-ZIP bulk uploads are UNCHANGED: they
+        # arrive as many waves with no reliable "finished" signal, so they still
+        # defer to the status-poller settle sweep (docs_settle_prompted re-armed
+        # to False below).
+        zip_settled = bool(saw_zip and missing and not state.docs_settle_prompted)
+        if zip_settled:
+            try:
+                await self._send_pending_docs(
+                    ctx, state, list(missing), received=docs_acked
+                )
+                await self._send_more_docs_prompt(ctx, state)
+                more_docs_prompt_at = last_upload_at
+            except Exception as exc:  # noqa: BLE001 — fall back to the sweep
+                ctx.logger.warning("zip_settle_prompt.failed", error=str(exc)[:200])
+                zip_settled = False
         return self._step(
             "documents_upload_loop_await",
             ctx,
@@ -2943,7 +2958,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             more_docs_prompt_at=more_docs_prompt_at,
             docs_last_upload_at=last_upload_at,
             docs_acked=docs_acked,
-            docs_settle_prompted=False,
+            docs_settle_prompted=zip_settled,
         )
 
     async def _send_pending_docs(
@@ -2951,6 +2966,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         ctx: WorkflowContext,
         state: OnboardingState,
         missing: list[str],
+        received: list[str] | None = None,
     ) -> None:
         """Reply to the SME's "what's still missing?" query with the
         running pending-docs list (spec page 8 PENDING DOCS self-service).
@@ -2958,16 +2974,26 @@ class OnboardingWorkflow(WorkflowDefinition):
         Format mirrors the per-upload checklist body so it's familiar but
         scoped to the on-demand path — no batch receipts, just the
         current state.
+
+        ``received`` are doc types the SME HAS uploaded but we couldn't
+        auto-validate (landed as ⏳ "received, team will review"). They stay
+        in ``missing`` (not confidently validated) but must NOT be re-listed
+        as "still needed" — that told the SME to re-send a doc they'd already
+        sent (user 2026-06-13, ZIP flow). Show them as "received, under
+        review" instead so the checklist reflects what actually landed.
         """
 
         def _label(doc: str) -> str:
             return DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title())
 
+        received_set = set(received or [])
         all_required = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
-        still_missing = list(missing)
-        already_validated = [d for d in all_required if d not in still_missing]
+        # Split the pending list: uploaded-but-unvalidated (⏳) vs never-sent.
+        under_review = [d for d in missing if d in received_set]
+        still_missing = [d for d in missing if d not in received_set]
+        already_validated = [d for d in all_required if d not in missing]
 
-        if not still_missing:
+        if not still_missing and not under_review:
             # SME asked but everything's already in — short, honest reply.
             await self._send(
                 ctx, state, "onboarding.help.contextual",
@@ -2982,13 +3008,15 @@ class OnboardingWorkflow(WorkflowDefinition):
             return
 
         rows = [f"✅ {_label(d)}" for d in already_validated]
+        rows += [f"📩 {_label(d)} — received, under review" for d in under_review]
         rows += [f"⚠️ {_label(d)} — still needed" for d in still_missing]
         body = "📋 Application checklist:\n" + "\n".join(rows)
-        noun = "document" if len(still_missing) == 1 else "documents"
-        body += (
-            f"\n\n📤 Please share the remaining {len(still_missing)} "
-            f"{noun} to move forward."
-        )
+        if still_missing:
+            noun = "document" if len(still_missing) == 1 else "documents"
+            body += (
+                f"\n\n📤 Please share the remaining {len(still_missing)} "
+                f"{noun} to move forward."
+            )
         # Per project_optional_docs (2026-06-10): surface optional docs as a
         # separate "Optional" section so the SME knows they can send them but
         # isn't pressured to. Validated optionals appear up in the ✅ list

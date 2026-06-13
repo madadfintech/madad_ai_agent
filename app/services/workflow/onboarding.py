@@ -3798,6 +3798,24 @@ class OnboardingWorkflow(WorkflowDefinition):
         except (TypeError, ValueError):
             tenure = "—"
 
+        # Bug #58 (UAT 2026-06-13): the OFFER_ACCEPTED → ACTIVATED transition can
+        # land faster than the agent resumes/polls, so the run routes straight to
+        # 'activated' and the one-time ✅ "offer confirmed" acceptance message
+        # never fires (the SME got activation but not the acceptance). If it
+        # hasn't been sent, backfill it HERE — in order, just before the
+        # activation message — so the acceptance is never silently skipped.
+        backfilled_offer_confirmed = False
+        if not state.offer_confirmed_sent:
+            try:
+                await self._send(
+                    ctx, state, "onboarding.offer.confirmed", {"lender": lender}
+                )
+                backfilled_offer_confirmed = True
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "activated.offer_confirmed_backfill_failed", error=str(exc)[:200]
+                )
+
         await self._send(
             ctx,
             state,
@@ -3813,6 +3831,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         return self._step(
             "activated", ctx,
             outcome="completed",
+            offer_confirmed_sent=state.offer_confirmed_sent or backfilled_offer_confirmed,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
         )
 

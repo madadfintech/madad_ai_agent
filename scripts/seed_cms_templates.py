@@ -217,6 +217,16 @@ _TEMPLATE_BODIES = {
         "Reply YES if you'd like to send more, or NO if you're done — "
         "we'll proceed with the next step."
     ),
+    # End-of-upload "settle" message (UAT 2026-06-13): the checklist + the
+    # any-more prompt in ONE message, fired ONCE by the docs_more_prompt nudge
+    # after the SME stops uploading — never mid-batch. ``{{ results }}`` is the
+    # current checklist body supplied by the workflow when it arms the nudge.
+    "onboarding.documents.settle_prompt": (
+        "{{ results }}\n\n"
+        "📄 Do you have any more documents to upload?\n\n"
+        "Reply YES if you'd like to send more, or NO if you're done — "
+        "we'll proceed with the next step."
+    ),
     # Immediate ack the instant a valid CR attachment arrives — guarantees the
     # user always sees a response even if the downstream upload + financials
     # prompt fails (QA Bug #1 + Ishan handover §9 / 2026-06-09).
@@ -477,9 +487,9 @@ _NUDGE_SCHEDULES: dict[str, dict[str, Any]] = {
     "docs_more_prompt": {
         "schedule": [
             {
-                "offset": 40,
+                "offset": 25,
                 "channels": ["whatsapp"],
-                "template_key": "onboarding.documents.more_docs_prompt",
+                "template_key": "onboarding.documents.settle_prompt",
             },
         ],
         "max_attempts": 1,

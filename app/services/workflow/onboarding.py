@@ -128,6 +128,7 @@ TEMPLATE_KEYS = [
     "onboarding.cr.received",
     "onboarding.documents.processing",
     "onboarding.documents.more_docs_prompt",
+    "onboarding.documents.settle_prompt",
     "onboarding.documents.upload_failed",
     "onboarding.status.pending",
     "onboarding.payment.awaiting",
@@ -664,6 +665,38 @@ def _format_documents(documents: list[str]) -> str:
         return "required documents"
     labels = [DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title()) for doc in documents]
     return "\n".join(f"{idx}. {label}" for idx, label in enumerate(labels, start=1))
+
+
+def _pending_checklist_body(missing: list[str]) -> str:
+    """The "📋 Application checklist" body (✅ done + ⚠️ still-needed + optional).
+
+    Returns "" when nothing is missing. Shared by the on-demand pending-docs
+    reply and the end-of-upload settle nudge so both render identically.
+    """
+
+    def _label(doc: str) -> str:
+        return DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title())
+
+    still_missing = list(missing)
+    if not still_missing:
+        return ""
+    all_required = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+    already_validated = [d for d in all_required if d not in still_missing]
+    rows = [f"✅ {_label(d)}" for d in already_validated]
+    rows += [f"⚠️ {_label(d)} — still needed" for d in still_missing]
+    body = "📋 Application checklist:\n" + "\n".join(rows)
+    noun = "document" if len(still_missing) == 1 else "documents"
+    body += (
+        f"\n\n📤 Please share the remaining {len(still_missing)} {noun} to move forward."
+    )
+    optional_unsent = [
+        d for d in DEFAULT_WHATSAPP_OPTIONAL_DOCS if d not in already_validated
+    ]
+    if optional_unsent:
+        body += "\n\nℹ️ Optional (send if you have them):"
+        for d in optional_unsent:
+            body += f"\n• {_label(d)}"
+    return body
 
 
 def _format_banks_list(banks: list[str]) -> str:
@@ -2833,32 +2866,32 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-        elif validated:
-            # Send the checklist + "any more documents?" prompt ONCE per upload
-            # SESSION (not per wave). WhatsApp splits one upload action into many
-            # inbound waves a few seconds apart over >1 min, and a parked
-            # workflow has no reliable timer (await_input has no timeout; the
-            # nudge worker is unreliable on this host). So we detect a NEW session
-            # by a gap since the previous wave: fire if we've never prompted, OR
-            # the SME paused for > DOCS_SESSION_GAP_SECONDS and is uploading again.
-            # Gated on ``validated`` so an off-checklist first wave (e.g. a
-            # re-uploaded Audited Report → ⏳ only) doesn't trigger it prematurely.
-            # This restores the spec (confirmation → receipts → checklist →
-            # prompt) reliably for the single-doc / single-zip case and bounds it
-            # to ~once per burst for the 5–20-doc case. NO/"done" is honoured any
-            # time a doc has been uploaded (see the is_no branch above).
-            prior_upload = _parse_iso_or_none(state.docs_last_upload_at)
-            gap = (now - prior_upload).total_seconds() if prior_upload else None
-            new_session = gap is not None and gap > DOCS_SESSION_GAP_SECONDS
-            if not state.more_docs_prompt_at or new_session:
-                try:
-                    await self._send_pending_docs(ctx, state, list(missing))
-                    await self._send_more_docs_prompt(ctx, state)
-                    more_docs_prompt_at = now.isoformat()
-                except Exception as exc:  # noqa: BLE001
-                    ctx.logger.warning(
-                        "more_docs_prompt.send_failed", error=str(exc)[:200]
-                    )
+        else:
+            # End-of-upload "settle" prompt (UAT 2026-06-13). WhatsApp delivers a
+            # multi-file upload as many overlapping inbound waves and a parked
+            # workflow has no "uploads finished" signal (await_input is a plain
+            # interrupt). So we (re)arm a short nudge on EVERY wave and suppress
+            # the prior one: the checklist + "any more documents?" prompt fire as
+            # ONE message ONCE, only after the SME stops uploading for ~the nudge
+            # delay (≈25-85s) — never mid-batch, identical for 1 doc / many /
+            # zip. The nudge carries the CURRENT checklist body (the last wave to
+            # arm it wins → the fired checklist is accurate). NO/"done" is honoured
+            # any time a doc has been uploaded (is_no branch). The nudge worker's
+            # event-loop bug that made this unreliable is fixed in tasks.py.
+            try:
+                target = state.madad_user_id or ctx.session_id
+                await self._reminders.suppress(target_ref=target)
+                await self._reminders.schedule(
+                    "docs_more_prompt",
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    target_ref=target,
+                    variables={"results": _pending_checklist_body(list(missing))},
+                )
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "docs_settle_nudge.schedule_failed", error=str(exc)[:200]
+                )
         return self._step(
             "documents_upload_loop_await",
             ctx,

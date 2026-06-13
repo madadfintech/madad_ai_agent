@@ -550,6 +550,11 @@ DOCS_PROCESSING_ACK_TTL_SECONDS = 30.0
 # ZIP / multi-doc upload arrives as many separate inbounds and must not yield
 # one prompt per file (user 2026-06-12).
 MORE_DOCS_PROMPT_TTL_SECONDS = 45.0
+# A multi-file WhatsApp upload arrives as many inbound waves a few seconds apart.
+# Treat a pause LONGER than this between waves as a NEW upload session, so the
+# checklist + "any more?" prompt fires once per session (not per wave) but does
+# re-appear if the SME uploads a fresh batch after a break (UAT 2026-06-13).
+DOCS_SESSION_GAP_SECONDS = 30.0
 
 # Bug #15 (UAT 2026-06-09): same debounce shape but for the full
 # "📋 Application checklist" body. Per-file POSTs land as separate
@@ -2809,37 +2814,37 @@ class OnboardingWorkflow(WorkflowDefinition):
         # service's count-based unblock (PR #4, commit 6c05b1c).
         new_uploaded_count = state.docs_uploaded_count + len(attachments)
         more_docs_prompt_at = state.more_docs_prompt_at
+        last_upload_at = now.isoformat()
         if not missing:
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-        else:
-            # Trailing-edge "any more documents?" prompt (UAT 2026-06-13).
-            # WhatsApp delivers a multi-file upload (5–20 docs) as many SEPARATE,
-            # overlapping inbound waves over >1 min, and a parked workflow has NO
-            # "uploads finished" signal (await_input is a plain interrupt — no
-            # timeout). Two earlier shapes both failed: prompting per wave
-            # spammed it 3–4×; latching to fire once fired it too early (after a
-            # single doc) and then never again after a later batch. So we (re)arm
-            # a single short nudge on EVERY upload wave and suppress the prior
-            # one — the prompt fires ONCE, only after the SME stops uploading for
-            # ~40-100s, never mid-batch. NO/"done" is honoured anytime (is_no
-            # branch, gated on docs_uploaded_count), so even a missed nudge can
-            # never strand the SME.
-            try:
-                await self._reminders.suppress(
-                    target_ref=state.madad_user_id or ctx.session_id
-                )
-                await self._reminders.schedule(
-                    "docs_more_prompt",
-                    channel=_channel(ctx),
-                    identity=ctx.identity,
-                    target_ref=state.madad_user_id or ctx.session_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                ctx.logger.warning(
-                    "docs_more_prompt.schedule_failed", error=str(exc)[:200]
-                )
+        elif validated:
+            # Send the checklist + "any more documents?" prompt ONCE per upload
+            # SESSION (not per wave). WhatsApp splits one upload action into many
+            # inbound waves a few seconds apart over >1 min, and a parked
+            # workflow has no reliable timer (await_input has no timeout; the
+            # nudge worker is unreliable on this host). So we detect a NEW session
+            # by a gap since the previous wave: fire if we've never prompted, OR
+            # the SME paused for > DOCS_SESSION_GAP_SECONDS and is uploading again.
+            # Gated on ``validated`` so an off-checklist first wave (e.g. a
+            # re-uploaded Audited Report → ⏳ only) doesn't trigger it prematurely.
+            # This restores the spec (confirmation → receipts → checklist →
+            # prompt) reliably for the single-doc / single-zip case and bounds it
+            # to ~once per burst for the 5–20-doc case. NO/"done" is honoured any
+            # time a doc has been uploaded (see the is_no branch above).
+            prior_upload = _parse_iso_or_none(state.docs_last_upload_at)
+            gap = (now - prior_upload).total_seconds() if prior_upload else None
+            new_session = gap is not None and gap > DOCS_SESSION_GAP_SECONDS
+            if not state.more_docs_prompt_at or new_session:
+                try:
+                    await self._send_pending_docs(ctx, state, list(missing))
+                    await self._send_more_docs_prompt(ctx, state)
+                    more_docs_prompt_at = now.isoformat()
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning(
+                        "more_docs_prompt.send_failed", error=str(exc)[:200]
+                    )
         return self._step(
             "documents_upload_loop_await",
             ctx,
@@ -2851,6 +2856,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             token_expires_at=expires,
             documents_processing_ack_at=processing_ack_at,
             more_docs_prompt_at=more_docs_prompt_at,
+            docs_last_upload_at=last_upload_at,
         )
 
     async def _send_pending_docs(

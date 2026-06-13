@@ -166,6 +166,10 @@ class OnboardingState(WorkflowState):
     # inbounds — the prompt fires once per burst (within the TTL), never per
     # doc. Reset implicitly by the TTL window.
     more_docs_prompt_at: str | None = None
+    # ISO timestamp of the most recent upload wave. Used to detect a NEW upload
+    # session (a gap since the last wave) so the checklist + "any more?" prompt
+    # fires once per session — not per wave (UAT 2026-06-13).
+    docs_last_upload_at: str | None = None
     # Deprecated (2026-06-12): replaced by the in-loop is_no/is_yes handling.
     # Retained for checkpoint back-compat; no longer read.
     more_docs_decision: str | None = None  # "yes" | "no" | None (not asked yet)

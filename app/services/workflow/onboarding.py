@@ -367,9 +367,14 @@ _SMART_SYSTEM_PROMPT = (
     "generally and point them to their Madad account for exact figures. If they "
     "ask why a document or detail is needed, explain simply that it verifies the "
     "business and assesses financing eligibility. For account-specific status you "
-    "don't know, reassure them the team is reviewing and it will update soon. "
-    "End by gently nudging them toward the current step. Never include a phone "
-    "number.\n\n"
+    "don't know, reassure them the team is reviewing and it will update soon.\n\n"
+    "CRITICAL — STAY IN YOUR LANE: Answer ONLY the question the user asked, then "
+    "STOP. Do NOT tell the user what to do next, do NOT ask them to upload, share "
+    "or provide anything, do NOT ask follow-up questions, and do NOT describe, "
+    "invent, or assume any application step or order — a separate system guides "
+    "them to the correct next step right after your reply. Never restate the step "
+    "or say things like 'shall I guide you' or 'what type of business do you "
+    "have'. Never include a phone number.\n\n"
     "GUARDRAILS: Be genuinely helpful. You CAN answer anything reasonably "
     "related to Madad, business or invoice financing, the application/onboarding "
     "process, the documents we ask for (what each one is, why it's needed, what "
@@ -1011,6 +1016,8 @@ def _next_step_hint(state: OnboardingState) -> str:
     step = state.history[-1].step if state.history else ""
     if step in {"campaign_send", "campaign_await"}:
         return "Please reply YES if you want to start, or NO to opt out."
+    if step in {"business_email_send", "business_email_await"}:
+        return "Right now I need your business email address. 📧"
     if step in {"consent_send", "consent_await"}:
         return "Right now I need your Commercial Registration (CR) as a PDF or photo."
     if step in {"eligibility_intake_send", "eligibility_intake_await"}:
@@ -1460,7 +1467,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             # fallback default already carries the YES/NO prompt. (user 2026-06-14)
             await self._contextual_off_script(
                 ctx, state, reply,
-                "Are you interested in financing for your business? "
+                default_answer="Are you interested in financing for your business? "
                 "Please reply YES or NO.",
             )
             entry_reply = "ASK"
@@ -2059,7 +2066,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             # (Groq), falling back to the upload nudge. (user 2026-06-14)
             await self._contextual_off_script(
                 ctx, state, reply,
-                "Whenever you're ready, please share your Commercial "
+                default_answer="Whenever you're ready, please share your Commercial "
                 "Registration (CR) as a PDF or a clear photo. 🙂",
             )
             return self._step("consent_await", ctx, consent=False)
@@ -2191,8 +2198,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             # prompt verbatim. (user 2026-06-14)
             await self._contextual_off_script(
                 ctx, state, reply,
-                "When you're ready, please share the quick business details we "
-                "asked for so we can check your eligibility. 🙂",
+                default_answer="When you're ready, please share the quick business "
+                "details we asked for so we can check your eligibility. 🙂",
             )
         await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
         return self._step(
@@ -2335,8 +2342,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             # back to the upload nudge. (user 2026-06-14)
             await self._contextual_off_script(
                 ctx, state, reply,
-                "Whenever you're ready, please share your latest Audited "
-                "Financial Statement as a PDF or a clear photo. 🙂",
+                default_answer="Whenever you're ready, please share your latest "
+                "Audited Financial Statement as a PDF or a clear photo. 🙂",
             )
             return self._step("financials_await", ctx, financials_received=False)
         first = attachments[0]
@@ -2473,8 +2480,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             # falling back to the buyer-details nudge. (user 2026-06-14)
             await self._contextual_off_script(
                 ctx, state, reply,
-                "When you're ready, please share your main buyer's details "
-                "(name, country, and contact). 🙂",
+                default_answer="When you're ready, please share your main buyer's "
+                "details (name, country, and contact). 🙂",
             )
             return self._step("buyers_collect_await", ctx, buyers=list(state.buyers))
         if data and state.access_token:
@@ -2579,8 +2586,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             # (Groq), falling back to the shareholder-details nudge.
             await self._contextual_off_script(
                 ctx, state, reply,
-                "When you're ready, please share your shareholders' details "
-                "(name and percentage). 🙂",
+                default_answer="When you're ready, please share your shareholders' "
+                "details (name and percentage). 🙂",
             )
             return self._step(
                 "shareholders_collect_await", ctx, shareholders=list(state.shareholders)
@@ -4561,8 +4568,10 @@ class OnboardingWorkflow(WorkflowDefinition):
         hint = _next_step_hint(state)
         answer = await _llm_answer(reply_text(reply), hint)
         if answer:
-            # The model already nudges toward the next step, so don't repeat it.
-            next_step = ""
+            # The model answers ONLY the question (told not to invent/restate
+            # steps); WE append the deterministic current-step nudge so guidance
+            # never deviates from the real flow (user 2026-06-14).
+            next_step = hint
         else:
             answer = fallback_answer
             next_step = hint

@@ -578,6 +578,12 @@ def _parse_shareholder_text(text: str, fallback_phone: str | None) -> list[dict[
 # messages in 3 seconds. 30s covers a typical multi-file burst plus a small
 # buffer; anything older is treated as a fresh batch and re-fires the ack.
 DOCS_PROCESSING_ACK_TTL_SECONDS = 30.0
+# Single isolated file → prompt inline immediately (like a ZIP), no 45s sweep
+# wait (user 2026-06-13). A wave counts as isolated when it carries one
+# attachment AND the previous upload was either the first ever or this far in
+# the past — i.e. NOT part of a rapid bulk burst (those still defer to the
+# settle sweep so we don't fire one checklist per file).
+DOCS_SINGLE_INLINE_GAP_SECONDS = 90.0
 # The "any more documents?" prompt is debounced to once per upload burst — a
 # ZIP / multi-doc upload arrives as many separate inbounds and must not yield
 # one prompt per file (user 2026-06-12).
@@ -2923,19 +2929,32 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-        # ZIP end-of-batch prompt (user 2026-06-13): a ZIP is a SINGLE upload we
-        # process FULLY in one server-side classify call — so the moment we reach
-        # here the whole batch is done and we don't need to guess when uploads
-        # "finished". Send the checklist + tappable YES/NO prompt ONCE, inline,
-        # right now — received-aware so uploaded-but-⏳ docs show as "received,
-        # under review" instead of being re-listed as "still needed" — and
-        # suppress the settle sweep for this run so it can't fire a premature or
-        # duplicate checklist mid-batch. NON-ZIP bulk uploads are UNCHANGED: they
-        # arrive as many waves with no reliable "finished" signal, so they still
-        # defer to the status-poller settle sweep (docs_settle_prompted re-armed
-        # to False below).
-        zip_settled = bool(saw_zip and missing and not state.docs_settle_prompted)
-        if zip_settled:
+        # End-of-batch prompt, inline (user 2026-06-13): a ZIP is processed FULLY
+        # in one server-side classify call, and a SINGLE isolated file is likewise
+        # self-contained — in both cases the moment we reach here the upload is
+        # done, so send the checklist + tappable YES/NO prompt ONCE, inline, right
+        # now. Received-aware so uploaded-but-⏳ docs show as "received, under
+        # review" instead of being re-listed as "still needed"; sets
+        # docs_settle_prompted=True to suppress the settle sweep (no 45s wait, no
+        # premature/duplicate checklist).
+        #
+        # A BULK burst arrives as many waves; we keep it on the sweep by treating
+        # a one-attachment wave as "single" ONLY when isolated — the first upload
+        # ever, or >90s after the previous one. Rapid bulk waves (<=90s apart)
+        # fall through to the sweep so we don't fire a checklist per file (only a
+        # bulk's very first wave can trip this — bounded to one extra checklist,
+        # which the user accepted "for now").
+        prior_upload = _parse_iso_or_none(state.docs_last_upload_at)
+        upload_gap = (now - prior_upload).total_seconds() if prior_upload else None
+        single_isolated = len(attachments) == 1 and (
+            upload_gap is None or upload_gap > DOCS_SINGLE_INLINE_GAP_SECONDS
+        )
+        settle_now = bool(
+            (saw_zip or single_isolated)
+            and missing
+            and not state.docs_settle_prompted
+        )
+        if settle_now:
             try:
                 await self._send_pending_docs(
                     ctx, state, list(missing), received=docs_acked
@@ -2943,8 +2962,8 @@ class OnboardingWorkflow(WorkflowDefinition):
                 await self._send_more_docs_prompt(ctx, state)
                 more_docs_prompt_at = last_upload_at
             except Exception as exc:  # noqa: BLE001 — fall back to the sweep
-                ctx.logger.warning("zip_settle_prompt.failed", error=str(exc)[:200])
-                zip_settled = False
+                ctx.logger.warning("inline_settle_prompt.failed", error=str(exc)[:200])
+                settle_now = False
         return self._step(
             "documents_upload_loop_await",
             ctx,
@@ -2958,7 +2977,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             more_docs_prompt_at=more_docs_prompt_at,
             docs_last_upload_at=last_upload_at,
             docs_acked=docs_acked,
-            docs_settle_prompted=zip_settled,
+            docs_settle_prompted=settle_now,
         )
 
     async def _send_pending_docs(

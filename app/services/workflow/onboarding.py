@@ -2097,13 +2097,17 @@ class OnboardingWorkflow(WorkflowDefinition):
     ) -> dict[str, Any]:
         token, refresh, expires = await self._live_token(state, ctx)
         # Classify-and-upload (not the forced CR upload) so we learn what the
-        # doc ACTUALLY is. A real CR classifies as commercial_registration and
-        # lands in the CR slot exactly as before; a random doc classifies as
-        # something else and we suppress the "registered in Qatar — all good"
-        # affirmation downstream (user 2026-06-13: demo can't claim Qatar
-        # registration when the SME uploaded a non-CR). Default stays True so a
-        # classifier miss never drops the line on a genuine CR.
-        cr_verified = state.cr_verified
+        # doc ACTUALLY is, and ONLY claim "registered in Qatar — all good"
+        # downstream when the classifier CONFIRMS it's a Commercial Registration.
+        # Default FALSE (user 2026-06-14: uploading a LOGO still got the Qatar
+        # line — because the old default was True and a logo classifies as
+        # 'additional_document'/uncertain, which didn't flip it). Now: the
+        # affirmation shows ONLY on a confident commercial_registration; a logo,
+        # any other doc type, 'additional_document', or a classifier
+        # timeout/error all leave it False → no false Qatar claim. A genuine CR
+        # that fails to classify just misses the affirmation line (the financials
+        # request still goes out) — far better than asserting Qatar for a non-CR.
+        cr_verified = False
         if token and state.cr_ref:
             try:
                 resp = await self._kyc.classify_and_upload_document_base64(
@@ -2121,12 +2125,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                     )
                     if isinstance(raw, str) and raw:
                         detected = _workflow_doc_type(raw)
-                # Only flip the verdict when the classifier confidently named a
-                # type: a CONFIRMED non-CR (and not the catch-all
-                # "additional_document") → not a CR. Unknown / no type → keep the
-                # default so a real CR is never wrongly downgraded.
-                if detected and detected != "additional_document":
-                    cr_verified = detected == "commercial_registration"
+                cr_verified = detected == "commercial_registration"
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
                     "cr_upload.failed", error=str(exc)[:200],

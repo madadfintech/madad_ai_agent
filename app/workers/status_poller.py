@@ -34,10 +34,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import structlog
+
 from app.services.workflow.deps import OnboardingPlatform, get_onboarding_platform
 from app.services.workflow.state import JourneyStatus
 from app.shared.workflow.enums import RunStatus
 from app.shared.workflow.persistence import WorkflowRun
+
+logger = structlog.get_logger(__name__)
 
 # Polling step names — the only awaits this worker advances.
 POLLABLE_STEPS: frozenset[str] = frozenset({"journey_wait_await", "lender_wait_await"})
@@ -137,22 +141,36 @@ async def _maybe_settle_docs(
         return False
     values = await _read_state(platform, run)
     if not values:
+        logger.info("docs_settle.skip", run_id=run.run_id, reason="no_state")
         return False
     missing = values.get("missing_documents") or []
+    last_upload_raw = values.get("docs_last_upload_at")
+    last_upload = (
+        _parse_iso(last_upload_raw) if isinstance(last_upload_raw, str) else last_upload_raw
+    )
+    if last_upload is not None and last_upload.tzinfo is None:
+        last_upload = last_upload.replace(tzinfo=UTC)
+    quiet_for = (now - last_upload).total_seconds() if last_upload else None
+    logger.info(
+        "docs_settle.eval",
+        run_id=run.run_id,
+        missing=len(missing),
+        prompted=bool(values.get("docs_settle_prompted")),
+        last_upload=last_upload_raw,
+        quiet_for=quiet_for,
+    )
     if not missing:
         return False  # checklist complete → the coffee/complete path handles it
     if values.get("docs_settle_prompted"):
         return False  # already prompted for this quiet period
-    last_upload = values.get("docs_last_upload_at")
-    if isinstance(last_upload, str):
-        last_upload = _parse_iso(last_upload)
-    if last_upload is None or (now - last_upload) < DOCS_SETTLE_QUIET:
+    if last_upload is None or quiet_for is None or quiet_for < DOCS_SETTLE_QUIET.total_seconds():
         return False  # still actively uploading — wait for quiet
     await platform.dispatcher.resume_external(
         run.channel,
         run.identity,
         {"type": "docs_settle"},
     )
+    logger.info("docs_settle.fired", run_id=run.run_id)
     return True
 
 
@@ -179,8 +197,11 @@ async def run_status_poller(
             try:
                 if await _maybe_settle_docs(platform, run, now):
                     stats.polled += 1
-            except Exception:  # noqa: BLE001 — one bad run shouldn't kill the tick
+            except Exception as exc:  # noqa: BLE001 — one bad run shouldn't kill the tick
                 stats.failed += 1
+                logger.warning(
+                    "docs_settle.error", run_id=run.run_id, error=str(exc)[:300]
+                )
             continue
         if run.current_step not in POLLABLE_STEPS:
             stats.skipped_step += 1

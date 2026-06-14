@@ -810,6 +810,26 @@ def _format_banks_list(banks: list[str]) -> str:
     return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
 
 
+def _offer_date_key(offer: dict[str, Any]) -> str:
+    """Sort key for offers — older-offered-first (user UAT 2026-06-14).
+
+    Tries each timestamp field the backend has used (camelCase + snake_case).
+    Returns an ISO-8601 string when present so direct lexicographic sort
+    gives chronological order. Offers without any date sort to the end so a
+    missing date can't shuffle the rest."""
+    for k in (
+        "createdAt", "created_at",
+        "offeredAt", "offered_at",
+        "createdDate", "created_date",
+        "submittedAt", "submitted_at",
+    ):
+        v = offer.get(k)
+        if isinstance(v, str) and v:
+            return v
+    # Past offers sort first; dateless offers go to the end ("￿" > any ISO).
+    return "￿"
+
+
 def _extract_offers_from_me(info: Any) -> list[dict[str, Any]]:
     """Read the offer list off an ``auth_me`` response.
 
@@ -820,6 +840,8 @@ def _extract_offers_from_me(info: Any) -> list[dict[str, Any]]:
     are ready!" template (UAT screenshot 2026-06-10). Try every shape
     the backend is known to use so a one-off field rename can't drop
     offers on the floor again.
+
+    Sorted chronologically per UAT 2026-06-14 — first-offered first.
     """
 
     if not isinstance(info, dict):
@@ -830,7 +852,10 @@ def _extract_offers_from_me(info: Any) -> list[dict[str, Any]]:
         for key in ("offersReceived", "offers", "offer_list"):
             raw = owner.get(key)
             if isinstance(raw, list):
-                return [o for o in raw if isinstance(o, dict)]
+                return sorted(
+                    (o for o in raw if isinstance(o, dict)),
+                    key=_offer_date_key,
+                )
     return []
 
 
@@ -2701,29 +2726,18 @@ class OnboardingWorkflow(WorkflowDefinition):
                 if progress_step is not None:
                     fields["onboarding_progress_step"] = progress_step
             return self._step("documents_upload_loop_await", ctx, **fields)
-        # End-of-upload settle (UAT 2026-06-13): the status-poller sweep resumes
-        # this run with a synthetic ``docs_settle`` event once the SME has stopped
-        # uploading for the quiet window. THIS is where the checklist + the
-        # tappable YES/NO button prompt are sent — from the workflow, so the
-        # buttons are interactive — exactly once per quiet period, at the very
-        # end of the batch (never mid-upload). Re-armed by each new upload wave
-        # (which clears docs_settle_prompted).
+        # End-of-upload settle (UAT 2026-06-14): the status-poller sweep
+        # still resumes this run with a synthetic ``docs_settle`` event,
+        # but per user we no longer send the checklist + YES/NO prompt
+        # during the upload phase. The flow advances purely via backend
+        # events (madad_score.ready / journey_status → QUALIFIED+) or the
+        # user's own NO escape hatch. Mark the sweep handled so the
+        # poller doesn't keep re-arming, and stay parked silently.
         if _is_docs_settle(reply):
-            if state.missing_documents and not state.docs_settle_prompted:
-                try:
-                    await self._send_pending_docs(
-                        ctx, state, list(state.missing_documents)
-                    )
-                    await self._send_more_docs_prompt(ctx, state)
-                except Exception as exc:  # noqa: BLE001
-                    ctx.logger.warning(
-                        "docs_settle_prompt.failed", error=str(exc)[:200]
-                    )
             return self._step(
                 "documents_upload_loop_await",
                 ctx,
                 docs_settle_prompted=True,
-                more_docs_prompt_at=ctx.clock.now().isoformat(),
                 missing_documents=list(state.missing_documents),
                 documents_received=False,
             )
@@ -3070,41 +3084,12 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-        # End-of-batch prompt, inline (user 2026-06-13): a ZIP is processed FULLY
-        # in one server-side classify call, and a SINGLE isolated file is likewise
-        # self-contained — in both cases the moment we reach here the upload is
-        # done, so send the checklist + tappable YES/NO prompt ONCE, inline, right
-        # now. Received-aware so uploaded-but-⏳ docs show as "received, under
-        # review" instead of being re-listed as "still needed"; sets
-        # docs_settle_prompted=True to suppress the settle sweep (no 45s wait, no
-        # premature/duplicate checklist).
-        #
-        # A BULK burst arrives as many waves; we keep it on the sweep by treating
-        # a one-attachment wave as "single" ONLY when isolated — the first upload
-        # ever, or >90s after the previous one. Rapid bulk waves (<=90s apart)
-        # fall through to the sweep so we don't fire a checklist per file (only a
-        # bulk's very first wave can trip this — bounded to one extra checklist,
-        # which the user accepted "for now").
-        prior_upload = _parse_iso_or_none(state.docs_last_upload_at)
-        upload_gap = (now - prior_upload).total_seconds() if prior_upload else None
-        single_isolated = len(attachments) == 1 and (
-            upload_gap is None or upload_gap > DOCS_SINGLE_INLINE_GAP_SECONDS
-        )
-        settle_now = bool(
-            (saw_zip or single_isolated)
-            and missing
-            and not state.docs_settle_prompted
-        )
-        if settle_now:
-            try:
-                await self._send_pending_docs(
-                    ctx, state, list(missing), received=docs_acked
-                )
-                await self._send_more_docs_prompt(ctx, state)
-                more_docs_prompt_at = last_upload_at
-            except Exception as exc:  # noqa: BLE001 — fall back to the sweep
-                ctx.logger.warning("inline_settle_prompt.failed", error=str(exc)[:200])
-                settle_now = False
+        # Per user 2026-06-14: no inline checklist + YES/NO prompt during
+        # the upload phase. The brief per-upload receipt (single_received)
+        # is the only ack the SME sees while uploading. Flow advances via
+        # backend events (madad_score.ready / status → QUALIFIED+) or the
+        # user's own NO escape hatch. docs_settle_prompted is left in the
+        # state schema only because the settle-sweep early-return reads it.
         return self._step(
             "documents_upload_loop_await",
             ctx,
@@ -3118,7 +3103,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             more_docs_prompt_at=more_docs_prompt_at,
             docs_last_upload_at=last_upload_at,
             docs_acked=docs_acked,
-            docs_settle_prompted=settle_now,
+            docs_settle_prompted=state.docs_settle_prompted,
         )
 
     async def _send_pending_docs(
@@ -3590,10 +3575,23 @@ class OnboardingWorkflow(WorkflowDefinition):
             list(result.get("products", [])) if isinstance(result, dict) else []
         )
         product = products[0] if products else {}
+        # Capture the live amount per UAT 2026-06-14 so downstream nodes
+        # don't fall back to the hardcoded ONBOARDING_FEE_QAR — accepts
+        # ``amount_qar`` (snake) or ``amountQar`` (camel) or ``amount``.
+        amount_raw = (
+            product.get("amount_qar")
+            or product.get("amountQar")
+            or product.get("amount")
+        )
+        try:
+            amount_qar: int | None = int(amount_raw) if amount_raw is not None else None
+        except (TypeError, ValueError):
+            amount_qar = None
         return self._step(
             "products_list_fetch",
             ctx,
             payment_product_id=product.get("product_id"),
+            payment_amount_qar=amount_qar,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
         )
 
@@ -3611,7 +3609,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             access_token=token,
             business_details_id=state.business_details_id,
             product_id=state.payment_product_id,
-            amount_qar=ONBOARDING_FEE_QAR,
+            amount_qar=state.payment_amount_qar or ONBOARDING_FEE_QAR,
             idempotency_key=key,
         )
         payment_id = result.get("payment_id") if isinstance(result, dict) else None
@@ -3651,7 +3649,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         # backend's send-monetization-payment-link tool (it routes through
         # an upstream notification provider that has been flaky in UAT and
         # adds no value over our own send).
-        amount = f"{ONBOARDING_FEE_QAR:,}"
+        amount = f"{(state.payment_amount_qar or ONBOARDING_FEE_QAR):,}"
         score = state.madad_score if state.madad_score is not None else 78
         variables = {
             "amount":         amount,
@@ -4344,7 +4342,14 @@ class OnboardingWorkflow(WorkflowDefinition):
     def _route_journey_status(self, state: OnboardingState) -> str:
         s = state.journey_status
         if s in (JourneyStatus.PRE_QUALIFIED, JourneyStatus.QUALIFIED):
-            return "payment"
+            # UAT 2026-06-14: after offer handoff the run parks at
+            # journey_wait_await; the status poller fires from there and a
+            # transient PRE_QUALIFIED / QUALIFIED read from /me used to
+            # re-route through business_details_fetch → payment_send_link,
+            # showing the SME a SECOND "Pay QAR X →" button AFTER offers
+            # were already in. If they've already paid, stay parked and
+            # wait for the next real status update.
+            return "wait" if state.paid else "payment"
         if s == JourneyStatus.IN_ELIGIBLE:
             return "ineligible"
         if s in (JourneyStatus.UNQUALIFIED, JourneyStatus.NOT_ACCEPTED):

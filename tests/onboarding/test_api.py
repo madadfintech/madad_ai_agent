@@ -54,11 +54,12 @@ def test_full_flow_over_http() -> None:
     assert started.json()["waiting"] is True
     assert started.json()["prompt"]["step"] == "campaign"
 
-    # Post-main spec-aligned flow: YES → consent_cr direct (no collect_details
-    # form), CR → financials direct (no 7-field eligibility form), audited →
-    # PARK(prequalify_wait), prequalification.completed → documents, doc upload
-    # → PARK(journey_wait or payment_wait depending on path), payment chain.
-    assert _inbound(text="YES").json()["prompt"]["step"] == "consent_cr"
+    # Post-main spec-aligned flow + PR #5/#6 (2026-06-10): YES →
+    # business_email → consent_cr, CR → financials, audited →
+    # PARK(prequalify_wait), prequalification.completed → documents,
+    # doc upload → payment chain.
+    assert _inbound(text="YES").json()["prompt"]["step"] == "business_email"
+    assert _inbound(text="biz@example.com").json()["prompt"]["step"] == "consent_cr"
     assert (
         _inbound(attachments=[{"filename": "CR.pdf", "content_base64": DOC}]).json()["prompt"]["step"]  # noqa: E501
         == "financials"
@@ -96,11 +97,37 @@ def test_full_flow_over_http() -> None:
     paid = _backend_event("payment.completed", {"paid": True}, event_id="evt-paid")
     assert paid.json()["prompt"]["step"] == "lender_wait"
 
-    # ACCEPTED → offers_fetch → offer handoff terminal.
+    # Ishan 17c3d44 (2026-06-11): the run no longer COMPLETES at offer
+    # handoff — it parks at ``journey_wait_await`` so the post-handoff
+    # offer.accepted / credit_line.activated webhooks can fire the ✅
+    # confirmation and 🎊 activation messages.
     platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
-    final = _backend_event("offers.available", event_id="evt-offers")
-    assert final.json()["completed"] is True
-    assert final.json()["outcome"] == "offer_handoff"
+    handed_off = _backend_event("offers.available", event_id="evt-offers")
+    assert handed_off.json()["completed"] is False
+    assert handed_off.json()["prompt"]["step"] == "journey_wait"
+
+    # offer.accepted → ✅ confirmation; still parked for activation.
+    platform.workflow._identity.journey_status = "OFFER_ACCEPTED"  # type: ignore[union-attr]
+    confirmed = _backend_event(
+        "offer.accepted",
+        {"lenderName": "Qatar Islamic Bank"},
+        event_id="evt-accepted",
+    )
+    assert confirmed.json()["completed"] is False
+    assert confirmed.json()["prompt"]["step"] == "journey_wait"
+
+    # credit_line.activated → ACTIVATED → 🎊 activation → invoice_collect.
+    # The run stays open (not terminated) so the SME can submit invoices
+    # over WhatsApp once the line is live (PDF Steps 10-13).
+    platform.workflow._identity.journey_status = "ACTIVATED"  # type: ignore[union-attr]
+    activated = _backend_event(
+        "credit_line.activated",
+        {"lenderName": "Qatar Islamic Bank"},
+        event_id="evt-activated",
+    )
+    assert activated.json()["completed"] is False
+    assert activated.json()["prompt"]["step"] == "invoice_collect"
+    assert activated.json()["outcome"] == "completed"
 
 
 def test_unknown_backend_event_rejected_with_400() -> None:

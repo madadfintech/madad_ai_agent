@@ -233,6 +233,10 @@ class OnboardingState(WorkflowState):
     # -- Step 5: monetization payment (Phase 3 will populate) ----------------
     business_details_id: str | None = None
     payment_product_id: str | None = None
+    # Live amount in QAR sourced from the monetization product (UAT 2026-06-14)
+    # so the SME-facing fee tracks whatever Madad ops priced the product at
+    # — no more hardcoded "QAR 6,000" when ops bumps the fee.
+    payment_amount_qar: int | None = None
     payment_id: str | None = None
     payment_link: str | None = None
     payment_provider_ref: str | None = None  # Tess providerOrderNumber

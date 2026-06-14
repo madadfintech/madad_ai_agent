@@ -54,8 +54,12 @@ async def test_returning_user_terminal_statuses(
     _returning(harness, journey_status)
 
     runtime = harness.platform.runtime
-    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    result = await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+    # Per Ishan (2026-06-10): cold-start entry_registration_check runs
+    # BEFORE campaign_send, so a returning user's run terminates at
+    # ``runtime.start`` itself — no YES needed.
+    result = await runtime.start(
+        "onboarding", WA, IDENTITY, input={"trigger": "campaign"}
+    )
 
     assert result.status == RunStatus.COMPLETED, (
         f"{journey_status} should complete, got {result.status}"
@@ -114,7 +118,9 @@ async def test_referenceNumber_threaded_into_state(make_harness) -> None:
     _returning(harness, "QUALIFIED", referenceNumber="7388266")
 
     runtime = harness.platform.runtime
-    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    result = await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+    # Returning-user terminates at start (cold-start entry check).
+    result = await runtime.start(
+        "onboarding", WA, IDENTITY, input={"trigger": "campaign"}
+    )
 
     assert result.values["application_ref"] == "7388266"

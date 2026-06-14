@@ -55,6 +55,7 @@ async def test_onboarding_drives_real_communication_and_nudge():
 
     doc = "ZHVtbXk="
     await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})  # business_email
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
@@ -71,9 +72,17 @@ async def test_onboarding_drives_real_communication_and_nudge():
     await resume({"event": "madad_score.ready", "journey_status": "QUALIFIED"})
     await resume({"type": "payment", "paid": True})
     platform.workflow._identity.journey_status = "ACCEPTED"  # type: ignore[union-attr]
-    result = await resume({"type": "status_update"})
+    await resume({"type": "status_update"})
+    # Ishan 17c3d44 (2026-06-11): run parks after handoff so post-handoff
+    # webhooks fire — drive through OFFER_ACCEPTED + ACTIVATED to exercise
+    # the full new path. Run stays open at invoice_collect afterwards.
+    platform.workflow._identity.journey_status = "OFFER_ACCEPTED"  # type: ignore[union-attr]
+    await resume({"type": "status_update", "lenderName": "Qatar Islamic Bank"})
+    platform.workflow._identity.journey_status = "ACTIVATED"  # type: ignore[union-attr]
+    result = await resume({"type": "status_update", "lenderName": "Qatar Islamic Bank"})
 
-    assert result.status == RunStatus.COMPLETED
+    assert result.status == RunStatus.WAITING_FOR_INPUT
+    assert result.prompt == {"waiting_for": "invoice", "step": "invoice_collect"}
 
     # Communication rendered + recorded real messages from CMS templates.
     conversation = await comms.resolve_conversation(WA, IDENTITY)

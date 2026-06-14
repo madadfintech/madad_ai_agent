@@ -27,6 +27,7 @@ DOC = "ZHVtbXk="
 async def _drive_to_documents(harness, runtime) -> None:
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
     await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+    await runtime.resume(WA, IDENTITY, message={"text": "biz@example.com"})  # business_email
     await runtime.resume(
         WA, IDENTITY, message={"attachments": [{"filename": "CR.pdf", "content_base64": DOC}]}
     )

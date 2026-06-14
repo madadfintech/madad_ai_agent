@@ -28,9 +28,11 @@ async def _drive_to_completion(harness):
     assert start.waiting
     assert start.prompt == {"waiting_for": "reply", "step": "campaign"}
 
-    # YES → consent_cr direct (existing-user fast-path via create_user_if_missing).
+    # YES → business_email step (PR #5/#6, 2026-06-10) → consent_cr.
     after_yes = await resume({"text": "YES"})
-    assert after_yes.prompt == {"waiting_for": "upload", "step": "consent_cr"}
+    assert after_yes.prompt == {"waiting_for": "email", "step": "business_email"}
+    after_email = await resume({"text": "biz@example.com"})
+    assert after_email.prompt == {"waiting_for": "upload", "step": "consent_cr"}
 
     # CR upload → financials direct (auto-eligibility, no 7-field form).
     after_cr = await resume({"attachments": [{"filename": "CR.pdf", "content_base64": "ZHVtbXk="}]})
@@ -66,15 +68,28 @@ async def _drive_to_completion(harness):
     assert after_pay.prompt == {"waiting_for": "journey_status", "step": "lender_wait"}
 
     # Backend advances → ACCEPTED → offers_fetch → offer_view → handoff.
+    # Ishan 17c3d44 (2026-06-11): the run no longer completes at handoff;
+    # it parks at journey_wait_await so the post-handoff offer.accepted +
+    # credit_line.activated webhooks can fire the ✅ confirmation and
+    # 🎊 activation messages, then transitions into invoice_collect_await
+    # so the SME can submit invoices once the line is live.
     harness.identity.journey_status = "ACCEPTED"
-    return await resume({"type": "status_update"})
+    await resume({"type": "status_update"})
+    harness.identity.journey_status = "OFFER_ACCEPTED"
+    await resume({"type": "status_update", "lenderName": "Qatar Islamic Bank"})
+    harness.identity.journey_status = "ACTIVATED"
+    return await resume({"type": "status_update", "lenderName": "Qatar Islamic Bank"})
 
 
 async def test_full_onboarding_completes(harness):
     result = await _drive_to_completion(harness)
 
-    assert result.status == RunStatus.COMPLETED
-    assert result.values["outcome"] == "offer_handoff"
+    # Run stays open at invoice_collect after activation — the SME can now
+    # submit invoices over WhatsApp. ``outcome="completed"`` is the marker
+    # that onboarding-proper finished; the run lives on for invoice work.
+    assert result.status == RunStatus.WAITING_FOR_INPUT
+    assert result.prompt == {"waiting_for": "invoice", "step": "invoice_collect"}
+    assert result.values["outcome"] == "completed"
     # collect_details step is gone — onboarding_first_name / onboarding_last_name
     # are no longer captured. CR upload + financials + docs still are.
     assert result.values["consent"] is True
@@ -97,6 +112,11 @@ async def test_messages_sent_once_in_order(harness):
     # skipped on the QUALIFY-mid-docs path the helper drives — the
     # checklist isn't naturally complete, admin overrode it, and the
     # coffee message would misrepresent the SME's state.
+    # UAT 2026-06-10: the offers preview + handoff used to fire as TWO
+    # bubbles. Combined into a single CTA-URL message via
+    # ``onboarding.offer.handoff.button`` — ``offers.preview`` is now
+    # a back-compat fallback only and no longer fires on the WhatsApp
+    # happy path.
     expected_subset = [
         "onboarding.campaign.intro",
         "onboarding.consent.request",
@@ -104,7 +124,6 @@ async def test_messages_sent_once_in_order(harness):
         "onboarding.account.created",
         "onboarding.documents.checklist",
         "onboarding.payment.request.button",
-        "onboarding.offers.preview",
         "onboarding.offer.handoff.button",
     ]
     for tpl in expected_subset:
@@ -159,14 +178,22 @@ async def test_existing_user_skips_collect_details_branch(make_harness):
     # YES → check_contact → known phone → existing branch → channel_session_first
     # → consent (NO collect_details prompt at all).
     after_yes = await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})  # business_email
     assert after_yes.prompt == {"waiting_for": "upload", "step": "consent_cr"}
 
     identity_calls = [name for name, _ in harness.identity.calls]
-    # check_contact + check_registration (read-only, returns
-    # registered=False by default — fall through to existing path) +
-    # open_session (single bridge call for existing user, no
-    # complete_onboarding, no second session).
-    assert identity_calls == ["check_contact", "check_registration", "open_session"]
+    # Cold-start entry (Ishan 2026-06-10): check_registration fires FIRST
+    # at entry_registration_check, returns False (opt-in fake), then
+    # check_contact fires, then check_registration fires AGAIN inside
+    # check_contact_send because the entry's check returned no route
+    # (guard only short-circuits when a route was already captured).
+    # Finally open_session for the existing-user path.
+    assert identity_calls == [
+        "check_registration",
+        "check_contact",
+        "check_registration",
+        "open_session",
+    ]
 
 
 async def test_locale_propagates(make_harness):

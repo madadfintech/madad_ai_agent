@@ -211,6 +211,7 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
     # direct, audited → PARK(prequalify_wait), webhook → documents, doc upload
     # → PARK(payment_wait), score event → payment chain.
     await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})  # business_email
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": "QkE="}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": "QkE="}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
@@ -234,12 +235,19 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
     after_pay = await resume({"type": "payment", "paid": True})
     assert after_pay.prompt == {"waiting_for": "journey_status", "step": "lender_wait"}
 
-    # Backend advances → ACCEPTED → offers_fetch → offer_view → handoff.
+    # Ishan 17c3d44 (2026-06-11): the run now parks after offer handoff so
+    # post-handoff webhooks fire — drive through OFFER_ACCEPTED + ACTIVATED.
     backend_state["journey_status"] = "ACCEPTED"
-    final = await resume({"type": "status_update"})
+    await resume({"type": "status_update"})
+    backend_state["journey_status"] = "OFFER_ACCEPTED"
+    await resume({"type": "status_update", "lenderName": "Qatar Islamic Bank"})
+    backend_state["journey_status"] = "ACTIVATED"
+    final = await resume({"type": "status_update", "lenderName": "Qatar Islamic Bank"})
 
-    assert final.status == RunStatus.COMPLETED
-    assert final.values["outcome"] == "offer_handoff"
+    # Run stays open at invoice_collect after the credit line goes active.
+    assert final.status == RunStatus.WAITING_FOR_INPUT
+    assert final.prompt == {"waiting_for": "invoice", "step": "invoice_collect"}
+    assert final.values["outcome"] == "completed"
     # offers were extracted from the auth_me embedded list.
     assert len(final.values["offers"]) == 2
 

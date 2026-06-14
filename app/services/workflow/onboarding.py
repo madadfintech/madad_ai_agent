@@ -2727,13 +2727,45 @@ class OnboardingWorkflow(WorkflowDefinition):
                     fields["onboarding_progress_step"] = progress_step
             return self._step("documents_upload_loop_await", ctx, **fields)
         # End-of-upload settle (UAT 2026-06-14): the status-poller sweep
-        # still resumes this run with a synthetic ``docs_settle`` event,
-        # but per user we no longer send the checklist + YES/NO prompt
-        # during the upload phase. The flow advances purely via backend
-        # events (madad_score.ready / journey_status → QUALIFIED+) or the
-        # user's own NO escape hatch. Mark the sweep handled so the
-        # poller doesn't keep re-arming, and stay parked silently.
+        # resumes this run with a synthetic ``docs_settle`` event after a
+        # quiet window with no new uploads. Per user we no longer ASK the
+        # SME "any more?" — but the flow must still advance silently or
+        # the run gets stuck (UAT 2026-06-14: ZIP upload acked 8 ✅ + 3 ⏳,
+        # then nothing). Auto-proceed when the SME has uploaded enough:
+        # either every required slot has been touched (validated OR ⏳ acked)
+        # OR the cumulative upload count has met the required threshold.
+        # Fire the coffee message once for closure, set docs_proceed=True
+        # so ``_route_documents`` advances to the next step.
         if _is_docs_settle(reply):
+            required = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+            acked = set(state.docs_acked)
+            all_required_touched = bool(required) and all(
+                d in acked or d not in state.missing_documents for d in required
+            )
+            enough_uploads = (
+                state.docs_uploaded_count >= len(required) if required else False
+            )
+            if state.docs_uploaded_count > 0 and (
+                all_required_touched or enough_uploads
+            ):
+                if not state.documents_complete_sent:
+                    try:
+                        await self._send(
+                            ctx, state, "onboarding.documents.complete"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        ctx.logger.warning(
+                            "docs_settle_complete.failed", error=str(exc)[:200]
+                        )
+                return self._step(
+                    "documents_upload_loop_await",
+                    ctx,
+                    docs_proceed=True,
+                    documents_complete_sent=True,
+                    docs_settle_prompted=True,
+                    missing_documents=list(state.missing_documents),
+                    documents_received=False,
+                )
             return self._step(
                 "documents_upload_loop_await",
                 ctx,

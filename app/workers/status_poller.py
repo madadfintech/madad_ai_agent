@@ -34,13 +34,30 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import structlog
+
 from app.services.workflow.deps import OnboardingPlatform, get_onboarding_platform
 from app.services.workflow.state import JourneyStatus
 from app.shared.workflow.enums import RunStatus
 from app.shared.workflow.persistence import WorkflowRun
 
+logger = structlog.get_logger(__name__)
+
 # Polling step names — the only awaits this worker advances.
 POLLABLE_STEPS: frozenset[str] = frozenset({"journey_wait_await", "lender_wait_await"})
+
+# Document-upload await: the settle sweep resumes a run parked here once the SME
+# has stopped uploading, so the workflow can send the end-of-batch checklist +
+# tappable YES/NO button prompt (UAT 2026-06-13).
+DOCS_UPLOAD_STEP = "documents_upload_loop_await"
+# How long the upload stream must be quiet before we fire the settle prompt.
+# A ZIP (or multi-file bulk) reaches us as separate inbound waves, and each
+# member's classify+upload can take up to ~25s — so consecutive waves can be
+# >25s apart. At 25s the sweep fired BETWEEN waves and rendered a stale partial
+# checklist ("all but 2 still missing" right after a full upload — UAT
+# 2026-06-13). 45s comfortably absorbs the inter-wave gap so the checklist
+# reflects the whole batch, while staying well inside the SME's attention span.
+DOCS_SETTLE_QUIET = timedelta(seconds=45)
 
 # Cadence per journey-status group, expressed as a timedelta.
 CADENCE_OFFER = timedelta(seconds=60)   # ACCEPTED/OFFER_ACCEPTED — see below
@@ -118,6 +135,58 @@ async def _read_state(
     return values
 
 
+async def _maybe_settle_docs(
+    platform: OnboardingPlatform, run: WorkflowRun, now: datetime
+) -> bool:
+    """Resume a docs-upload run with a synthetic ``docs_settle`` event once the
+    SME has stopped uploading for ``DOCS_SETTLE_QUIET`` and required docs are
+    still missing — the cue for the workflow to send the end-of-batch checklist
+    + tappable YES/NO button prompt exactly once. Returns True if resumed."""
+
+    if run.channel is None or not run.identity:
+        return False
+    values = await _read_state(platform, run)
+    if not values:
+        logger.info("docs_settle.skip", run_id=run.run_id, reason="no_state")
+        return False
+    missing = values.get("missing_documents") or []
+    last_upload_raw = values.get("docs_last_upload_at")
+    last_upload = (
+        _parse_iso(last_upload_raw) if isinstance(last_upload_raw, str) else last_upload_raw
+    )
+    if last_upload is not None and last_upload.tzinfo is None:
+        last_upload = last_upload.replace(tzinfo=UTC)
+    quiet_for = (now - last_upload).total_seconds() if last_upload else None
+    logger.info(
+        "docs_settle.eval",
+        run_id=run.run_id,
+        missing=len(missing),
+        prompted=bool(values.get("docs_settle_prompted")),
+        last_upload=last_upload_raw,
+        quiet_for=quiet_for,
+    )
+    if not missing:
+        return False  # checklist complete → the coffee/complete path handles it
+    if not values.get("docs_acked"):
+        # Nothing actually received yet (an upload wave that classified to
+        # nothing usable can stamp docs_last_upload_at without acking a doc).
+        # Firing here re-sent the full "all N still needed" checklist — a
+        # verbatim repeat of the pre-qualified doc list, mid-batch (user
+        # 2026-06-13, ZIP flow). Wait until at least one doc has landed.
+        return False
+    if values.get("docs_settle_prompted"):
+        return False  # already prompted for this quiet period
+    if last_upload is None or quiet_for is None or quiet_for < DOCS_SETTLE_QUIET.total_seconds():
+        return False  # still actively uploading — wait for quiet
+    await platform.dispatcher.resume_external(
+        run.channel,
+        run.identity,
+        {"type": "docs_settle"},
+    )
+    logger.info("docs_settle.fired", run_id=run.run_id)
+    return True
+
+
 async def run_status_poller(
     platform: OnboardingPlatform | None = None, *, now: datetime | None = None
 ) -> PollerStats:
@@ -135,6 +204,18 @@ async def run_status_poller(
         RunStatus.WAITING_FOR_INPUT
     )
     for run in waiting:
+        if run.current_step == DOCS_UPLOAD_STEP:
+            # End-of-upload settle: resume the run so the workflow sends the
+            # checklist + tappable button prompt once uploads go quiet.
+            try:
+                if await _maybe_settle_docs(platform, run, now):
+                    stats.polled += 1
+            except Exception as exc:  # noqa: BLE001 — one bad run shouldn't kill the tick
+                stats.failed += 1
+                logger.warning(
+                    "docs_settle.error", run_id=run.run_id, error=str(exc)[:300]
+                )
+            continue
         if run.current_step not in POLLABLE_STEPS:
             stats.skipped_step += 1
             continue

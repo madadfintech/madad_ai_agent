@@ -98,6 +98,10 @@ class OnboardingState(WorkflowState):
     journey_status: JourneyStatus | None = None
     last_polled_at: datetime | None = None
     last_status_source: StatusSource | None = None
+    # Returning-user resume (set by _resume_status_fetch): whether the existing
+    # account already has an email on file. Drives the SIGN_UP/ONBOARDED resume
+    # split — no email → ask for it first; has email → straight to consent/CR.
+    account_has_email: bool | None = None
     # Step 1: new-lead onboarding-details capture (precedes complete_onboarding).
     # ALL 9 fields the cluster's AUTH_COMPLETE_ONBOARDING tool requires for a
     # fresh signup; email/phone are normally derived from the channel identity
@@ -124,6 +128,13 @@ class OnboardingState(WorkflowState):
     cr_filename: str | None = None
     cr_content_base64: str | None = None
     cr_mime_type: str | None = None
+    # Whether the document uploaded at the CR step CONFIRMED as a Commercial
+    # Registration. Gates the "registered in Qatar — all good" affirmation:
+    # defaults FALSE and is set True ONLY when the classifier confidently returns
+    # commercial_registration — so a logo / any other doc / classifier
+    # timeout/uncertainty never produces a false Qatar claim (user 2026-06-14:
+    # uploading a logo still triggered the line under the old default-True).
+    cr_verified: bool = False
 
     # Step 3–4: eligibility + financials.
     eligibility_form_data: dict[str, Any] = Field(default_factory=dict)
@@ -148,10 +159,35 @@ class OnboardingState(WorkflowState):
     # When this hits ``len(DEFAULT_WHATSAPP_REQUIRED_DOCS)`` the docs
     # loop unblocks even if some required slots are still pending.
     docs_uploaded_count: int = 0
-    # Tracks the SME's reply to the "any more documents to upload?" prompt
-    # that fires once the docs phase has produced enough uploads. NO → the
-    # run advances to payment_wait. YES → the run loops back to the docs
-    # upload-await node so they can keep sending.
+    # The coffee / "all documents received" message must fire exactly ONCE.
+    # Set True after _documents_complete sends it; _route_documents then
+    # re-parks silently in the upload-await node instead of re-sending it
+    # (user 2026-06-12 — kills the repeated "any more documents?" loop).
+    documents_complete_sent: bool = False
+    # The SME replied NO / "done" to the "any more documents?" prompt while
+    # some required docs were still undetected — proceed to the next step
+    # anyway (frustrated-user escape hatch, user 2026-06-12).
+    docs_proceed: bool = False
+    # Debounce for the "any more documents?" prompt: timestamp (ISO) of the
+    # last time it was sent. A 20-doc / ZIP burst arrives as 20 separate
+    # inbounds — the prompt fires once per burst (within the TTL), never per
+    # doc. Reset implicitly by the TTL window.
+    more_docs_prompt_at: str | None = None
+    # ISO timestamp of the most recent upload wave. Used to detect a NEW upload
+    # session (a gap since the last wave) so the checklist + "any more?" prompt
+    # fires once per session — not per wave (UAT 2026-06-13).
+    docs_last_upload_at: str | None = None
+    # Doc types we've already sent a receipt for (✅ validated or ⏳ received), so
+    # a multi-wave bulk upload never re-acknowledges the same doc — which
+    # previously produced contradictory "✅ X validated" then "⏳ X received"
+    # receipts and repeated ⏳ for the same file (UAT 2026-06-13).
+    docs_acked: list[str] = []
+    # Set once the end-of-upload settle prompt (checklist + tappable YES/NO
+    # buttons) has been sent for the current quiet period; reset on each new
+    # upload wave so a later batch re-arms it (UAT 2026-06-13).
+    docs_settle_prompted: bool = False
+    # Deprecated (2026-06-12): replaced by the in-loop is_no/is_yes handling.
+    # Retained for checkpoint back-compat; no longer read.
     more_docs_decision: str | None = None  # "yes" | "no" | None (not asked yet)
     # Bug #11 (UAT 2026-06-09): debounce the ``documents.processing`` ack
     # so the bridge's per-file POST burst (one inbound per ZIP-member,

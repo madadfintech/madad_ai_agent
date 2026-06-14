@@ -96,7 +96,6 @@ _TEMPLATE_BODIES = {
     # Business-email step — asked right after YES / account creation, before
     # the consent/CR step. Capturing it makes the lead portal-loginable.
     "onboarding.business_email.ask": (
-        "Your Madad account is all set! 🎉\n\n"
         "What's your business email? We'll use it for your account and to keep "
         "you updated on your application. 📧"
     ),
@@ -134,7 +133,10 @@ _TEMPLATE_BODIES = {
     ),
     "onboarding.financials.request": (
         "Awesome, thanks for sharing! 🙌\n\n"
-        "We can see that your business is registered in Qatar — all good so far! ✅\n\n"
+        # {{ cr_affirmation }} is the "registered in Qatar — all good" line, sent
+        # ONLY when the CR step's upload classified as a real CR (else empty, so a
+        # random/non-CR upload doesn't get a false Qatar-registration claim).
+        "{{ cr_affirmation }}"
         "To further assess your eligibility we need to know your financials. "
         "Please share your last Audited Financial Statement.\n\n"
         "For any query call us on +974 3017 3888."
@@ -149,7 +151,7 @@ _TEMPLATE_BODIES = {
         "Perfect! 🙌\n\n"
         "You will receive your pre-qualification result within 24 hours.\n\n"
         "Meanwhile, your account has been created on Madad with reference number "
-        "#{{ ref }}. You can login at madadfintech.com and track your status anytime."
+        "#{{ ref }}. You can login at uat-portal.madadfintech.com and track your status anytime."
     ),
     "onboarding.documents.checklist": (
         "🎉 Congratulations! Your business is pre-qualified for financing.\n\n"
@@ -173,7 +175,7 @@ _TEMPLATE_BODIES = {
         "11. QID   12. Passport\n\n"
         "ℹ️ Optional: Shareholder Proof of Address — send if you have it, "
         "but not required to proceed.\n\n"
-        "📤 Share the documents here or login at madadfintech.com to complete "
+        "📤 Share the documents here or login at uat-portal.madadfintech.com to complete "
         "your application.\n\n"
         "Please share your documents to move forward!"
     ),
@@ -217,6 +219,16 @@ _TEMPLATE_BODIES = {
         "Reply YES if you'd like to send more, or NO if you're done — "
         "we'll proceed with the next step."
     ),
+    # End-of-upload "settle" message (UAT 2026-06-13): the checklist + the
+    # any-more prompt in ONE message, fired ONCE by the docs_more_prompt nudge
+    # after the SME stops uploading — never mid-batch. ``{{ results }}`` is the
+    # current checklist body supplied by the workflow when it arms the nudge.
+    "onboarding.documents.settle_prompt": (
+        "{{ results }}\n\n"
+        "📄 Do you have any more documents to upload?\n\n"
+        "Reply YES if you'd like to send more, or NO if you're done — "
+        "we'll proceed with the next step."
+    ),
     # Immediate ack the instant a valid CR attachment arrives — guarantees the
     # user always sees a response even if the downstream upload + financials
     # prompt fails (QA Bug #1 + Ishan handover §9 / 2026-06-09).
@@ -241,7 +253,7 @@ _TEMPLATE_BODIES = {
     "onboarding.status.pending": (
         "Hi! Your application is currently under review with Madad. 👍\n\n"
         "I'll notify you as soon as the next update is available. You can also "
-        "track your status at madadfintech.com. For queries call +974 3017 3888."
+        "track your status at uat-portal.madadfintech.com. For queries call +974 3017 3888."
     ),
     "onboarding.payment.awaiting": (
         "Your application is ready to move forward. Please complete the secure "
@@ -256,7 +268,7 @@ _TEMPLATE_BODIES = {
         "{{ banks }}.\n\n"
         "We will update you as soon as financing offers are received — typically "
         "within 3–5 business days. 📲\n\n"
-        "Track your status at madadfintech.com (Ref: {{ ref }})"
+        "Track your status at uat-portal.madadfintech.com (Ref: {{ ref }})"
     ),
     "onboarding.not_qualified": (
         "Unfortunately your application wasn't accepted by our lender "
@@ -302,10 +314,9 @@ _TEMPLATE_BODIES = {
         "💬 Feel free to ask me anything about these offers right here!"
     ),
     "onboarding.offer.handoff": (
-        "💬 Feel free to ask me anything about these offers right here!\n\n"
         "When you're ready to select, please login to your Madad account to finalise "
         "your offer — this is where you'll also manage your invoices going forward.\n\n"
-        "Login to Madad Platform → madadfintech.com"
+        "Login to Madad Platform → uat-portal.madadfintech.com"
     ),
     # Spec Step 8 button variant + UAT 2026-06-10 combined-message fix.
     # User saw the offers preview + the handoff message arriving as TWO
@@ -316,9 +327,6 @@ _TEMPLATE_BODIES = {
     # "Login to Madad" CTA-URL button. Button URL is supplied at send-
     # time (capped at 20 chars by Meta).
     "onboarding.offer.handoff.button": (
-        "🎉 Exciting news — your financing offers are ready!\n\n"
-        "{{ offer_cards }}\n\n"
-        "💬 Feel free to ask me anything about these offers right here!\n\n"
         "When you're ready to select, please login to your Madad account to "
         "finalise your offer — this is where you'll also manage your invoices "
         "going forward."
@@ -341,7 +349,7 @@ _TEMPLATE_BODIES = {
         "🏦 {{ lender }} · 💰 {{ limit }} · 📈 {{ rate }} · ⏱ {{ tenure }}\n\n"
         "You can now submit invoices for financing right here — send a single "
         "PDF or multiple invoices at once. 📄\n\n"
-        "Track at madadfintech.com (Ref: {{ ref }})"
+        "Track at uat-portal.madadfintech.com (Ref: {{ ref }})"
     ),
 }
 
@@ -364,23 +372,23 @@ _NUDGE_TEMPLATE_BODIES = {
     "nudge.financials_pending.3": (
         "Final reminder: your Madad application will be marked inactive if "
         "we don't receive your Audited Financial Statement soon. Reply here "
-        "or visit madadfintech.com to continue."
+        "or visit uat-portal.madadfintech.com to continue."
     ),
     # Nudge — Partial Documents
     "nudge.incomplete_docs.1": (
         "Hi! You're almost there. 🚀\n\n"
         "Still needed: {{ documents }}.\n\n"
-        "Share here or at madadfintech.com to keep moving."
+        "Share here or at uat-portal.madadfintech.com to keep moving."
     ),
     "nudge.incomplete_docs.2": (
         "Quick reminder — we still need: {{ documents }}.\n\n"
         "Reply here with the documents attached, or upload via "
-        "madadfintech.com. Need help? Call +974 3017 3888."
+        "uat-portal.madadfintech.com. Need help? Call +974 3017 3888."
     ),
     "nudge.incomplete_docs.3": (
         "Final reminder — your application is at risk of being marked "
         "inactive. Missing: {{ documents }}. Please complete soon at "
-        "madadfintech.com or by replying here."
+        "uat-portal.madadfintech.com or by replying here."
     ),
     # Nudge — Payment Not Received  (link re-sent every step per PDF spec)
     "nudge.payment_pending.1": (
@@ -481,6 +489,23 @@ _NUDGE_SCHEDULES: dict[str, dict[str, Any]] = {
             },
         ],
         "max_attempts": 3,
+    },
+    # Trailing-edge "any more documents?" prompt (UAT 2026-06-13). A multi-file
+    # WhatsApp upload arrives as many SEPARATE inbound waves; there is no
+    # in-workflow "uploads finished" signal. The documents loop (re)arms this
+    # single short nudge on every upload wave and suppresses it on the next, so
+    # the prompt fires ONCE — only after the SME has been quiet for ~the delay
+    # below — never mid-batch. The worker tick is 60s, so effective quiet window
+    # is ≈ 40–100s.
+    "docs_more_prompt": {
+        "schedule": [
+            {
+                "offset": 25,
+                "channels": ["whatsapp"],
+                "template_key": "onboarding.documents.settle_prompt",
+            },
+        ],
+        "max_attempts": 1,
     },
 }
 

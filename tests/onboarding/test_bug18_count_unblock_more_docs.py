@@ -1,19 +1,19 @@
-"""User UAT 2026-06-10: classifier failures (notably AoA) leave required
-slots permanently "still needed" even when the SME has uploaded enough
-files. Plus the SME often realises they have one more document to send
-right after the coffee message — currently the flow forces them past it.
+"""Document-loop routing (rebuilt 2026-06-12).
 
-Two changes pinned here:
+Two behaviours pinned here:
 
-1. Count-based unblock at the workflow level. ``_route_documents`` now
-   exits to ``complete`` when the cumulative attachment count meets the
-   required count, regardless of how many slots are still "pending" on
-   ``state.missing_documents``. Mirrors the doc-service-level unblock
-   in PR #4 (commit 6c05b1c).
+1. Count-based unblock — ``_route_documents`` exits to ``complete`` when the
+   cumulative attachment count meets the required count, even if some slots
+   are still "pending" (classifier hangs, notably AoA). Mirrors the
+   doc-service-level unblock in PR #4 (commit 6c05b1c).
 
-2. New ``more_docs_prompt`` step after ``documents_complete``. The SME
-   is asked YES / NO whether they want to send more docs. YES loops
-   back to the upload-await node; NO proceeds to ``payment_wait_await``.
+2. NO "any more documents?" prompt (user 2026-06-12). That prompt caused a
+   stuck loop — every non-YES/NO reply, INCLUDING an incoming qualify/offer
+   webhook, re-fired the "No problem…" line and swallowed the status event so
+   the payment message never came. Now: the coffee message fires exactly ONCE
+   (``documents_complete_sent`` guard), the run re-parks in the upload-await
+   node, and a QUALIFIED/ACCEPTED/OFFER_ACCEPTED/ACTIVATED status event ALWAYS
+   routes straight to the payment/offer branch.
 """
 
 from __future__ import annotations
@@ -22,36 +22,47 @@ from app.services.workflow.onboarding import (
     DEFAULT_WHATSAPP_REQUIRED_DOCS,
     OnboardingWorkflow,
 )
-from app.services.workflow.state import OnboardingState
+from app.services.workflow.state import JourneyStatus, OnboardingState
 from app.shared.workflow import Channel
 
 WA = Channel.WHATSAPP
 IDENTITY = "+97455501801"
-DOC = "ZHVtbXk="
 
 
 def _wf() -> OnboardingWorkflow:
-    # White-box access for the pure router functions.
     from app.services.workflow.deps import build_onboarding_platform
 
     return build_onboarding_platform().workflow
 
 
-def test_route_documents_unblocks_on_count_with_missing_slots() -> None:
-    """Classifier hung on a few docs → required slots stay pending →
-    the count-based unblock kicks in and lets the loop complete."""
+def test_route_documents_incomplete_stays_in_loop_no_auto_coffee() -> None:
+    """Classifier hung on a few docs → required slots stay pending. We do NOT
+    auto-complete to the coffee (that would be a misleading 'all received').
+    Instead the loop stays parked — the in-loop 'any more documents?' prompt
+    fires and the SME replies NO to proceed (user 2026-06-12)."""
     wf = _wf()
     state = OnboardingState(
         identity=IDENTITY,
-        missing_documents=["aoa", "proof_of_address"],  # still pending
-        docs_uploaded_count=len(DEFAULT_WHATSAPP_REQUIRED_DOCS),  # but enough sent
+        missing_documents=["aoa", "proof_of_address"],
+        docs_uploaded_count=len(DEFAULT_WHATSAPP_REQUIRED_DOCS),
     )
-    assert wf._route_documents(state) == "complete"  # noqa: SLF001
+    assert wf._route_documents(state) == "await_again"  # noqa: SLF001
+
+
+def test_route_documents_proceed_on_no() -> None:
+    """SME replied NO to 'any more documents?' (docs_proceed) → route straight
+    to the payment-wait park even with docs still missing."""
+    wf = _wf()
+    state = OnboardingState(
+        identity=IDENTITY,
+        missing_documents=["aoa"],
+        docs_proceed=True,
+    )
+    assert wf._route_documents(state) == "proceed"  # noqa: SLF001
 
 
 def test_route_documents_does_not_unblock_below_threshold() -> None:
-    """1 upload vs 10 required must NOT unblock — guard against a
-    too-eager loop exit."""
+    """1 upload vs 10 required must NOT unblock."""
     wf = _wf()
     state = OnboardingState(
         identity=IDENTITY,
@@ -61,111 +72,46 @@ def test_route_documents_does_not_unblock_below_threshold() -> None:
     assert wf._route_documents(state) == "await_again"  # noqa: SLF001
 
 
-def test_route_documents_natural_completion_still_works() -> None:
-    """When every required slot is filled (missing list empty), the
-    route still says ``complete`` — count-based path is additive."""
+def test_route_documents_natural_completion_first_time_shows_coffee() -> None:
+    """Every required slot filled, coffee not yet sent → ``complete`` (so the
+    coffee message fires)."""
     wf = _wf()
     state = OnboardingState(identity=IDENTITY, missing_documents=[])
     assert wf._route_documents(state) == "complete"  # noqa: SLF001
 
 
-def test_route_more_docs_dispatches_on_decision() -> None:
+def test_route_documents_reparks_silently_after_coffee() -> None:
+    """Once the coffee has been sent, a still-complete checklist must NOT
+    re-show it — it re-parks silently in the upload-await node. This is the
+    fix for the repeated coffee / 'any more documents?' spam."""
     wf = _wf()
-    yes_state = OnboardingState(identity=IDENTITY, more_docs_decision="yes")
-    no_state = OnboardingState(identity=IDENTITY, more_docs_decision="no")
-    pending_state = OnboardingState(identity=IDENTITY, more_docs_decision=None)
-    assert wf._route_more_docs(yes_state) == "yes"  # noqa: SLF001
-    assert wf._route_more_docs(no_state) == "no"  # noqa: SLF001
-    assert wf._route_more_docs(pending_state) == "await_again"  # noqa: SLF001
+    state = OnboardingState(
+        identity=IDENTITY,
+        missing_documents=[],
+        documents_complete_sent=True,
+    )
+    assert wf._route_documents(state) == "await_again"  # noqa: SLF001
 
 
-async def _drive_to_more_docs_prompt(harness) -> None:
-    """End-to-end: campaign → YES → CR → audited → prequal → enough
-    uploads to trigger the count-based unblock → coffee + more-docs
-    prompt fires."""
-
-    runtime = harness.platform.runtime
-    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
-    await runtime.resume(WA, IDENTITY, message={"text": "YES"})
-    await runtime.resume(WA, IDENTITY, message={"text": "biz@example.com"})  # business_email
-    await runtime.resume(
-        WA, IDENTITY, message={"attachments": [{"filename": "CR.pdf", "content_base64": DOC}]}
-    )
-    await runtime.resume(
-        WA,
-        IDENTITY,
-        message={"attachments": [{"filename": "Audited.pdf", "content_base64": DOC}]},
-    )
-    await runtime.resume(
-        WA,
-        IDENTITY,
-        message={"event": "prequalification.completed", "journey_status": "PRE_QUALIFIED"},
-    )
-    # Send enough attachments to hit the count-based unblock — none are
-    # required-named in the in-memory classifier so missing_documents stays
-    # populated; the count-based exit is what we're exercising.
-    n = len(DEFAULT_WHATSAPP_REQUIRED_DOCS)
-    for idx in range(n):
-        await runtime.resume(
-            WA, IDENTITY,
-            message={
-                "attachments": [
-                    {"filename": f"random_{idx}.pdf", "content_base64": DOC}
-                ]
-            },
+def test_route_documents_qualify_always_routes_to_payment() -> None:
+    """A QUALIFIED/ACCEPTED/OFFER_ACCEPTED/ACTIVATED status ALWAYS routes to
+    payment — even mid-docs, even after the coffee, even with docs missing.
+    This guarantees the qualify/payment message is never swallowed by the
+    document phase (the recurring stuck-message bug)."""
+    wf = _wf()
+    for status in (
+        JourneyStatus.QUALIFIED,
+        JourneyStatus.ACCEPTED,
+        JourneyStatus.OFFER_ACCEPTED,
+        JourneyStatus.ACTIVATED,
+    ):
+        state = OnboardingState(
+            identity=IDENTITY,
+            missing_documents=list(DEFAULT_WHATSAPP_REQUIRED_DOCS),  # docs not done
+            documents_complete_sent=True,
+            journey_status=status,
         )
-
-
-async def test_count_unblock_drives_into_more_docs_prompt(harness) -> None:
-    """After N uploads (N == required count), the run parks at the new
-    ``more_docs_prompt_await`` step instead of crossing straight into
-    payment_wait."""
-    await _drive_to_more_docs_prompt(harness)
-
-    runtime = harness.platform.runtime
-    session = await runtime.sessions.get(WA, IDENTITY)
-    assert session is not None and session.active_run_id
-    run = await runtime.run_store.get(session.active_run_id)
-    assert run.current_step == "more_docs_prompt_await"
-    # And the new prompt template fired.
-    assert (
-        "onboarding.documents.more_docs_prompt"
-        in harness.messenger.templates()
-    )
-    # Plus the coffee message — natural-completion narrative is preserved.
-    assert "onboarding.documents.complete" in harness.messenger.templates()
-
-
-async def test_more_docs_yes_loops_back_to_upload_await(harness) -> None:
-    """SME replies YES → run resumes the upload-await node, ready to
-    accept another batch."""
-    await _drive_to_more_docs_prompt(harness)
-
-    runtime = harness.platform.runtime
-    result = await runtime.resume(WA, IDENTITY, message={"text": "YES"})
-    await runtime.resume(WA, IDENTITY, message={"text": "biz@example.com"})  # business_email
-
-    assert result.prompt == {"waiting_for": "upload", "step": "documents"}
-
-
-async def test_more_docs_no_advances_to_payment_wait(harness) -> None:
-    """SME replies NO → run advances to payment_wait_await."""
-    await _drive_to_more_docs_prompt(harness)
-
-    runtime = harness.platform.runtime
-    result = await runtime.resume(WA, IDENTITY, message={"text": "NO"})
-
-    assert result.prompt == {"waiting_for": "payment_ready", "step": "payment_wait"}
-
-
-async def test_more_docs_off_script_re_prompts(harness) -> None:
-    """An unrelated chat reply (not YES/NO) gets an answer and stays
-    parked at the prompt — never silently advances."""
-    await _drive_to_more_docs_prompt(harness)
-
-    runtime = harness.platform.runtime
-    result = await runtime.resume(
-        WA, IDENTITY, message={"text": "is my application ok?"}
-    )
-
-    assert result.prompt == {"waiting_for": "reply", "step": "more_docs_prompt"}
+        assert wf._route_documents(state) == "payment"  # noqa: SLF001
+    # Same via the explicit payment_ready flag (set on the score.ready event).
+    state = OnboardingState(identity=IDENTITY, payment_ready=True)
+    assert wf._route_documents(state) == "payment"  # noqa: SLF001

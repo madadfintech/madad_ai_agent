@@ -549,6 +549,7 @@ class InMemoryMadadIdentityClient:
             channel=channel,
             identifier=identifier,
         )
+        # Configurable conflict for tests: emails in ``self.taken_emails`` clash.
         conflict = email.strip().lower() in getattr(self, "taken_emails", set())
         return {"ok": not conflict, "conflict": conflict, "email": email}
 

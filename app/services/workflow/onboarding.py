@@ -114,14 +114,6 @@ TEMPLATE_KEYS = [
     "onboarding.business_email.ask",
     "onboarding.business_email.conflict",
     "onboarding.collect_details.request",
-    # PR #5/#6 (2026-06-10): new business-email step after YES — Ishan
-    # added the nodes + the seed-script entries but missed registering
-    # the keys here, so the CMS upsert in
-    # ``test_integration::test_onboarding_drives_real_communication_and_nudge``
-    # (which only seeds ``TEMPLATE_KEYS``) was leaving them unrendered
-    # and the workflow died with a CMS template-not-found error.
-    "onboarding.business_email.ask",
-    "onboarding.business_email.conflict",
     "onboarding.consent.request",
     "onboarding.eligibility.intake.request",
     "onboarding.not_eligible",
@@ -1003,7 +995,10 @@ def _format_offer_cards(offers: list[dict[str, Any]]) -> str:
         _fee_total = 0.0
         _saw_fee = False
         for _fee_keys in (
-            ("processingFeeValue", "processing_fee_value", "processingFee", "processing_fee", "fee"),
+            (
+                "processingFeeValue", "processing_fee_value",
+                "processingFee", "processing_fee", "fee",
+            ),
             ("otherCharges", "other_charges"),
             ("brokerageFees", "brokerage_fees"),
             ("feasibilityStudyFees", "feasibility_study_fees"),
@@ -1094,13 +1089,6 @@ class OnboardingWorkflow(WorkflowDefinition):
     def build(self, graph: GraphBuilder) -> None:
         nodes: dict[str, Any] = {
             # Step 1: campaign + identification
-            # Cold-start entry per Ishan (2026-06-10): pre-empt
-            # campaign_send with a read-only registration lookup so a
-            # returning user doesn't get re-broadcast the "are you
-            # interested?" template — they're routed straight to the
-            # appropriate returning-user message (re-send offer, payment
-            # link, invoice prompt, portal login, etc.).
-            "entry_registration_check": self._entry_registration_check,
             "campaign_send": self._campaign_send,
             "campaign_await": self._campaign_await,
             "declined": self._declined,
@@ -1173,21 +1161,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         for node_name, fn in nodes.items():
             graph.add_node(node_name, fn)
 
-        # Per Ishan (2026-06-10): cold-start entry. Before firing the
-        # campaign initiate template, check whether the lead is already
-        # registered. If so, route them straight to the returning-user
-        # terminal (re-send offer / payment link / invoice prompt /
-        # portal login). If not, fall through to the normal
-        # campaign_send → YES → consent/CR flow.
-        graph.set_entry("entry_registration_check")
-        graph.add_conditional_edges(
-            "entry_registration_check",
-            self._route_entry_registration,
-            {
-                "registered": "registered_route_send",
-                "campaign": "campaign_send",
-            },
-        )
+        graph.set_entry("campaign_send")
         graph.add_edge("campaign_send", "campaign_await")
         graph.add_conditional_edges(
             "campaign_await",
@@ -1453,46 +1427,6 @@ class OnboardingWorkflow(WorkflowDefinition):
 
     # -- Step 1: campaign + check_contact + session ---------------------------
 
-    async def _entry_registration_check(
-        self, state: OnboardingState, ctx: WorkflowContext
-    ) -> dict[str, Any]:
-        """Cold-start: call ``madad_mcp_check_registration`` BEFORE the
-        campaign initiate template so a returning user is routed straight
-        to the registered_route_send terminal instead of being broadcast
-        the "are you interested? YES/NO" greeting.
-
-        Per Ishan (2026-06-10): the lookup is cheap, side-effect-free,
-        and returns everything needed to pick the next message (offers
-        list, payment link, credit-line state, ref number). Failure is
-        non-fatal — we fall through to the normal SIGN_UP flow.
-        """
-
-        route: str | None = None
-        payload: dict[str, Any] = {}
-        try:
-            reg = await self._identity.check_registration(
-                identifier=ctx.identity,
-                channel=_channel(ctx),
-            )
-            if isinstance(reg, dict) and reg.get("registered"):
-                payload = reg
-                raw_route = reg.get("route")
-                if isinstance(raw_route, str):
-                    route = raw_route
-        except Exception as exc:  # noqa: BLE001 — non-fatal
-            ctx.logger.warning(
-                "entry_registration_check.failed", error=str(exc)[:200]
-            )
-        return self._step(
-            "entry_registration_check",
-            ctx,
-            registration_route=route,
-            registration_payload=payload,
-        )
-
-    def _route_entry_registration(self, state: OnboardingState) -> str:
-        return "registered" if state.registration_route else "campaign"
-
     async def _campaign_send(self, state: OnboardingState, ctx: WorkflowContext) -> dict[str, Any]:
         locale = str(state.data.get("locale") or state.locale)
         # Step 0 reach-out. This is the FIRST outbound to the contact, so there
@@ -1558,30 +1492,29 @@ class OnboardingWorkflow(WorkflowDefinition):
             result = await self._identity.check_contact(phone=ctx.identity)
         else:
             result = await self._identity.check_contact(email=ctx.identity)
-        # Per Ishan (cluster commit e6ea5d2, 2026-06-10): the read-only
-        # registration lookup is normally fired at the cold-start
-        # ``entry_registration_check`` node. We re-fire here ONLY when
-        # that earlier call produced nothing — covers a freshly-pulled
-        # branch where the run resumed at this node without going through
-        # the new entry. Best-effort: a failure here must not break the
-        # SIGN_UP path.
-        route: str | None = state.registration_route
-        payload: dict[str, Any] = dict(state.registration_payload or {})
-        if not route:
-            try:
-                reg = await self._identity.check_registration(
-                    identifier=ctx.identity,
-                    channel=_channel(ctx),
-                )
-                if isinstance(reg, dict) and reg.get("registered"):
-                    payload = reg
-                    raw_route = reg.get("route")
-                    if isinstance(raw_route, str):
-                        route = raw_route
-            except Exception as exc:  # noqa: BLE001 — non-fatal, fall through
-                ctx.logger.warning(
-                    "check_registration.failed", error=str(exc)[:200]
-                )
+        # Per Ishan (cluster commit e6ea5d2, 2026-06-10): also fire the
+        # read-only registration lookup — it returns the full registered
+        # shape (route hint, journey status, fee paid, credit line,
+        # offers…) so the dispatcher can skip SIGN_UP for returning
+        # users and re-send the appropriate message instead of
+        # silently re-onboarding (Bug #2 + Bug #6). Best-effort: a
+        # failure here must not break the SIGN_UP path.
+        route: str | None = None
+        payload: dict[str, Any] = {}
+        try:
+            reg = await self._identity.check_registration(
+                identifier=ctx.identity,
+                channel=_channel(ctx),
+            )
+            if isinstance(reg, dict) and reg.get("registered"):
+                payload = reg
+                raw_route = reg.get("route")
+                if isinstance(raw_route, str):
+                    route = raw_route
+        except Exception as exc:  # noqa: BLE001 — non-fatal, fall through
+            ctx.logger.warning(
+                "check_registration.failed", error=str(exc)[:200]
+            )
         return self._step(
             "check_contact_send",
             ctx,
@@ -4018,32 +3951,39 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _offer_view_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        # Per user (UAT 2026-06-10): the offers preview + the handoff
-        # message used to fire as TWO separate WhatsApp bubbles with the
-        # offer cards rendered empty on the first. Both are now folded
-        # into the single CTA-URL message sent by ``_offer_handoff_to_madad``
-        # so the SME sees one clean message with offer details + login
-        # button. This node stays in the graph for state-transition
-        # symmetry but no longer emits anything. (Ishan's 2026-06-11 sig
-        # guard for re-send-on-new-lender lives on the handoff node instead.)
+        # A6 (Ishan 2026-06-07): render PDF Step 8 structured offer cards —
+        # one block per offer with lender + credit limit + interest rate +
+        # tenure + processing fee. Falls back to a count-only line if the
+        # offer list is empty (auth_me hasn't surfaced offers yet).
+        #
+        # Re-send only when the offer SET changed (a new lender made an offer) —
+        # the fast status poller re-enters this route ~every minute while the SME
+        # is deciding, and we must not re-spam the same cards each tick.
+        if _offers_sig(state.offers) == state.offers_shown_sig:
+            return self._step("offer_view_send", ctx)
+        await self._send(
+            ctx,
+            state,
+            "onboarding.offers.preview",
+            {
+                "count": len(state.offers),
+                "offer_cards": _format_offer_cards(state.offers),
+            },
+        )
         return self._step("offer_view_send", ctx)
 
     async def _offer_handoff_to_madad(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        # Combined "your offers are ready + login to select" message.
-        # Re-send guard (Ishan, bdc7e2a): the status poller re-enters this
-        # route ~every minute while the SME is deciding. Only (re)send the
-        # button when the offer set actually changed (a new lender's offer).
+        # Skip the whole handoff block on a routine poll where the offer set is
+        # unchanged (the run just passed through offer_view_send without
+        # re-sending). Only (re)send the button when new offers were just shown.
         if _offers_sig(state.offers) == state.offers_shown_sig:
             return self._step("offer_handoff_to_madad", ctx, outcome="offer_handoff")
         # PDF Step 8 — tappable "Login to Madad →" CTA-URL button on WhatsApp
-        # with offer details inline (UAT 2026-06-10: was firing as two bubbles
-        # with empty cards). Meta caps the button label at 20 chars. Falls
-        # back to the plain-text ``onboarding.offer.handoff`` template (with
-        # the URL inline) if the interactive path isn't available.
+        # (Meta caps the label at 20 chars). Falls back to the plain-text
+        # template (with the URL inline) if the interactive path fails.
         portal_url = "https://uat-portal.madadfintech.com"
-        offer_cards = _format_offer_cards(state.offers)
         sent_as_button = False
         if ctx.channel is Channel.WHATSAPP:
             try:
@@ -4053,7 +3993,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                     template_key="onboarding.offer.handoff.button",
                     button_text="Login to Madad →",
                     button_url=portal_url,
-                    variables={"offer_cards": offer_cards},
+                    variables={},
                     locale=state.locale,
                 )
             except Exception as exc:  # noqa: BLE001 — fall back to text
@@ -4063,17 +4003,6 @@ class OnboardingWorkflow(WorkflowDefinition):
                     note="falling back to plain-text handoff message",
                 )
         if not sent_as_button:
-            # Non-WhatsApp / button send failed → plain-text fallback.
-            # The legacy ``onboarding.offer.handoff`` template doesn't carry
-            # offer_cards; pair it with the standalone offers.preview so the
-            # SME still gets the details + the handoff prompt in succession.
-            await self._send(
-                ctx, state, "onboarding.offers.preview",
-                {
-                    "count": len(state.offers),
-                    "offer_cards": offer_cards,
-                },
-            )
             await self._send(ctx, state, "onboarding.offer.handoff")
         # Record the shown offer set so routine polls don't re-send these cards.
         return self._step(

@@ -3603,26 +3603,54 @@ class OnboardingWorkflow(WorkflowDefinition):
                 access_token=token, refresh_token=refresh, token_expires_at=expires,
             )
         result = await self._pay.list_monetization_products(access_token=token)
-        products = (
-            list(result.get("products", [])) if isinstance(result, dict) else []
-        )
+        # The backend may return either ``{"products": [...]}`` or a bare list
+        # — tolerate both. Same for the per-product shape: ``product_id`` /
+        # ``productId`` / ``id``, and ``amount_qar`` / ``amountQar`` /
+        # ``amount`` / ``value`` / ``valueQar`` / ``feeAmount`` /
+        # ``priceAmount`` / ``monthlyFee``. UAT 2026-06-14: SME-facing fee
+        # was still showing 6,000 — log the resolved fields so the next
+        # round confirms whether the backend amount field is one we don't
+        # know about yet (in which case we'd add it here) vs the product
+        # genuinely priced at 6,000.
+        if isinstance(result, dict):
+            raw_products = result.get("products") or result.get("data") or []
+        elif isinstance(result, list):
+            raw_products = result
+        else:
+            raw_products = []
+        products = [p for p in raw_products if isinstance(p, dict)]
         product = products[0] if products else {}
-        # Capture the live amount per UAT 2026-06-14 so downstream nodes
-        # don't fall back to the hardcoded ONBOARDING_FEE_QAR — accepts
-        # ``amount_qar`` (snake) or ``amountQar`` (camel) or ``amount``.
+        product_id = (
+            product.get("product_id")
+            or product.get("productId")
+            or product.get("id")
+        )
         amount_raw = (
             product.get("amount_qar")
             or product.get("amountQar")
             or product.get("amount")
+            or product.get("value")
+            or product.get("valueQar")
+            or product.get("feeAmount")
+            or product.get("priceAmount")
+            or product.get("monthlyFee")
         )
         try:
-            amount_qar: int | None = int(amount_raw) if amount_raw is not None else None
+            amount_qar: int | None = (
+                int(amount_raw) if amount_raw is not None else None
+            )
         except (TypeError, ValueError):
             amount_qar = None
+        ctx.logger.info(
+            "products_list_fetch.resolved",
+            product_id=product_id,
+            amount_qar=amount_qar,
+            product_keys=sorted(product.keys()) if product else [],
+        )
         return self._step(
             "products_list_fetch",
             ctx,
-            payment_product_id=product.get("product_id"),
+            payment_product_id=product_id,
             payment_amount_qar=amount_qar,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
         )

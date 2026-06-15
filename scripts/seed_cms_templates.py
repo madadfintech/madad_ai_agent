@@ -353,6 +353,68 @@ _TEMPLATE_BODIES = {
         "PDF or multiple invoices at once. 📄\n\n"
         "Track at uat-portal.madadfintech.com (Ref: {{ ref }})"
     ),
+    # ----------------------------------------------------------------
+    # Phase 1.b — invoice financing (Steps 10–13).
+    # ----------------------------------------------------------------
+    # Receipt after each invoice submission. ``summary`` is the
+    # per-invoice ✅ block built by ``_format_accepted_invoices``;
+    # ``count`` / ``noun`` / ``failed`` reflect the batch.
+    "onboarding.invoice.received": (
+        "{{ summary }}\n\n"
+        "Got it — {{ count }} {{ noun }} submitted for financing. "
+        "Our team will review and you'll get an update here once it's disbursed. 💸\n\n"
+        "Send another invoice anytime — single file or a ZIP both work."
+    ),
+    # Submission failed (unreadable file / no token / backend error).
+    "onboarding.invoice.failed": (
+        "⚠️ {{ reason }}\n\n"
+        "Need help? Reply here or call us on +974 3017 3888."
+    ),
+    # On-demand "what's the status of my invoices?" reply.
+    "onboarding.invoice.status": (
+        "📋 Your invoice history ({{ count }}):\n\n"
+        "{{ summary }}\n\n"
+        "Send a new invoice anytime as a PDF or photo."
+    ),
+    # Backend says funds disbursed to the SME's account.
+    "onboarding.disbursement.received": (
+        "💸 Funds disbursed!\n\n"
+        "{{ amount }} has been transferred for invoice {{ ref }}.\n"
+        "The amount should appear in your bank account shortly. 🏦\n\n"
+        "Track all invoices at uat-portal.madadfintech.com or just ask me here."
+    ),
+    # Repayment lifecycle. Bodies template-substitute the same field
+    # names the workflow sets in ``_handle_phase1b_event``.
+    "onboarding.repayment.received": (
+        "✅ Repayment received\n\n"
+        "We've received {{ amount }} toward invoice {{ ref }}.\n"
+        "Outstanding balance: {{ outstanding }}\n\n"
+        "Thanks for staying on top of it! 🙌"
+    ),
+    "onboarding.repayment.partially_paid": (
+        "📩 Partial repayment received\n\n"
+        "{{ amount }} received for invoice {{ ref }} — "
+        "{{ outstanding }} still outstanding.\n\n"
+        "Reply here if you have any questions about the remaining balance."
+    ),
+    "onboarding.repayment.closed": (
+        "🎉 Repayment closed for invoice {{ ref }}!\n\n"
+        "Total settled: {{ amount }}. Thanks for your business — "
+        "we'd love to finance more invoices for you anytime. 💼"
+    ),
+    "onboarding.repayment.due_soon": (
+        "⏰ Friendly reminder — repayment due soon\n\n"
+        "{{ amount }} is due on {{ due_date }} for invoice {{ ref }}.\n"
+        "Please ensure funds are available; replies welcome here.\n\n"
+        "Questions? Call us on +974 3017 3888."
+    ),
+    "onboarding.repayment.overdue": (
+        "🚨 Repayment overdue\n\n"
+        "{{ amount }} for invoice {{ ref }} is now {{ days_overdue }} days "
+        "past due. Please arrange payment as soon as possible to keep your "
+        "credit line in good standing.\n\n"
+        "Call us on +974 3017 3888 or reply here — we're here to help."
+    ),
 }
 
 

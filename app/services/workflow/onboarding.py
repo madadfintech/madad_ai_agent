@@ -3604,14 +3604,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
         result = await self._pay.list_monetization_products(access_token=token)
         # The backend may return either ``{"products": [...]}`` or a bare list
-        # — tolerate both. Same for the per-product shape: ``product_id`` /
-        # ``productId`` / ``id``, and ``amount_qar`` / ``amountQar`` /
-        # ``amount`` / ``value`` / ``valueQar`` / ``feeAmount`` /
-        # ``priceAmount`` / ``monthlyFee``. UAT 2026-06-14: SME-facing fee
-        # was still showing 6,000 — log the resolved fields so the next
-        # round confirms whether the backend amount field is one we don't
-        # know about yet (in which case we'd add it here) vs the product
-        # genuinely priced at 6,000.
+        # — tolerate both.
         if isinstance(result, dict):
             raw_products = result.get("products") or result.get("data") or []
         elif isinstance(result, list):
@@ -3619,21 +3612,48 @@ class OnboardingWorkflow(WorkflowDefinition):
         else:
             raw_products = []
         products = [p for p in raw_products if isinstance(p, dict)]
-        product = products[0] if products else {}
+        # CRITICAL BUG FIX (UAT 2026-06-15): the backend returns multiple
+        # monetization products — "Onboarding charges" (6000, paid by
+        # LENDER) and "Credit assessment charges" (3500, paid by SME). My
+        # earlier code picked products[0] which was "Onboarding charges"
+        # → SME was billed 6000 even though the SME pays the credit
+        # assessment fee (3500). Filter to status=ACTIVE + chargedParty=SME
+        # and prefer code=credit-assessment so the SME-facing payment
+        # message and the create_monetization_payment call both use the
+        # right product. Falls back to the first SME-paid active product
+        # if the code changes, then to the first product overall to avoid
+        # ever hard-failing on a backend rename.
+        def _picked(p: dict[str, Any]) -> bool:
+            return (
+                str(p.get("status", "")).upper() == "ACTIVE"
+                and str(p.get("chargedParty", "")).upper() == "SME"
+            )
+        sme_active = [p for p in products if _picked(p)]
+        product = (
+            next(
+                (p for p in sme_active if str(p.get("code", "")).lower()
+                 == "credit-assessment"),
+                None,
+            )
+            or (sme_active[0] if sme_active else None)
+            or (products[0] if products else {})
+        )
         product_id = (
             product.get("product_id")
             or product.get("productId")
             or product.get("id")
         )
+        # The backend's product field is ``amount`` (per UAT 2026-06-14 log);
+        # snake/camel/other variants kept as defence-in-depth so a backend
+        # rename can't put us back into the 6,000-fallback trap.
         amount_raw = (
-            product.get("amount_qar")
+            product.get("amount")
+            or product.get("amount_qar")
             or product.get("amountQar")
-            or product.get("amount")
             or product.get("value")
             or product.get("valueQar")
             or product.get("feeAmount")
             or product.get("priceAmount")
-            or product.get("monthlyFee")
         )
         try:
             amount_qar: int | None = (
@@ -3645,7 +3665,10 @@ class OnboardingWorkflow(WorkflowDefinition):
             "products_list_fetch.resolved",
             product_id=product_id,
             amount_qar=amount_qar,
-            product_keys=sorted(product.keys()) if product else [],
+            picked_name=product.get("name"),
+            picked_code=product.get("code"),
+            picked_charged_party=product.get("chargedParty"),
+            total_products=len(products),
         )
         return self._step(
             "products_list_fetch",

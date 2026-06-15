@@ -72,8 +72,12 @@ def create_service_app(
         init_sentry,
         metrics_endpoint,
     )
+    from app.core.tracing import init_tracing, instrument_app
 
     init_sentry(settings, service)  # no-op unless a DSN is configured
+    # OpenTelemetry — no-op unless settings.observability.otel_endpoint is set.
+    init_tracing(settings, service)
+    instrument_app(app, service)
     if enable_metrics:
         app.add_middleware(PrometheusMiddleware, service=service)
         app.add_api_route("/metrics", metrics_endpoint, methods=["GET"], tags=["ops"])

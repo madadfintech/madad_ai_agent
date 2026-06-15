@@ -169,16 +169,26 @@ class SecuritySettings(BaseModel):
 
 
 class ObservabilitySettings(BaseModel):
-    """Metrics + error tracking.
+    """Metrics + error tracking + distributed tracing.
 
     Prometheus metrics are exposed at ``/metrics`` (scraped, not authed). Sentry
     is initialised only when ``sentry_dsn`` is set, so dev/tests run with neither
     a Sentry account nor the SDK imported.
+
+    OpenTelemetry tracing is OFF by default — set ``otel_endpoint`` to enable.
+    When enabled, FastAPI + httpx (the MCP client) + SQLAlchemy + Celery get
+    auto-instrumented and spans go to the configured OTLP endpoint (typically a
+    local OTel Collector that fans out to Jaeger / Tempo / Cloud Trace).
     """
 
     metrics_enabled: bool = True
     sentry_dsn: str | None = None
     sentry_traces_sample_rate: float = 0.0
+    # OpenTelemetry — empty string / None means tracing is disabled.
+    otel_endpoint: str | None = None
+    otel_service_namespace: str = "madad"
+    otel_environment: str = "dev"
+    otel_traces_sample_rate: float = 1.0
 
 
 class DomainSettings(BaseModel):

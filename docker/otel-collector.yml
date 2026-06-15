@@ -1,0 +1,42 @@
+# OpenTelemetry Collector — receives OTLP/HTTP spans from every MADAD
+# service and fans out to Jaeger (UI/storage) + the platform's
+# Prometheus instance (so RED metrics from spans show up next to the
+# scrape-based ones).
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+  # Drop probe noise — /health / /ready / /metrics generate thousands
+  # of spans/min that bury real traffic without informing anything.
+  filter/probes:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["http.target"] == "/health"'
+        - 'attributes["http.target"] == "/ready"'
+        - 'attributes["http.target"] == "/metrics"'
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [filter/probes, batch]
+      exporters: [otlp/jaeger]

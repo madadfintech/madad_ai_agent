@@ -284,6 +284,33 @@ services:
       - opensearch
     restart: unless-stopped
 
+  # Distributed tracing — every service ships OTLP traces to the
+  # collector; the collector batches + filters probe noise + forwards
+  # to Jaeger for storage and the UI. Set OBSERVABILITY__OTEL_ENDPOINT
+  # to http://otel-collector:4318/v1/traces on each service to enable.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    container_name: madad_otel_collector
+    command: ["--config=/etc/otel-collector.yml"]
+    volumes:
+      - ./otel-collector.yml:/etc/otel-collector.yml:ro
+    ports:
+      - "4317:4317"   # gRPC
+      - "4318:4318"   # HTTP
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    container_name: madad_jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14250:14250"  # gRPC collector
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   grafana_data:

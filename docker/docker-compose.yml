@@ -202,7 +202,15 @@ services:
     image: prom/prometheus:v3.1.0
     container_name: madad_prometheus
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # New layout — bundled config + alert rules. The legacy
+      # ./prometheus.yml is now superseded; remove it once O2 ships.
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
     ports:
       - "9090:9090"
     restart: unless-stopped
@@ -212,10 +220,15 @@ services:
     container_name: madad_grafana
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
     ports:
       - "3000:3000"
     volumes:
       - grafana_data:/var/lib/grafana
+      # Provision datasource + dashboards from files so every fresh
+      # boot gets the same pinned views instead of relying on UI clicks.
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
     depends_on:
       - prometheus
     restart: unless-stopped

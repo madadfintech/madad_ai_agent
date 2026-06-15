@@ -1,0 +1,63 @@
+{
+  "title": "MADAD Onboarding — Workflow funnel",
+  "tags": ["madad", "workflow", "funnel"],
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active waiting runs (by step)",
+      "type": "barchart",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (path) (rate(http_requests_total{service=\"workflow\",path=~\"/workflow/.*\"}[1h]))",
+          "legendFormat": "{{path}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Workflow throughput — inbound vs webhook",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum (rate(http_requests_total{service=\"workflow\",path=\"/workflow/inbound\"}[1m]))",
+          "legendFormat": "inbound (chat)"
+        },
+        {
+          "expr": "sum (rate(http_requests_total{service=\"workflow\",path=~\"/workflow/madad/events/.*\"}[1m]))",
+          "legendFormat": "webhook (backend)"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Ops list reads (operator activity)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum (rate(http_requests_total{path=~\"/workflow/admin/ops/.*\"}[5m]))",
+          "legendFormat": "admin ops {{path}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "MCP cluster call duration (p95)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"workflow\"}[5m])))",
+          "legendFormat": "workflow p95"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    }
+  ]
+}

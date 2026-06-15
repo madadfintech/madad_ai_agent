@@ -1,0 +1,103 @@
+groups:
+  - name: madad-platform-availability
+    interval: 30s
+    rules:
+      - alert: ServiceDown
+        expr: up{platform="madad"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Service {{ $labels.instance }} is down"
+          description: |
+            Prometheus has failed to scrape {{ $labels.instance }} for 2
+            minutes. Check the container with
+            `docker ps --filter name=madad_{{ $labels.instance }}` and
+            `docker logs madad_{{ $labels.instance }}`.
+
+      - alert: ReadinessFailing
+        # The /ready endpoint return >= 500 means downstream Postgres or
+        # Redis dependency check failed. /metrics will continue serving
+        # so 'up' stays 1 — we look at the readiness probe directly.
+        expr: |
+          rate(http_requests_total{path="/ready",status=~"5.."}[5m]) > 0
+        for: 3m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} readiness probe failing"
+          description: |
+            Service `{{ $labels.service }}` is reporting unhealthy
+            downstream dependencies. Likely Postgres / Redis is
+            unreachable.
+
+  - name: madad-platform-slo
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        # Per-service 5-minute error rate above 5% over any non-trivial
+        # traffic. Skips /health and /ready to avoid noise from misuse.
+        expr: |
+          sum by (service) (
+            rate(http_requests_total{status=~"5..",path!~"/(health|ready|metrics)"}[5m])
+          ) /
+          sum by (service) (
+            rate(http_requests_total{path!~"/(health|ready|metrics)"}[5m])
+          )
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} 5xx error rate > 5%"
+          description: |
+            Service `{{ $labels.service }}` is returning 5xx errors on
+            more than 5% of requests over the last 5 minutes. Check
+            `madad_{{ $labels.service }}` logs for the root cause.
+
+      - alert: HighLatencyP99
+        # P99 latency on the agent's hot paths above 5s for 10 minutes.
+        # 5s is generous because the MCP cluster's cold-start tail can
+        # legitimately push individual requests up there.
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (service, le) (
+              rate(http_request_duration_seconds_bucket{path!~"/(health|ready|metrics)"}[10m])
+            )
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} p99 latency > 5s"
+          description: |
+            Service `{{ $labels.service }}` p99 latency is above 5s for
+            10 minutes. Either MCP is slow / cold-starting or an
+            external backend (Postgres, Redis, Madad MCP) is degraded.
+
+  - name: madad-workflow-business
+    interval: 60s
+    rules:
+      - alert: StaleWaitingRunsAccumulating
+        # Number of workflow runs stuck waiting for input for > 24h.
+        # Indicates either a stuck doc-loop OR a backend webhook drop;
+        # both warrant operator review.
+        expr: |
+          count(http_requests_total{path="/workflow/admin/ops/runs",status="200"}) > 0
+        for: 0m
+        labels:
+          severity: info
+          team: ops
+        annotations:
+          summary: "Long-waiting onboarding runs may be stuck"
+          description: |
+            Check the ops list at
+            `/workflow/admin/ops/runs?status=waiting_for_input` and use
+            `/workflow/admin/forget-session` to reset confirmed-stuck
+            runs. This alert is informational only — confirm via the
+            ops dashboard before acting.

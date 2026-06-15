@@ -144,6 +144,16 @@ TEMPLATE_KEYS = [
     "onboarding.offer.handoff.button",
     "onboarding.offer.confirmed",
     "onboarding.activated",
+    # Phase 1.b — invoice financing (post-activation) + repayment lifecycle.
+    "onboarding.invoice.received",
+    "onboarding.invoice.failed",
+    "onboarding.invoice.status",
+    "onboarding.disbursement.received",
+    "onboarding.repayment.received",
+    "onboarding.repayment.partially_paid",
+    "onboarding.repayment.closed",
+    "onboarding.repayment.due_soon",
+    "onboarding.repayment.overdue",
 ]
 
 # Default values for the seven KYC_UPDATE_ELIGIBILITY fields when the
@@ -301,6 +311,128 @@ def _is_pending_docs_query(value: Any) -> bool:
     if text in _PENDING_DOCS_SHORT_TOKENS:
         return True
     return any(phrase in text for phrase in _PENDING_DOCS_PHRASES)
+
+
+_INVOICE_STATUS_PHRASES = (
+    "my invoice", "my invoices", "invoice status", "invoices status",
+    "status of my invoice", "where is my invoice", "what about my invoice",
+    "invoice update", "where are my invoices", "list my invoices",
+    "show my invoices", "show invoices", "any updates on my invoice",
+    "fund", "funding", "disburs",  # "when will it disburse / fund"
+)
+_INVOICE_STATUS_SHORT_TOKENS = frozenset({"invoices?", "invoice?"})
+
+
+def _is_invoice_status_query(value: Any) -> bool:
+    """True when the SME is asking for the status of submitted invoices —
+    used inside the post-activation ``_invoice_collect_await`` to dispatch
+    the on-demand ``get_my_invoices`` read instead of the chit-chat fallback.
+    """
+    text = reply_text(value).strip().lower()
+    if not text:
+        return False
+    if text in _INVOICE_STATUS_SHORT_TOKENS:
+        return True
+    return any(phrase in text for phrase in _INVOICE_STATUS_PHRASES)
+
+
+def _normalize_invoice_record(
+    record: dict[str, Any], submitted_at_iso: str
+) -> dict[str, Any]:
+    """Flatten the backend's invoice shape into a fixed agent-side schema:
+    ``{invoice_id, supplier_name, customer_name, total_amount, currency,
+    invoice_number, status, submitted_at}``. Missing fields default to None
+    or ``"—"`` so messages never render ``None`` as a value.
+    """
+    def _g(*keys: str) -> Any:
+        for k in keys:
+            v = record.get(k)
+            if v not in (None, ""):
+                return v
+        return None
+
+    return {
+        "invoice_id": _g("invoice_id", "id"),
+        "supplier_name": _g("supplier_name", "supplierName") or "—",
+        "customer_name": _g("customer_name", "customerName") or "—",
+        "total_amount": _g("total_amount", "totalAmount", "amount"),
+        "currency": _g("currency") or "QAR",
+        "invoice_number": _g("invoice_number", "invoiceNumber") or "—",
+        "status": _g("status") or "SUBMITTED",
+        "filename": _g("filename") or "invoice.pdf",
+        "submitted_at": submitted_at_iso,
+    }
+
+
+def _format_accepted_invoices(invoices: list[dict[str, Any]]) -> str:
+    """Render a per-invoice bullet list for the success receipt — one block
+    per invoice with supplier / amount / reference."""
+    lines: list[str] = []
+    for idx, inv in enumerate(invoices, start=1):
+        amount = inv.get("total_amount")
+        currency = inv.get("currency") or "QAR"
+        try:
+            amount_str = f"{currency} {int(amount):,}" if amount is not None else f"{currency} —"
+        except (TypeError, ValueError):
+            amount_str = f"{currency} {amount}" if amount is not None else f"{currency} —"
+        ref = inv.get("invoice_number") or "—"
+        supplier = inv.get("supplier_name") or "—"
+        lines.append(
+            f"✅ Invoice {idx} — {supplier}\n"
+            f"💰 {amount_str} · 📄 Ref: {ref}"
+        )
+    return "\n━━━━━━━━━━━━━\n".join(lines)
+
+
+def _format_invoice_status_summary(invoices: list[dict[str, Any]]) -> str:
+    """Render the SME's full invoice history with backend statuses for the
+    on-demand status query."""
+    if not invoices:
+        return (
+            "You haven't submitted any invoices yet — send one as a PDF or "
+            "photo and I'll get it into financing for you. 🙂"
+        )
+    lines: list[str] = []
+    for idx, inv in enumerate(invoices, start=1):
+        if not isinstance(inv, dict):
+            continue
+        status = (
+            inv.get("status")
+            or inv.get("invoice_status")
+            or inv.get("invoiceStatus")
+            or "SUBMITTED"
+        )
+        # Friendly icon by status group.
+        if str(status).upper() in {"DISBURSED", "FUNDED", "PAID_OUT"}:
+            icon = "💸"
+        elif str(status).upper() in {"REPAID", "CLOSED"}:
+            icon = "✅"
+        elif str(status).upper() in {"REJECTED", "DECLINED"}:
+            icon = "❌"
+        else:
+            icon = "📄"
+        supplier = (
+            inv.get("supplier_name")
+            or inv.get("supplierName")
+            or "—"
+        )
+        ref = (
+            inv.get("invoice_number")
+            or inv.get("invoiceNumber")
+            or "—"
+        )
+        amount = (
+            inv.get("total_amount")
+            or inv.get("totalAmount")
+            or inv.get("amount")
+        )
+        currency = inv.get("currency") or "QAR"
+        try:
+            amount_str = f"{currency} {int(amount):,}" if amount is not None else f"{currency} —"
+        except (TypeError, ValueError):
+            amount_str = f"{currency} {amount}" if amount is not None else f"{currency} —"
+        lines.append(f"{icon} Invoice {idx} — {supplier} · Ref {ref} · {amount_str} · {status}")
+    return "\n".join(lines)
 
 
 def _is_short_negative(value: Any) -> bool:
@@ -4226,13 +4358,51 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _invoice_collect_await(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        # Steps 10-13: once the credit line is ACTIVE, the SME can send invoices
-        # over WhatsApp. Each uploaded PDF/photo is submitted for financing
-        # immediately — same extraction + submission path as the portal — and
-        # the run stays parked here to accept more. Disbursement / repayment
-        # alerts then arrive via the backend webhooks (transaction.disbursed,
-        # repayment.*). Non-file chat is answered in context; we never drop it.
+        # Steps 10-13 (Phase 1.b): once the credit line is ACTIVATED the SME
+        # can send invoices over WhatsApp/email. Routing:
+        #   1. ``status`` query (e.g. "where are my invoices?") → call
+        #      ``get_my_invoices`` and render the running status list.
+        #   2. Attachments: ZIP → ``submit_zip_base64`` (server-side
+        #      extract+submit per member). Single PDF/photo →
+        #      ``extract_and_submit_base64`` (preferred path per Ishan's
+        #      README §"Step 10: Invoice Submission" — one round-trip:
+        #      backend extracts and submits in one shot).
+        #   3. Empty chat → contextual answer, stay parked.
+        # Disbursement / repayment alerts arrive via the backend webhooks
+        # (transaction.disbursed, repayment.*); ``OnboardingDispatcher``
+        # routes those into ``_disbursement_received`` /
+        # ``_repayment_received`` / ``_repayment_partially_paid`` /
+        # ``_repayment_closed`` / ``_repayment_due_soon`` /
+        # ``_repayment_overdue`` (P3 lands those nodes).
         reply = await_input({"waiting_for": "invoice", "step": "invoice_collect"})
+
+        # Status-query path FIRST so the SME can ask "any update?" without
+        # us misinterpreting it as chit-chat.
+        if _is_invoice_status_query(reply):
+            token, refresh, expires = await self._live_token(state, ctx)
+            invoices: list[dict[str, Any]] = []
+            if token:
+                try:
+                    info = await self._invoices.get_my_invoices(access_token=token)
+                    invoices = list(info.get("invoices") or [])
+                except Exception as exc:  # noqa: BLE001 — degrade in staging
+                    ctx.logger.warning(
+                        "invoice_status.fetch_failed", error=str(exc)[:200]
+                    )
+            await self._send(
+                ctx, state, "onboarding.invoice.status",
+                {
+                    "summary": _format_invoice_status_summary(
+                        invoices or state.invoices_submitted
+                    ),
+                    "count": len(invoices or state.invoices_submitted),
+                },
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+
         attachments = _valid_upload_attachments(reply)
         if not attachments:
             await self._smart_contextual(
@@ -4247,8 +4417,10 @@ class OnboardingWorkflow(WorkflowDefinition):
         # Mint a live token from the verified identity (a long-active user can
         # resume with an empty/expired cached token — same fix as doc uploads).
         token, refresh, expires = await self._live_token(state, ctx)
-        submitted = 0
+        accepted: list[dict[str, Any]] = []
         failed = 0
+        now_iso = ctx.clock.now().isoformat()
+
         for att in attachments:
             content = att.get("content_base64") or ""
             filename = att.get("filename") or "invoice.pdf"
@@ -4256,13 +4428,25 @@ class OnboardingWorkflow(WorkflowDefinition):
                 failed += 1
                 continue
             try:
-                await self._kyc.upload_invoice_base64(
-                    access_token=token,
-                    content_base64=content,
-                    filename=filename,
-                    mime_type=att.get("mime_type"),
-                )
-                submitted += 1
+                if _is_zip_attachment(att):
+                    # Bulk path — server-side recursive extract + submit.
+                    bulk = await self._invoices.submit_zip_base64(
+                        access_token=token,
+                        filename=filename,
+                        content_base64=content,
+                    )
+                    for inv in bulk.get("invoices", []):
+                        if isinstance(inv, dict):
+                            accepted.append(_normalize_invoice_record(inv, now_iso))
+                    failed += int(bulk.get("failed") or 0)
+                else:
+                    record = await self._invoices.extract_and_submit_base64(
+                        access_token=token,
+                        filename=filename,
+                        content_base64=content,
+                        mime_type=att.get("mime_type"),
+                    )
+                    accepted.append(_normalize_invoice_record(record, now_iso))
             except Exception as exc:  # noqa: BLE001 — never crash the run
                 ctx.logger.warning(
                     "invoice_upload.failed",
@@ -4271,29 +4455,29 @@ class OnboardingWorkflow(WorkflowDefinition):
                 )
                 failed += 1
 
-        if submitted:
-            noun = "your invoice has" if submitted == 1 else f"{submitted} invoices have"
-            answer = (
-                f"✅ Got it — {noun} been submitted for financing. Our team will "
-                "review and you'll get an update here once it's disbursed. Send "
-                "another invoice anytime. 🙂"
+        if accepted:
+            await self._send(
+                ctx, state, "onboarding.invoice.received",
+                {
+                    "summary": _format_accepted_invoices(accepted),
+                    "count": len(accepted),
+                    "noun": "invoice" if len(accepted) == 1 else "invoices",
+                    "failed": failed,
+                },
             )
         else:
-            answer = (
-                "I couldn't read that file just now — please resend the invoice as "
-                "a clear PDF or photo and I'll submit it for financing."
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {"reason": "We couldn't read the file — please resend as a clear PDF or photo."},
             )
-        # Send the confirmation directly via the existing contextual template
-        # (no new CMS template needed; no LLM round-trip for a confirmation).
-        await self._send(
-            ctx, state, "onboarding.help.contextual", {"answer": answer, "next_step": ""}
-        )
+
         return self._step(
             "invoice_collect_await",
             ctx,
             access_token=token,
             refresh_token=refresh,
             token_expires_at=expires,
+            invoices_submitted=[*state.invoices_submitted, *accepted],
         )
 
     # -- routers --------------------------------------------------------------

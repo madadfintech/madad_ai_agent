@@ -248,6 +248,21 @@ class OnboardingState(WorkflowState):
     # operations.
     idempotency_keys: dict[str, str] = Field(default_factory=dict)
 
+    # -- Phase 1.b: invoice financing ledger --------------------------------
+    # Each accepted invoice is appended once (invoice_id, supplier_name,
+    # total_amount, currency, status, submitted_at). Lets the agent answer
+    # "what's the status of my invoices?" without a backend round-trip when
+    # the SME has just submitted one, and gives the disbursement webhook a
+    # local record to reconcile against. Disbursements + repayments accrete
+    # similarly so the SME can see a running history over WhatsApp.
+    invoices_submitted: list[dict[str, Any]] = Field(default_factory=list)
+    disbursements_received: list[dict[str, Any]] = Field(default_factory=list)
+    repayments_recorded: list[dict[str, Any]] = Field(default_factory=list)
+    # Running outstanding balance the SME sees on repayment messages. The
+    # backend is the source of truth — this is the agent's optimistic mirror
+    # so the message can render a number without an extra read.
+    repayment_outstanding_qar: int | None = None
+
     # Terminal/decline tracking.
     outcome: str | None = None  # completed | declined | not_eligible | domain_blocked | ...
 

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import pytest
 
 from app.services.workflow import (
+    InMemoryInvoiceClient,
     InMemoryKycClient,
     InMemoryMadadIdentityClient,
     InMemoryMonetizationPaymentClient,
@@ -28,6 +29,7 @@ class Harness:
     kyc: InMemoryKycClient
     payments: InMemoryMonetizationPaymentClient
     reminders: RecordingReminders
+    invoices: InMemoryInvoiceClient
 
 
 @pytest.fixture
@@ -42,6 +44,7 @@ def make_harness() -> Callable[..., Harness]:
         eligibility_result: dict[str, object] | None = None,
         business_details: dict[str, object] | None = None,
         products: list[dict[str, object]] | None = None,
+        seeded_invoices: list[dict[str, object]] | None = None,
     ) -> Harness:
         messenger = RecordingMessenger()
         identity = InMemoryMadadIdentityClient(
@@ -59,14 +62,18 @@ def make_harness() -> Callable[..., Harness]:
             products=products,
         )
         reminders = RecordingReminders()
+        invoices = InMemoryInvoiceClient(invoices=seeded_invoices)
         platform = build_onboarding_platform(
             messenger=messenger,
             identity=identity,
             kyc=kyc,
             payments=payments,
             reminders=reminders,
+            invoices=invoices,
         )
-        return Harness(platform, messenger, identity, kyc, payments, reminders)
+        return Harness(
+            platform, messenger, identity, kyc, payments, reminders, invoices,
+        )
 
     return _make
 

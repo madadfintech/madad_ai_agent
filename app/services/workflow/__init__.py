@@ -23,13 +23,16 @@ from .dispatcher import (
     translate_backend_event,
 )
 from .mcp_identity import McpMadadIdentityClient
+from .mcp_invoices import McpInvoiceClient
 from .mcp_kyc import McpKycClient
 from .mcp_payments import McpMonetizationPaymentAdapter, McpTessLoanPaymentAdapter
 from .onboarding import TEMPLATE_KEYS, OnboardingWorkflow
 from .ports import (
+    InMemoryInvoiceClient,
     InMemoryKycClient,
     InMemoryMadadIdentityClient,
     InMemoryMonetizationPaymentClient,
+    InvoiceClient,
     KycClient,
     MadadIdentityClient,
     Messenger,
@@ -68,18 +71,21 @@ __all__ = [
     "MadadIdentityClient",
     "KycClient",
     "MonetizationPaymentClient",
+    "InvoiceClient",
     "Reminders",
     # in-memory / recording fakes
     "RecordingMessenger",
     "InMemoryMadadIdentityClient",
     "InMemoryKycClient",
     "InMemoryMonetizationPaymentClient",
+    "InMemoryInvoiceClient",
     "RecordingReminders",
     # MCP-backed adapters
     "McpMadadIdentityClient",
     "McpKycClient",
     "McpMonetizationPaymentAdapter",
     "McpTessLoanPaymentAdapter",
+    "McpInvoiceClient",
     # real adapters
     "CommunicationMessenger",
     "NudgeReminders",

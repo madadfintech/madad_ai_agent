@@ -101,11 +101,19 @@ def translate_backend_event(
     workflow can advance without a separate auth_me round-trip.
     ``last_status_source="webhook"`` rides along so the polling worker
     can suppress its next cycle for this run.
+
+    Phase 1.b events (``transaction.disbursed``, ``repayment.*``) get the
+    distinguishing ``type: "phase1b_event"`` marker so the
+    ``_invoice_collect_await`` node can route them to the right handler
+    without scraping every status_update payload looking for the event
+    name.
     """
 
     base: dict[str, Any] = {"last_status_source": "webhook"}
     if event_type == "payment.completed":
         return {"type": "payment", "paid": True, **base, **payload}
+    if event_type in PHASE1B_BACKEND_EVENTS:
+        return {"type": "phase1b_event", "event": event_type, **base, **payload}
     if event_type in EVENT_TO_JOURNEY_STATUS:
         base["journey_status"] = EVENT_TO_JOURNEY_STATUS[event_type]
     return {"type": "status_update", "event": event_type, **base, **payload}

@@ -4360,21 +4360,23 @@ class OnboardingWorkflow(WorkflowDefinition):
     ) -> dict[str, Any]:
         # Steps 10-13 (Phase 1.b): once the credit line is ACTIVATED the SME
         # can send invoices over WhatsApp/email. Routing:
-        #   1. ``status`` query (e.g. "where are my invoices?") → call
+        #   1. Phase 1.b webhook event (transaction.disbursed,
+        #      repayment.received/.partially_paid/.closed/.due_soon/.overdue)
+        #      → dispatch to the matching handler, send the SME-facing
+        #      template, append to the local ledger.
+        #   2. ``status`` query (e.g. "where are my invoices?") → call
         #      ``get_my_invoices`` and render the running status list.
-        #   2. Attachments: ZIP → ``submit_zip_base64`` (server-side
+        #   3. Attachments: ZIP → ``submit_zip_base64`` (server-side
         #      extract+submit per member). Single PDF/photo →
         #      ``extract_and_submit_base64`` (preferred path per Ishan's
         #      README §"Step 10: Invoice Submission" — one round-trip:
         #      backend extracts and submits in one shot).
-        #   3. Empty chat → contextual answer, stay parked.
-        # Disbursement / repayment alerts arrive via the backend webhooks
-        # (transaction.disbursed, repayment.*); ``OnboardingDispatcher``
-        # routes those into ``_disbursement_received`` /
-        # ``_repayment_received`` / ``_repayment_partially_paid`` /
-        # ``_repayment_closed`` / ``_repayment_due_soon`` /
-        # ``_repayment_overdue`` (P3 lands those nodes).
+        #   4. Empty chat → contextual answer, stay parked.
         reply = await_input({"waiting_for": "invoice", "step": "invoice_collect"})
+
+        # Phase 1.b webhook events arrive marked by the dispatcher.
+        if isinstance(reply, dict) and reply.get("type") == "phase1b_event":
+            return await self._handle_phase1b_event(state, ctx, reply)
 
         # Status-query path FIRST so the SME can ask "any update?" without
         # us misinterpreting it as chit-chat.
@@ -4478,6 +4480,145 @@ class OnboardingWorkflow(WorkflowDefinition):
             refresh_token=refresh,
             token_expires_at=expires,
             invoices_submitted=[*state.invoices_submitted, *accepted],
+        )
+
+    async def _handle_phase1b_event(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Dispatch the 6 Phase 1.b webhook events to their SME-facing
+        templates and update the local invoice/repayment ledger.
+
+        ``payload`` carries ``event`` (the backend event_type) plus all
+        the webhook's fields verbatim — amount, ref, due_date, etc. The
+        templates substitute the same field names so the message body
+        reflects whatever the backend sent.
+        """
+        event = str(payload.get("event") or "")
+        now_iso = ctx.clock.now().isoformat()
+
+        # Best-effort amount + reference extraction (camel and snake).
+        def _get(*keys: str) -> Any:
+            for k in keys:
+                v = payload.get(k)
+                if v not in (None, ""):
+                    return v
+            return None
+
+        amount = _get("amount", "amount_qar", "amountQar", "total_amount", "totalAmount")
+        currency = _get("currency") or "QAR"
+        invoice_ref = _get(
+            "invoice_id", "invoiceId", "invoice_number", "invoiceNumber",
+            "reference_number", "referenceNumber", "ref",
+        )
+        try:
+            amount_str = (
+                f"{currency} {int(amount):,}" if amount is not None else f"{currency} —"
+            )
+        except (TypeError, ValueError):
+            amount_str = f"{currency} {amount}" if amount is not None else f"{currency} —"
+
+        # State accumulators — append to whichever ledger the event maps to.
+        disbursements = list(state.disbursements_received)
+        repayments = list(state.repayments_recorded)
+        outstanding = state.repayment_outstanding_qar
+
+        if event == "transaction.disbursed":
+            disbursements.append({
+                "amount": amount,
+                "currency": currency,
+                "invoice_ref": invoice_ref,
+                "received_at": now_iso,
+                "payload": payload,
+            })
+            await self._send(
+                ctx, state, "onboarding.disbursement.received",
+                {"amount": amount_str, "ref": invoice_ref or "—"},
+            )
+        elif event == "repayment.received":
+            repayments.append({
+                "amount": amount, "currency": currency,
+                "invoice_ref": invoice_ref, "kind": "received",
+                "received_at": now_iso,
+            })
+            # Optimistic outstanding update — only when backend supplied it.
+            remaining = _get("outstanding", "outstanding_qar", "outstandingQar")
+            if isinstance(remaining, (int, float)):
+                outstanding = int(remaining)
+                rem_str = f"{currency} {int(remaining):,}"
+            else:
+                rem_str = f"{currency} —"
+            await self._send(
+                ctx, state, "onboarding.repayment.received",
+                {
+                    "amount": amount_str,
+                    "ref": invoice_ref or "—",
+                    "outstanding": rem_str,
+                },
+            )
+        elif event == "repayment.partially_paid":
+            repayments.append({
+                "amount": amount, "currency": currency,
+                "invoice_ref": invoice_ref, "kind": "partial",
+                "received_at": now_iso,
+            })
+            remaining = _get("outstanding", "outstanding_qar", "outstandingQar", "remaining")
+            if isinstance(remaining, (int, float)):
+                outstanding = int(remaining)
+                rem_str = f"{currency} {int(remaining):,}"
+            else:
+                rem_str = f"{currency} —"
+            await self._send(
+                ctx, state, "onboarding.repayment.partially_paid",
+                {
+                    "amount": amount_str,
+                    "ref": invoice_ref or "—",
+                    "outstanding": rem_str,
+                },
+            )
+        elif event == "repayment.closed":
+            repayments.append({
+                "amount": amount, "currency": currency,
+                "invoice_ref": invoice_ref, "kind": "closed",
+                "received_at": now_iso,
+            })
+            outstanding = 0
+            await self._send(
+                ctx, state, "onboarding.repayment.closed",
+                {"ref": invoice_ref or "—", "amount": amount_str},
+            )
+        elif event == "repayment.due_soon":
+            due_date = _get("due_date", "dueDate")
+            await self._send(
+                ctx, state, "onboarding.repayment.due_soon",
+                {
+                    "amount": amount_str,
+                    "ref": invoice_ref or "—",
+                    "due_date": str(due_date) if due_date else "soon",
+                },
+            )
+        elif event == "repayment.overdue":
+            days_overdue = _get("days_overdue", "daysOverdue")
+            await self._send(
+                ctx, state, "onboarding.repayment.overdue",
+                {
+                    "amount": amount_str,
+                    "ref": invoice_ref or "—",
+                    "days_overdue": str(days_overdue) if days_overdue else "—",
+                },
+            )
+        else:
+            # Defensive — unknown phase1b event, stay parked silently.
+            ctx.logger.warning("phase1b_event.unknown", event=event)
+
+        return self._step(
+            "invoice_collect_await",
+            ctx,
+            disbursements_received=disbursements,
+            repayments_recorded=repayments,
+            repayment_outstanding_qar=outstanding,
         )
 
     # -- routers --------------------------------------------------------------

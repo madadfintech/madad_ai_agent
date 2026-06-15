@@ -305,3 +305,217 @@ async def status(channel: Channel, identity: str, platform: Platform) -> RunStat
         prompt=run.pending_interrupts[-1] if run.pending_interrupts else None,
         outcome=None,
     )
+
+
+# --------------------------------------------------------------------------
+# Admin Ops API — surfaced to MADAD backend for operator visibility.
+# Read-only run inspection + a paginated list. Reset is the existing
+# /workflow/admin/forget-session endpoint.
+# --------------------------------------------------------------------------
+
+class OpsRunSummary(BaseModel):
+    """Lean run summary for the Ops list page (one row per run)."""
+
+    run_id: str
+    workflow: str
+    status: str
+    channel: str | None = None
+    identity: str | None = None
+    current_step: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    completed_at: str | None = None
+
+
+class OpsRunListResponse(BaseModel):
+    runs: list[OpsRunSummary]
+    total: int
+    limit: int
+    offset: int
+
+
+class OpsRunDetail(BaseModel):
+    """Full run view: summary + state values (with secrets stripped) +
+    pending interrupts so the operator can see what the SME is waiting on."""
+
+    run_id: str
+    workflow: str
+    status: str
+    channel: str | None
+    identity: str | None
+    current_step: str | None
+    created_at: str | None
+    updated_at: str | None
+    completed_at: str | None
+    pending_interrupts: list[dict[str, Any]] = Field(default_factory=list)
+    state: dict[str, Any] = Field(default_factory=dict)
+
+
+class OpsSummary(BaseModel):
+    """High-level ops summary — what every operator sees on the home page."""
+
+    runs_total: int
+    runs_waiting: int
+    runs_running: int
+    runs_completed: int
+    runs_failed: int
+    invoices_submitted: int
+    disbursements_received: int
+
+
+_OPS_SECRETS = frozenset({
+    "access_token", "onboarding_token", "refresh_token",
+    "token_expires_at",
+})
+
+
+def _to_summary(run: Any) -> OpsRunSummary:
+    return OpsRunSummary(
+        run_id=run.run_id,
+        workflow=getattr(run, "workflow", "onboarding"),
+        status=str(run.status),
+        channel=getattr(run, "channel", None) and str(run.channel),
+        identity=getattr(run, "identity", None),
+        current_step=getattr(run, "current_step", None),
+        created_at=str(getattr(run, "created_at", "") or "") or None,
+        updated_at=str(getattr(run, "updated_at", "") or "") or None,
+        completed_at=str(getattr(run, "completed_at", "") or "") or None,
+    )
+
+
+@app.get(
+    "/workflow/admin/ops/runs",
+    response_model=OpsRunListResponse,
+)
+async def ops_list_runs(
+    platform: Platform,
+    status: str | None = None,
+    channel: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> OpsRunListResponse:
+    """Paginated list of workflow runs for the MADAD ops portal.
+
+    Filters by ``status`` (e.g. ``waiting_for_input`` / ``completed``)
+    and ``channel`` (e.g. ``whatsapp`` / ``email``). Default page size
+    50, max 200. Auth: admin-bearer (gated by ``require_admin`` on the
+    workflow service).
+    """
+    from app.shared.workflow import RunStatus
+
+    runtime = platform.runtime
+    if status:
+        try:
+            statuses = (RunStatus(status),)
+        except ValueError as exc:
+            raise UnknownEventTypeError(f"unknown status: {status}") from exc
+        runs = await runtime.run_store.list_by_status(*statuses)
+    else:
+        # No status filter: union the meaningful statuses. List_by_status
+        # supports varargs so one call covers it.
+        runs = await runtime.run_store.list_by_status(*list(RunStatus))
+    if channel:
+        ch = channel.lower()
+        runs = [
+            r for r in runs
+            if str(getattr(r, "channel", "") or "").lower() == ch
+        ]
+    runs.sort(
+        key=lambda r: str(getattr(r, "updated_at", "") or ""), reverse=True,
+    )
+    page = runs[offset : offset + min(limit, 200)]
+    return OpsRunListResponse(
+        runs=[_to_summary(r) for r in page],
+        total=len(runs),
+        limit=min(limit, 200),
+        offset=offset,
+    )
+
+
+@app.get(
+    "/workflow/admin/ops/runs/{run_id}",
+    response_model=OpsRunDetail,
+)
+async def ops_get_run(run_id: str, platform: Platform) -> OpsRunDetail:
+    """Full run detail — summary + scrubbed state values + pending
+    interrupts. Auth: admin-bearer."""
+
+    runtime = platform.runtime
+    run = await runtime.run_store.get_or_none(run_id)
+    if run is None:
+        raise SessionNotFoundError(f"run not found: {run_id}")
+    compiled = runtime.loader.load(run.workflow, run.version)
+    try:
+        snap = await compiled.graph.aget_state(
+            {"configurable": {"thread_id": run.thread_id}}
+        )
+        raw_state: dict[str, Any] = dict(snap.values or {})
+    except Exception:  # noqa: BLE001 — snapshot may be missing
+        raw_state = {}
+    scrubbed = {
+        k: v for k, v in raw_state.items() if k not in _OPS_SECRETS
+    }
+    return OpsRunDetail(
+        run_id=run.run_id,
+        workflow=run.workflow,
+        status=str(run.status),
+        channel=str(run.channel) if getattr(run, "channel", None) else None,
+        identity=getattr(run, "identity", None),
+        current_step=run.current_step,
+        created_at=str(getattr(run, "created_at", "") or "") or None,
+        updated_at=str(getattr(run, "updated_at", "") or "") or None,
+        completed_at=str(getattr(run, "completed_at", "") or "") or None,
+        pending_interrupts=list(run.pending_interrupts or []),
+        state=scrubbed,
+    )
+
+
+@app.get(
+    "/workflow/admin/ops/summary",
+    response_model=OpsSummary,
+)
+async def ops_summary(platform: Platform) -> OpsSummary:
+    """One-shot operational summary for the MADAD ops home page.
+
+    Aggregates run counts by status + Phase 1.b invoice/disbursement
+    totals from the runs' state ledgers. Auth: admin-bearer.
+    """
+    from app.shared.workflow import RunStatus
+
+    runtime = platform.runtime
+    all_runs = await runtime.run_store.list_by_status(*list(RunStatus))
+    waiting = sum(1 for r in all_runs if str(r.status) == "waiting_for_input")
+    running = sum(1 for r in all_runs if str(r.status) == "running")
+    completed = sum(1 for r in all_runs if str(r.status) == "completed")
+    failed = sum(1 for r in all_runs if str(r.status) == "failed")
+
+    # Walk the recent active runs' state for Phase 1.b totals — bounded
+    # at 200 most-recent so the endpoint stays O(1) per request.
+    recent = sorted(
+        all_runs,
+        key=lambda r: str(getattr(r, "updated_at", "") or ""),
+        reverse=True,
+    )[:200]
+    invoices_submitted = 0
+    disbursements_received = 0
+    for r in recent:
+        try:
+            compiled = runtime.loader.load(r.workflow, r.version)
+            snap = await compiled.graph.aget_state(
+                {"configurable": {"thread_id": r.thread_id}}
+            )
+            state = snap.values or {}
+            invoices_submitted += len(state.get("invoices_submitted") or [])
+            disbursements_received += len(state.get("disbursements_received") or [])
+        except Exception:  # noqa: BLE001 — degrade per-run
+            continue
+
+    return OpsSummary(
+        runs_total=len(all_runs),
+        runs_waiting=waiting,
+        runs_running=running,
+        runs_completed=completed,
+        runs_failed=failed,
+        invoices_submitted=invoices_submitted,
+        disbursements_received=disbursements_received,
+    )

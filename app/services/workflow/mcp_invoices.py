@@ -95,15 +95,12 @@ class McpInvoiceClient:
         status: str = "UNVERIFIED",
         continue_on_error: bool = True,
     ) -> dict[str, Any]:
-        # The cluster's ``upload_zip`` takes ``zip_path`` (server-side
-        # resolvable). For WhatsApp/email attachments where the agent only
-        # has base64 bytes, we attempt a base64 variant first
-        # (``madad_invoices_upload_zip_base64`` if/when registered);
-        # otherwise the adapter raises so the workflow can fall back to a
-        # per-file extract+submit path locally without dropping the SME's
-        # attachment. The agent today never has a stable file_path on the
-        # cluster's filesystem, so the path variant is intentionally
-        # NOT used.
+        # The cluster's ``madad_invoices_upload_zip`` accepts the same
+        # ``file_name`` + ``file_base64`` shape as the single-invoice
+        # base64 tool (see Ishan's cluster README §"Step 10"), so we
+        # send the SME's WhatsApp ZIP bytes through the same tool. If
+        # the cluster ever splits a separate ``upload_zip_base64`` tool,
+        # this adapter is the only place that needs to switch.
         payload: dict[str, Any] = {
             "access_token": access_token,
             "file_name": filename,
@@ -135,10 +132,14 @@ class McpInvoiceClient:
         else:
             invoices = []
             extras = {"raw": response}
+        normalised = [i for i in invoices if isinstance(i, dict)]
+        # ``**extras`` first so the canonical ``invoices`` / ``total``
+        # keys can't be silently overwritten by a stray same-name field
+        # in the upstream response.
         return {
-            "invoices": [i for i in invoices if isinstance(i, dict)],
-            "total": len([i for i in invoices if isinstance(i, dict)]),
             **extras,
+            "invoices": normalised,
+            "total": len(normalised),
         }
 
     async def get_my_invoices(

@@ -80,24 +80,12 @@ groups:
             10 minutes. Either MCP is slow / cold-starting or an
             external backend (Postgres, Redis, Madad MCP) is degraded.
 
-  - name: madad-workflow-business
-    interval: 60s
-    rules:
-      - alert: StaleWaitingRunsAccumulating
-        # Number of workflow runs stuck waiting for input for > 24h.
-        # Indicates either a stuck doc-loop OR a backend webhook drop;
-        # both warrant operator review.
-        expr: |
-          count(http_requests_total{path="/workflow/admin/ops/runs",status="200"}) > 0
-        for: 0m
-        labels:
-          severity: info
-          team: ops
-        annotations:
-          summary: "Long-waiting onboarding runs may be stuck"
-          description: |
-            Check the ops list at
-            `/workflow/admin/ops/runs?status=waiting_for_input` and use
-            `/workflow/admin/forget-session` to reset confirmed-stuck
-            runs. This alert is informational only — confirm via the
-            ops dashboard before acting.
+  # TODO(madad-workflow-business): the previous StaleWaitingRunsAccumulating
+  # alert here was a placeholder — its expression counted /ops/runs API
+  # hits rather than long-stuck workflow runs, so it would fire whenever
+  # anyone opened the ops console. Add a real ``workflow_runs_waiting``
+  # gauge to the workflow service (exported from the run-store, updated
+  # on every transition) and re-introduce the rule against
+  # ``workflow_runs_waiting > N for: 24h``. Until that gauge ships,
+  # operators rely on the dashboard query for runs in
+  # ``waiting_for_input`` and the cached /ops/summary endpoint.

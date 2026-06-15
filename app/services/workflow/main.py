@@ -14,16 +14,17 @@ Drives the onboarding workflow:
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.core.app import create_service_app
-from app.core.security import verify_webhook_signature
+from app.core.security import require_admin, verify_webhook_signature
 from app.shared.events import connect_forwarders, get_event_bus
 from app.shared.workflow import Channel, ExecutionResult
 from app.shared.workflow.errors import SessionNotFoundError
@@ -37,33 +38,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     platform = get_onboarding_platform()
     await platform.runtime.setup()  # e.g. provision the Postgres checkpointer
     connect_forwarders(get_event_bus(), workflow=platform.runtime.events)
-    # Cold-start warmup: when MCP is on, the first request to Cloud Run
-    # takes 2-4 seconds for the instance to boot. Fire one cheap MCP call
-    # here so the first real user-driven turn already sees a warm cluster.
-    await _warmup_mcp()
+    # The previous startup hook fired AUTH_CHECK_CONTACT against the MCP
+    # cluster to warm Cloud Run, which produced a synthetic check_contact
+    # audit-log entry on every restart. Cold-start mitigation is now
+    # handled out-of-band (external uptime ping against /health) so we
+    # don't pollute backend audit logs from inside the agent.
     try:
         yield
     finally:
         await platform.runtime.aclose()
-
-
-async def _warmup_mcp() -> None:
-    """Best-effort cold-start warmup. Fires AUTH_CHECK_CONTACT (cheap,
-    auth-free, no side effects) to wake the Cloud Run instance so the
-    first user request is sub-second instead of 2-3 seconds. Silently
-    no-ops when MCP is disabled or the call fails."""
-
-    from app.core.config import settings as _s
-
-    if not _s.mcp.enabled:
-        return
-    try:
-        from app.shared.mcp import Tools, get_mcp_client
-
-        mcp = get_mcp_client()
-        await mcp.call_tool(Tools.AUTH_CHECK_CONTACT, {"email": "warmup@example.invalid"})
-    except Exception:  # noqa: BLE001 — warmup is best-effort
-        return
 
 
 app = create_service_app(
@@ -251,6 +234,7 @@ class ForgetSessionResponse(BaseModel):
 @app.post(
     "/workflow/admin/forget-session",
     response_model=ForgetSessionResponse,
+    dependencies=[Depends(require_admin)],
 )
 async def forget_session(
     req: ForgetSessionRequest, platform: Platform
@@ -303,7 +287,7 @@ async def status(channel: Channel, identity: str, platform: Platform) -> RunStat
         completed=run.status.value == "completed",
         current_step=run.current_step,
         prompt=run.pending_interrupts[-1] if run.pending_interrupts else None,
-        outcome=None,
+        outcome=(run.metadata or {}).get("outcome"),
     )
 
 
@@ -363,9 +347,52 @@ class OpsSummary(BaseModel):
     disbursements_received: int
 
 
-_OPS_SECRETS = frozenset({
-    "access_token", "onboarding_token", "refresh_token",
-    "token_expires_at",
+# Allow-list of state fields that are safe to surface via /ops/runs/{id}.
+# We invert the previous block-list so a new OnboardingState field is hidden
+# by default — adding KYC PII, document blobs, or payment links to the state
+# never accidentally leaks them through the ops API. Operators who need a
+# field added must do so explicitly.
+#
+# Excluded by design: any *_content_base64 (raw KYC PDFs), *_filename,
+# *_mime_type, business_email + onboarding_first_name/last_name/cr_number/
+# phone_override (PII), payment_link (live signed URL), idempotency_keys
+# (payment dedup keys), eligibility_form_data + buyers + shareholders
+# (PII bundles), check_contact_result / registration_payload (raw backend
+# bodies that may carry PII).
+_OPS_VISIBLE_STATE_FIELDS = frozenset({
+    # identity / routing
+    "locale", "channel_identity", "session_type",
+    "registration_route",
+    "domain_block_reason",
+    "madad_user_id", "application_ref",
+    # journey
+    "journey_status", "last_polled_at", "last_status_source",
+    "account_has_email",
+    # progress flags (non-PII booleans / counts only)
+    "consent", "cr_verified",
+    "eligible", "financials_received",
+    "documents_received", "docs_uploaded_count",
+    "documents_complete_sent", "docs_proceed",
+    "docs_settle_prompted",
+    "prequalified", "payment_ready", "madad_score",
+    "onboarding_progress_step",
+    "paid", "offer_confirmed_sent", "offers_shown_sig",
+    "outcome",
+    # payment (amount + status + product id only — NO payment_link)
+    "business_details_id", "payment_product_id",
+    "payment_amount_qar", "payment_id", "payment_status",
+    # missing-docs LIST (codes only — no contents)
+    "missing_documents", "docs_acked",
+    # Phase 1.b ledger summaries (sizes, not raw content)
+    "repayment_outstanding_qar",
+    # The lists below carry only the agent's local summaries (no base64,
+    # no PII) so they're safe; per-record fields are already vetted by
+    # the renderers in onboarding.py.
+    "invoices_submitted", "disbursements_received", "repayments_recorded",
+    "business_email_status",
+    # debounce timestamps
+    "documents_processing_ack_at", "documents_checklist_sent_at",
+    "more_docs_prompt_at", "docs_last_upload_at",
 })
 
 
@@ -386,6 +413,7 @@ def _to_summary(run: Any) -> OpsRunSummary:
 @app.get(
     "/workflow/admin/ops/runs",
     response_model=OpsRunListResponse,
+    dependencies=[Depends(require_admin)],
 )
 async def ops_list_runs(
     platform: Platform,
@@ -398,8 +426,7 @@ async def ops_list_runs(
 
     Filters by ``status`` (e.g. ``waiting_for_input`` / ``completed``)
     and ``channel`` (e.g. ``whatsapp`` / ``email``). Default page size
-    50, max 200. Auth: admin-bearer (gated by ``require_admin`` on the
-    workflow service).
+    50, max 200. Auth: admin-bearer.
     """
     from app.shared.workflow import RunStatus
 
@@ -408,7 +435,10 @@ async def ops_list_runs(
         try:
             statuses = (RunStatus(status),)
         except ValueError as exc:
-            raise UnknownEventTypeError(f"unknown status: {status}") from exc
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown status: {status!r}",
+            ) from exc
         runs = await runtime.run_store.list_by_status(*statuses)
     else:
         # No status filter: union the meaningful statuses. List_by_status
@@ -435,6 +465,7 @@ async def ops_list_runs(
 @app.get(
     "/workflow/admin/ops/runs/{run_id}",
     response_model=OpsRunDetail,
+    dependencies=[Depends(require_admin)],
 )
 async def ops_get_run(run_id: str, platform: Platform) -> OpsRunDetail:
     """Full run detail — summary + scrubbed state values + pending
@@ -452,8 +483,10 @@ async def ops_get_run(run_id: str, platform: Platform) -> OpsRunDetail:
         raw_state: dict[str, Any] = dict(snap.values or {})
     except Exception:  # noqa: BLE001 — snapshot may be missing
         raw_state = {}
+    # Allow-list (default-deny): a new state field is hidden until it's
+    # explicitly added to ``_OPS_VISIBLE_STATE_FIELDS``.
     scrubbed = {
-        k: v for k, v in raw_state.items() if k not in _OPS_SECRETS
+        k: v for k, v in raw_state.items() if k in _OPS_VISIBLE_STATE_FIELDS
     }
     return OpsRunDetail(
         run_id=run.run_id,
@@ -470,16 +503,30 @@ async def ops_get_run(run_id: str, platform: Platform) -> OpsRunDetail:
     )
 
 
-@app.get(
-    "/workflow/admin/ops/summary",
-    response_model=OpsSummary,
-)
-async def ops_summary(platform: Platform) -> OpsSummary:
-    """One-shot operational summary for the MADAD ops home page.
+# 30-second in-process cache for /ops/summary. The endpoint walks up to
+# 200 LangGraph state snapshots per call to aggregate Phase 1.b totals;
+# at a typical dashboard poll rate (15s × N viewers) that's a lot of
+# Postgres round-trips for a number that doesn't need to be live to the
+# second. We re-compute at most once every OPS_SUMMARY_CACHE_TTL_SECONDS
+# and serve cached otherwise. Reset when the workflow process restarts.
+OPS_SUMMARY_CACHE_TTL_SECONDS = 30.0
+_ops_summary_cached_value: OpsSummary | None = None
+_ops_summary_cached_at: float = 0.0
+_ops_summary_lock = asyncio.Lock()
 
-    Aggregates run counts by status + Phase 1.b invoice/disbursement
-    totals from the runs' state ledgers. Auth: admin-bearer.
+
+def reset_ops_summary_cache() -> None:
+    """Invalidate the /ops/summary cache so the next call recomputes.
+
+    Used by tests that drive state through the workflow then read summary
+    counts; in production we just let the TTL expire.
     """
+    global _ops_summary_cached_value, _ops_summary_cached_at
+    _ops_summary_cached_value = None
+    _ops_summary_cached_at = 0.0
+
+
+async def _compute_ops_summary(platform: OnboardingPlatform) -> OpsSummary:
     from app.shared.workflow import RunStatus
 
     runtime = platform.runtime
@@ -489,8 +536,9 @@ async def ops_summary(platform: Platform) -> OpsSummary:
     completed = sum(1 for r in all_runs if str(r.status) == "completed")
     failed = sum(1 for r in all_runs if str(r.status) == "failed")
 
-    # Walk the recent active runs' state for Phase 1.b totals — bounded
-    # at 200 most-recent so the endpoint stays O(1) per request.
+    # Walk only the 200 most-recent runs so a long-running deployment
+    # doesn't make /summary slower over time. The cache then absorbs
+    # repeat requests.
     recent = sorted(
         all_runs,
         key=lambda r: str(getattr(r, "updated_at", "") or ""),
@@ -519,3 +567,39 @@ async def ops_summary(platform: Platform) -> OpsSummary:
         invoices_submitted=invoices_submitted,
         disbursements_received=disbursements_received,
     )
+
+
+@app.get(
+    "/workflow/admin/ops/summary",
+    response_model=OpsSummary,
+    dependencies=[Depends(require_admin)],
+)
+async def ops_summary(platform: Platform) -> OpsSummary:
+    """One-shot operational summary for the MADAD ops home page.
+
+    Aggregates run counts by status + Phase 1.b invoice/disbursement
+    totals from the runs' state ledgers. Auth: admin-bearer.
+    Cached for OPS_SUMMARY_CACHE_TTL_SECONDS — operators see counts that
+    may lag by up to that window, which is fine for a dashboard.
+    """
+    global _ops_summary_cached_value, _ops_summary_cached_at
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    if (
+        _ops_summary_cached_value is not None
+        and (now - _ops_summary_cached_at) < OPS_SUMMARY_CACHE_TTL_SECONDS
+    ):
+        return _ops_summary_cached_value
+    async with _ops_summary_lock:
+        # Double-check inside the lock — another caller may have refreshed
+        # the cache while we were waiting on the lock.
+        now = loop.time()
+        if (
+            _ops_summary_cached_value is not None
+            and (now - _ops_summary_cached_at) < OPS_SUMMARY_CACHE_TTL_SECONDS
+        ):
+            return _ops_summary_cached_value
+        value = await _compute_ops_summary(platform)
+        _ops_summary_cached_value = value
+        _ops_summary_cached_at = loop.time()
+        return value

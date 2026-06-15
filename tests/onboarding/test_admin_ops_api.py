@@ -12,7 +12,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from app.services.workflow.deps import get_onboarding_platform
-from app.services.workflow.main import app
+from app.services.workflow.main import app, reset_ops_summary_cache
 
 client = TestClient(app)
 DOC = "ZHVtbXk="
@@ -69,7 +69,7 @@ def test_ops_run_detail_returns_state_and_pending_interrupts() -> None:
     identity = identities[0]
     # Find the run id from the list.
     list_resp = client.get(
-        f"/workflow/admin/ops/runs?status=waiting_for_input"
+        "/workflow/admin/ops/runs?status=waiting_for_input"
     )
     matching = [
         r for r in list_resp.json()["runs"] if r["identity"] == identity
@@ -144,5 +144,8 @@ async def test_ops_summary_phase1b_counts_after_invoice_submission() -> None:
     # Now at invoice_collect_await — submit one invoice.
     await resume({"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]})
 
+    # /ops/summary is cached for 30s in prod; for this test we invalidate
+    # so we read the post-submission counts directly.
+    reset_ops_summary_cache()
     summary = client.get("/workflow/admin/ops/summary").json()
     assert summary["invoices_submitted"] >= 1

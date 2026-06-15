@@ -22,13 +22,28 @@ from app.core.logging import get_logger
 _REQUESTS = Counter(
     "http_requests_total",
     "Total HTTP requests.",
-    ["service", "method", "status"],
+    ["service", "method", "path", "status"],
 )
 _LATENCY = Histogram(
     "http_request_duration_seconds",
     "HTTP request latency in seconds.",
-    ["service", "method"],
+    ["service", "method", "path"],
 )
+
+
+def _path_label(request: Request) -> str:
+    """Stable, low-cardinality path label for Prometheus.
+
+    Prefer the matched route's templated path (``/runs/{run_id}``) so
+    every concrete ID collapses to the same series instead of exploding
+    cardinality. Falls back to the raw URL path only when no route matched
+    (probes, 404s, middleware-early responses).
+    """
+    route = request.scope.get("route") if request.scope else None
+    template = getattr(route, "path", None) if route is not None else None
+    if isinstance(template, str) and template:
+        return template
+    return request.url.path or "unknown"
 
 
 class PrometheusMiddleware(BaseHTTPMiddleware):
@@ -46,13 +61,15 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             status = response.status_code
         except Exception:
-            _REQUESTS.labels(self._service, request.method, "500").inc()
-            _LATENCY.labels(self._service, request.method).observe(
+            path = _path_label(request)
+            _REQUESTS.labels(self._service, request.method, path, "500").inc()
+            _LATENCY.labels(self._service, request.method, path).observe(
                 time.perf_counter() - start
             )
             raise
-        _REQUESTS.labels(self._service, request.method, str(status)).inc()
-        _LATENCY.labels(self._service, request.method).observe(time.perf_counter() - start)
+        path = _path_label(request)
+        _REQUESTS.labels(self._service, request.method, path, str(status)).inc()
+        _LATENCY.labels(self._service, request.method, path).observe(time.perf_counter() - start)
         return response
 
 

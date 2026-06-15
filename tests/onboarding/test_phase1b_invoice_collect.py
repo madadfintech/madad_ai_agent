@@ -13,8 +13,6 @@ import base64
 import io
 import zipfile
 
-import pytest
-
 from app.services.workflow import InMemoryInvoiceClient
 from app.shared.workflow import Channel, RunStatus
 

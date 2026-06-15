@@ -15,11 +15,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from typing import Any
 
 from app.shared.workflow import Channel, ExecutionResult, WorkflowRuntime
 from app.shared.workflow.enums import TERMINAL_STATUSES, RunStatus
-from app.shared.workflow.errors import WorkflowExecutionError
 
 from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
 
@@ -145,8 +145,19 @@ class OnboardingDispatcher:
         # own "processing now" ack — user got 8 acks + duplicate ✅
         # entries). Per-(channel, identity) asyncio.Lock serialises the
         # concurrent posts so they queue cleanly instead of racing.
-        self._locks: dict[tuple[Channel, str], asyncio.Lock] = {}
+        #
+        # OrderedDict + size cap: the previous unbounded dict grew one
+        # entry per unique (channel, identity) tuple and never freed
+        # them. At scale that's a slow memory leak. The LRU trim evicts
+        # the oldest entries whenever the map crosses the cap; an
+        # evicted lock is only ever swapped for a fresh one on the next
+        # touch — safe because the previous one couldn't have been held
+        # (we hold the lock for the duration of one dispatch, and a
+        # fresh dispatch for the same identity always touches the map
+        # before acquiring the lock).
+        self._locks: OrderedDict[tuple[Channel, str], asyncio.Lock] = OrderedDict()
         self._locks_guard = asyncio.Lock()
+        self._locks_max = 2048
 
     async def _identity_lock(
         self, channel: Channel, identity: str
@@ -159,6 +170,11 @@ class OnboardingDispatcher:
             if lock is None:
                 lock = asyncio.Lock()
                 self._locks[key] = lock
+                # Trim the oldest entries when over the cap.
+                while len(self._locks) > self._locks_max:
+                    self._locks.popitem(last=False)
+            else:
+                self._locks.move_to_end(key)
         return lock
 
     @property
@@ -296,7 +312,7 @@ class OnboardingDispatcher:
                         return await self._runtime.resume(
                             channel, identity, message=payload
                         )
-                    except (WorkflowExecutionError, Exception):  # noqa: BLE001
+                    except Exception:  # noqa: BLE001
                         pass
         return await self._runtime.start(self._workflow, channel, identity, input=payload)
 

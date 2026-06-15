@@ -70,6 +70,11 @@ async def test_zip_upload_routes_through_classify_and_upload_zip(make_harness) -
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
+    # Snapshot KYC calls BEFORE the ZIP so the assertion only counts what
+    # the documents step did with it — the CR upload at consent_cr now
+    # also routes through classify_and_upload_document_base64 (A5 reshape)
+    # so we'd otherwise include that in the "per-file path didn't fire" check.
+    pre_zip_calls = [name for name, _ in harness.kyc.calls]
 
     zip_bytes = _build_zip_bytes()
     zip_b64 = base64.b64encode(zip_bytes).decode("ascii")
@@ -85,11 +90,11 @@ async def test_zip_upload_routes_through_classify_and_upload_zip(make_harness) -
         }
     )
 
-    kyc_calls = [name for name, _ in harness.kyc.calls]
+    post_zip_calls = [name for name, _ in harness.kyc.calls][len(pre_zip_calls):]
     # The ZIP tool fires exactly once for the whole archive.
-    assert kyc_calls.count("classify_and_upload_zip_base64") == 1
+    assert post_zip_calls.count("classify_and_upload_zip_base64") == 1
     # And the per-file path did NOT fire 3 extra times (server-side handled it).
-    assert kyc_calls.count("classify_and_upload_document_base64") == 0
+    assert post_zip_calls.count("classify_and_upload_document_base64") == 0
 
 
 async def test_zip_fallback_when_backend_errors(make_harness) -> None:
@@ -131,6 +136,10 @@ async def test_zip_fallback_when_backend_errors(make_harness) -> None:
     await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
     await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
     await resume({"event": "prequalification.completed", "madadScore": 78})
+    # Snapshot KYC calls BEFORE the ZIP — A5 reshape now routes the CR
+    # upload through classify_and_upload_document_base64 too, so the
+    # delta is the only fair denominator.
+    pre_zip_calls = [name for name, _ in harness.kyc.calls]
 
     zip_bytes = _build_zip_bytes()
     zip_b64 = base64.b64encode(zip_bytes).decode("ascii")
@@ -146,8 +155,8 @@ async def test_zip_fallback_when_backend_errors(make_harness) -> None:
         }
     )
 
-    kyc_calls = [name for name, _ in harness.kyc.calls]
+    post_zip_calls = [name for name, _ in harness.kyc.calls][len(pre_zip_calls):]
     # The ZIP tool was attempted once + raised...
-    assert kyc_calls.count("classify_and_upload_zip_base64") == 1
+    assert post_zip_calls.count("classify_and_upload_zip_base64") == 1
     # ...and the workflow fell back to per-member classify (3 members).
-    assert kyc_calls.count("classify_and_upload_document_base64") == 3
+    assert post_zip_calls.count("classify_and_upload_document_base64") == 3

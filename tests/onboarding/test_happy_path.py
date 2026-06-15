@@ -144,15 +144,20 @@ async def test_mcp_tool_calls_happen_in_order(harness):
     assert "open_session" in identity_calls
     assert "me" in identity_calls
 
-    # KYC contract: CR upload, audited financial report, and at least one
-    # document upload. main's WhatsApp flow uses the hardcoded full-checklist
-    # (DEFAULT_WHATSAPP_REQUIRED_DOCS) rather than calling
-    # get_admin_requested_documents on the WA channel; update_eligibility /
-    # add_buyer / add_shareholders are no longer in the graph.
-    assert "upload_commercial_registration" in kyc_calls
+    # KYC contract: A5 reshape (2026-06-07) routes BOTH the CR upload and
+    # the per-doc upload step through classify_and_upload_document_base64
+    # (single classify path — backend decides the document type rather
+    # than the agent inferring it from the filename). The audited
+    # financial report keeps its dedicated tool. main's WhatsApp flow
+    # uses the hardcoded full-checklist (DEFAULT_WHATSAPP_REQUIRED_DOCS)
+    # rather than calling get_admin_requested_documents on the WA
+    # channel; update_eligibility / add_buyer / add_shareholders are no
+    # longer in the graph.
     assert "upload_audited_financial_report" in kyc_calls
-    # A5: docs loop now routes through the classify-and-upload tool.
     assert "classify_and_upload_document_base64" in kyc_calls
+    # A5 retired ``upload_commercial_registration`` from the WA path —
+    # guard so it doesn't sneak back in.
+    assert "upload_commercial_registration" not in kyc_calls
 
 
 async def test_reminders_scheduled_and_suppressed_at_wait_points(harness):

@@ -30,18 +30,21 @@ def test_format_offer_cards_renders_pdf_step_8_layout() -> None:
         },
     ]
     out = _format_offer_cards(offers)
-    # Card 1: PDF Step 8 first row
+    # Card 1: PDF Step 8 first row. The fee label is "total fees" now —
+    # the renderer sums every fee component the lender set (processing +
+    # other charges + brokerage + feasibility + other fees/commissions)
+    # so one line tells the SME what they'll actually pay (UAT 2026-06-13).
     assert "🏦 Offer 1 — Qatar Islamic Bank" in out
     assert "QAR 35,000" in out
     assert "10% p.a." in out
     assert "30 days" in out
-    assert "QAR 100 fee" in out
+    assert "QAR 100 total fees" in out
     # Card 2: PDF Step 8 second row
     assert "🏦 Offer 2 — Commercial Bank" in out
     assert "QAR 40,000" in out
     assert "9.5% p.a." in out
     assert "45 days" in out
-    assert "QAR 150 fee" in out
+    assert "QAR 150 total fees" in out
     # Separator rule between cards
     assert "━━━━━━━━━━━━━" in out
 

@@ -46,6 +46,12 @@ async def test_upload_steps_require_attachments(make_harness):
 
 
 async def test_filename_only_upload_does_not_advance(make_harness):
+    """A filename-only attachment (no content_base64) used to fire the old
+    ``onboarding.upload.required`` nag. That template was retired per the
+    file docstring above (the lenient/conversational docs flow). The node
+    now stays parked at consent_cr and answers conversationally via
+    ``onboarding.help.contextual`` — and crucially must NOT advance to
+    the eligibility step on bytes-less input."""
     harness = make_harness(known_phones={IDENTITY: "user_42"})
     runtime = harness.platform.runtime
     await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
@@ -58,7 +64,10 @@ async def test_filename_only_upload_does_not_advance(make_harness):
 
     assert result.prompt == {"waiting_for": "upload", "step": "consent_cr"}
     templates = harness.messenger.templates()
-    assert "onboarding.upload.required" in templates
+    assert "onboarding.help.contextual" in templates
+    # The retired-template guard stays in place: it must never reappear.
+    assert "onboarding.upload.required" not in templates
+    # And we don't skip to eligibility either.
     assert "onboarding.eligibility.intake.request" not in templates
 
 

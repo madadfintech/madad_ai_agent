@@ -90,6 +90,7 @@ from app.shared.workflow.state import HistoryEntry
 
 from .mcp_kyc import workflow_doc_type as _workflow_doc_type
 from .ports import (
+    InMemoryInvoiceClient,
     InvoiceClient,
     KycClient,
     MadadIdentityClient,
@@ -403,12 +404,17 @@ def _format_invoice_status_summary(invoices: list[dict[str, Any]]) -> str:
             or "SUBMITTED"
         )
         # Friendly icon by status group.
-        if str(status).upper() in {"DISBURSED", "FUNDED", "PAID_OUT"}:
+        status_upper = str(status).upper()
+        if status_upper in {"DISBURSED", "FUNDED", "PAID_OUT"}:
             icon = "💸"
-        elif str(status).upper() in {"REPAID", "CLOSED"}:
+        elif status_upper in {"REPAID", "CLOSED"}:
             icon = "✅"
-        elif str(status).upper() in {"REJECTED", "DECLINED"}:
+        elif status_upper in {"REJECTED", "DECLINED"}:
             icon = "❌"
+        elif status_upper in {"OVERDUE", "PAST_DUE"}:
+            icon = "🚨"
+        elif status_upper in {"DUE_SOON", "DUE"}:
+            icon = "⏰"
         else:
             icon = "📄"
         supplier = (
@@ -1247,13 +1253,17 @@ class OnboardingWorkflow(WorkflowDefinition):
         # naming a new ctor arg; the default in-memory fake fires when
         # the caller omits it, and ``build_onboarding_platform`` wires
         # the real ``McpInvoiceClient`` when ``mcp.enabled=True``.
-        from .ports import InMemoryInvoiceClient
         self._invoices: InvoiceClient = invoices or InMemoryInvoiceClient()
 
     # -- graph wiring ---------------------------------------------------------
 
     def build(self, graph: GraphBuilder) -> None:
         nodes: dict[str, Any] = {
+            # Step 0: cold-start check_registration BEFORE we send the
+            # campaign intro — returning users are detected on the first
+            # inbound and routed into the RESUME chain instead of being
+            # asked to sign up again.
+            "entry_registration_check": self._entry_registration_check,
             # Step 1: campaign + identification
             "campaign_send": self._campaign_send,
             "campaign_await": self._campaign_await,
@@ -1327,7 +1337,19 @@ class OnboardingWorkflow(WorkflowDefinition):
         for node_name, fn in nodes.items():
             graph.add_node(node_name, fn)
 
-        graph.set_entry("campaign_send")
+        graph.set_entry("entry_registration_check")
+        graph.add_conditional_edges(
+            "entry_registration_check",
+            self._route_entry_registration_check,
+            {
+                # Returning user: a route or registered payload came back —
+                # mint a session and let the resume chain drop them at
+                # the exact step their journey_status implies.
+                "registered": "channel_session_resume",
+                # No registration → normal campaign intro / SIGN_UP path.
+                "fresh": "campaign_send",
+            },
+        )
         graph.add_edge("campaign_send", "campaign_await")
         graph.add_conditional_edges(
             "campaign_await",
@@ -1651,20 +1673,32 @@ class OnboardingWorkflow(WorkflowDefinition):
         await self._send(ctx, state, "onboarding.declined")
         return self._step("declined", ctx, outcome="declined")
 
-    async def _check_contact_send(
+    async def _entry_registration_check(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        if ctx.channel is Channel.WHATSAPP:
-            result = await self._identity.check_contact(phone=ctx.identity)
-        else:
-            result = await self._identity.check_contact(email=ctx.identity)
-        # Per Ishan (cluster commit e6ea5d2, 2026-06-10): also fire the
-        # read-only registration lookup — it returns the full registered
-        # shape (route hint, journey status, fee paid, credit line,
-        # offers…) so the dispatcher can skip SIGN_UP for returning
-        # users and re-send the appropriate message instead of
-        # silently re-onboarding (Bug #2 + Bug #6). Best-effort: a
-        # failure here must not break the SIGN_UP path.
+        """Cold-start ``check_registration`` BEFORE the campaign intro.
+
+        Per Ishan (cluster commit ``e6ea5d2``, 2026-06-10): returning users
+        should be detected on the FIRST inbound — before we send "Welcome
+        to Madad — would you like to sign up?" to someone whose application
+        is already in flight. The lookup is read-only and free, so we do
+        it once at workflow entry. Three outcomes:
+
+          * ``registered=True`` → store the route + payload on state and
+            jump into the RESUME chain (channel_session_resume →
+            resume_status_fetch → status-routed terminal/continue node).
+          * ``registered=False`` → fall through to campaign_send (the
+            original entry) so the normal SIGN_UP path runs unchanged.
+          * Lookup error → log + fall through to campaign_send. The
+            second check inside ``_check_contact_send`` (after YES)
+            gives the SME another chance to be detected as returning.
+
+        The follow-up check_registration call inside ``_check_contact_send``
+        is guarded so it only re-fires when ENTRY's call returned no route
+        (i.e. either ``registered=False`` or the request errored). This
+        avoids a redundant round-trip on the returning-user path while
+        keeping the original SIGN_UP detection working unchanged.
+        """
         route: str | None = None
         payload: dict[str, Any] = {}
         try:
@@ -1679,8 +1713,60 @@ class OnboardingWorkflow(WorkflowDefinition):
                     route = raw_route
         except Exception as exc:  # noqa: BLE001 — non-fatal, fall through
             ctx.logger.warning(
-                "check_registration.failed", error=str(exc)[:200]
+                "entry_check_registration.failed", error=str(exc)[:200]
             )
+        return self._step(
+            "entry_registration_check",
+            ctx,
+            channel_identity=ctx.identity,
+            registration_route=route,
+            registration_payload=payload,
+        )
+
+    def _route_entry_registration_check(self, state: OnboardingState) -> str:
+        """Branch from cold-start entry: registered → RESUME, else
+        SIGN_UP / campaign intro."""
+        if state.registration_payload:
+            return "registered"
+        return "fresh"
+
+    async def _check_contact_send(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        if ctx.channel is Channel.WHATSAPP:
+            result = await self._identity.check_contact(phone=ctx.identity)
+        else:
+            result = await self._identity.check_contact(email=ctx.identity)
+        # Per Ishan (cluster commit e6ea5d2, 2026-06-10): also fire the
+        # read-only registration lookup — it returns the full registered
+        # shape (route hint, journey status, fee paid, credit line,
+        # offers…) so the dispatcher can skip SIGN_UP for returning
+        # users and re-send the appropriate message instead of
+        # silently re-onboarding (Bug #2 + Bug #6). Best-effort: a
+        # failure here must not break the SIGN_UP path.
+        #
+        # Guard: if the cold-start ``entry_registration_check`` node
+        # already captured a route, skip this redundant call — the entry
+        # node's lookup wins. We only re-check here when the entry call
+        # returned no route (registered=False OR errored), in case the
+        # SME's account state changed between entry and the YES reply.
+        route: str | None = state.registration_route
+        payload: dict[str, Any] = dict(state.registration_payload or {})
+        if route is None and not payload:
+            try:
+                reg = await self._identity.check_registration(
+                    identifier=ctx.identity,
+                    channel=_channel(ctx),
+                )
+                if isinstance(reg, dict) and reg.get("registered"):
+                    payload = reg
+                    raw_route = reg.get("route")
+                    if isinstance(raw_route, str):
+                        route = raw_route
+            except Exception as exc:  # noqa: BLE001 — non-fatal, fall through
+                ctx.logger.warning(
+                    "check_registration.failed", error=str(exc)[:200]
+                )
         return self._step(
             "check_contact_send",
             ctx,
@@ -4023,7 +4109,7 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _fetch_banks_to_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> list[str]:
-        """Read \`BusinessDetails.banksToSend\` for the current SME — the list of
+        """Read ``BusinessDetails.banksToSend`` for the current SME — the list of
         banks the admin marked as targets when forwarding the application.
         Tolerates camelCase / snake_case / list-or-string shapes."""
         if not state.access_token:
@@ -4543,12 +4629,18 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "invoice_ref": invoice_ref, "kind": "received",
                 "received_at": now_iso,
             })
-            # Optimistic outstanding update — only when backend supplied it.
+            # Backend is the source of truth for the outstanding balance.
+            # When it omits the field the previous "—" in the message
+            # used to leave state pointing at the prior (stale) number,
+            # so /status would show one figure and the live message
+            # another. Clear state to None when the backend has nothing
+            # to say so the two stay aligned.
             remaining = _get("outstanding", "outstanding_qar", "outstandingQar")
             if isinstance(remaining, (int, float)):
                 outstanding = int(remaining)
                 rem_str = f"{currency} {int(remaining):,}"
             else:
+                outstanding = None
                 rem_str = f"{currency} —"
             await self._send(
                 ctx, state, "onboarding.repayment.received",
@@ -4569,6 +4661,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 outstanding = int(remaining)
                 rem_str = f"{currency} {int(remaining):,}"
             else:
+                outstanding = None
                 rem_str = f"{currency} —"
             await self._send(
                 ctx, state, "onboarding.repayment.partially_paid",

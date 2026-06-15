@@ -90,6 +90,7 @@ from app.shared.workflow.state import HistoryEntry
 
 from .mcp_kyc import workflow_doc_type as _workflow_doc_type
 from .ports import (
+    InvoiceClient,
     KycClient,
     MadadIdentityClient,
     Messenger,
@@ -1102,12 +1103,20 @@ class OnboardingWorkflow(WorkflowDefinition):
         kyc: KycClient,
         payments: MonetizationPaymentClient,
         reminders: Reminders,
+        invoices: InvoiceClient | None = None,
     ) -> None:
         self._msg = messenger
         self._identity = identity
         self._kyc = kyc
         self._pay = payments
         self._reminders = reminders
+        # Phase 1.b — invoice financing client. Optional only to keep
+        # the long tail of existing test harnesses building without
+        # naming a new ctor arg; the default in-memory fake fires when
+        # the caller omits it, and ``build_onboarding_platform`` wires
+        # the real ``McpInvoiceClient`` when ``mcp.enabled=True``.
+        from .ports import InMemoryInvoiceClient
+        self._invoices: InvoiceClient = invoices or InMemoryInvoiceClient()
 
     # -- graph wiring ---------------------------------------------------------
 

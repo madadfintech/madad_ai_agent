@@ -1162,3 +1162,164 @@ class RecordingReminders(Reminders):
 
     async def suppress(self, *, target_ref: str | None) -> None:
         self.suppressed.append(target_ref)
+
+
+# -- Phase 1.b invoice financing ------------------------------------------
+# Tools live in the cluster under ``madad_invoices_*``. Per Ishan's README
+# §"Step 10: Invoice Submission" and [[project_mcp_catalog]] §"Invoice
+# Financing", the preferred WhatsApp/email agent path for a SINGLE invoice
+# is ``extract_and_submit_invoice_base64`` (combines extract+submit in one
+# round-trip; backend reuses the portal pipeline). Bulk invoices go via
+# ``upload_zip`` (server-side recursive). Status queries call
+# ``get_my_invoices``.
+class InvoiceClient(Protocol):
+    """Phase 1.b invoice financing client — the SME submits invoices over
+    WhatsApp/email once the credit line is ACTIVATED, and the backend then
+    extracts + submits them through the same pipeline the portal uses.
+
+    Implementations: ``InMemoryInvoiceClient`` (tests) and
+    ``McpInvoiceClient`` (production — wraps the 9 ``madad_invoices_*``
+    tools from the MCP cluster).
+    """
+
+    async def extract_and_submit_base64(
+        self,
+        *,
+        access_token: str,
+        filename: str,
+        content_base64: str,
+        mime_type: str | None = None,
+        user_id: str | None = None,
+        status: str = "UNVERIFIED",
+    ) -> dict[str, Any]:
+        """Preferred WhatsApp/email path for a SINGLE invoice attachment.
+
+        One call: backend extracts the invoice fields (supplier, customer,
+        amount, due_date, etc.) and submits the record in one round-trip.
+        Returns the submitted invoice record so the agent can show the SME
+        the extracted summary and a backend-assigned reference number.
+        """
+        ...
+
+    async def submit_zip_base64(
+        self,
+        *,
+        access_token: str,
+        filename: str,
+        content_base64: str,
+        user_id: str | None = None,
+        status: str = "UNVERIFIED",
+        continue_on_error: bool = True,
+    ) -> dict[str, Any]:
+        """Bulk path — the SME sent a ZIP. Backend expands the archive,
+        runs extract+submit per member, returns the per-file outcome list
+        so the agent can render a ZIP receipt (✅ / ⚠️ per invoice)."""
+        ...
+
+    async def get_my_invoices(
+        self, *, access_token: str
+    ) -> dict[str, Any]:
+        """Status query — used when the SME asks 'what's the status of my
+        invoices?'. Returns the SME's invoice list with backend-computed
+        statuses (SUBMITTED / DISBURSED / REPAID / etc.)."""
+        ...
+
+
+class InMemoryInvoiceClient:
+    """Configurable fake implementing :class:`InvoiceClient`.
+
+    Tests can seed ``invoices`` to drive status-query rendering. Submitted
+    invoices accumulate in ``submitted`` so workflow assertions can
+    inspect what was sent. Each call is captured in ``calls`` for
+    introspection. ZIP submissions append one entry per member to
+    ``submitted`` so the per-file checklist is faithful to production.
+    """
+
+    def __init__(
+        self,
+        *,
+        invoices: list[dict[str, Any]] | None = None,
+        extract_error: BaseException | None = None,
+    ) -> None:
+        self._seeded: list[dict[str, Any]] = list(invoices or [])
+        self.submitted: list[dict[str, Any]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._extract_error = extract_error
+
+    def _record(self, name: str, **kwargs: Any) -> None:
+        self.calls.append((name, kwargs))
+
+    async def extract_and_submit_base64(
+        self,
+        *,
+        access_token: str,
+        filename: str,
+        content_base64: str,
+        mime_type: str | None = None,
+        user_id: str | None = None,
+        status: str = "UNVERIFIED",
+    ) -> dict[str, Any]:
+        self._record(
+            "extract_and_submit_base64",
+            access_token=access_token,
+            filename=filename,
+            mime_type=mime_type,
+            user_id=user_id,
+            status=status,
+        )
+        if self._extract_error is not None:
+            raise self._extract_error
+        record = {
+            "invoice_id": new_id("inv"),
+            "filename": filename,
+            "status": status,
+            "supplier_name": "Test Supplier",
+            "customer_name": "Test Customer",
+            "total_amount": 1000,
+            "currency": "QAR",
+            "invoice_number": f"INV-{len(self.submitted) + 1}",
+        }
+        self.submitted.append(record)
+        return record
+
+    async def submit_zip_base64(
+        self,
+        *,
+        access_token: str,
+        filename: str,
+        content_base64: str,
+        user_id: str | None = None,
+        status: str = "UNVERIFIED",
+        continue_on_error: bool = True,
+    ) -> dict[str, Any]:
+        self._record(
+            "submit_zip_base64",
+            access_token=access_token,
+            filename=filename,
+            user_id=user_id,
+            status=status,
+            continue_on_error=continue_on_error,
+        )
+        # Synthesise a 2-invoice ZIP per call so workflow tests don't need
+        # to build real ZIP bytes just to exercise the bulk path.
+        results = []
+        for i in range(1, 3):
+            record = {
+                "invoice_id": new_id("inv"),
+                "filename": f"invoice_{i}.pdf",
+                "status": status,
+                "supplier_name": "Test Supplier",
+                "total_amount": 500 * i,
+                "currency": "QAR",
+                "confidently_extracted": True,
+            }
+            self.submitted.append(record)
+            results.append(record)
+        return {"invoices": results, "total": len(results), "failed": 0}
+
+    async def get_my_invoices(
+        self, *, access_token: str
+    ) -> dict[str, Any]:
+        self._record("get_my_invoices", access_token=access_token)
+        # Return seeded + everything we've submitted in this run.
+        return {"invoices": list(self._seeded) + list(self.submitted)}

@@ -14,13 +14,16 @@ from app.shared.workflow import WorkflowRuntime, build_runtime
 from .adapters import CommunicationMessenger, NudgeReminders
 from .dispatcher import ALL_BACKEND_EVENTS, OnboardingDispatcher
 from .mcp_identity import McpMadadIdentityClient
+from .mcp_invoices import McpInvoiceClient
 from .mcp_kyc import McpKycClient
 from .mcp_payments import McpMonetizationPaymentAdapter
 from .onboarding import OnboardingWorkflow
 from .ports import (
+    InMemoryInvoiceClient,
     InMemoryKycClient,
     InMemoryMadadIdentityClient,
     InMemoryMonetizationPaymentClient,
+    InvoiceClient,
     KycClient,
     MadadIdentityClient,
     Messenger,
@@ -54,6 +57,7 @@ def build_onboarding_platform(
     kyc: KycClient | None = None,
     payments: MonetizationPaymentClient | None = None,
     reminders: Reminders | None = None,
+    invoices: InvoiceClient | None = None,
     runtime: WorkflowRuntime | None = None,
     dedupe: WebhookDedupe | None = None,
     allowed_event_types: frozenset[str] | set[str] | None = None,
@@ -65,6 +69,7 @@ def build_onboarding_platform(
         kyc=kyc or InMemoryKycClient(required_documents=DEFAULT_REQUIRED_DOCS),
         payments=payments or InMemoryMonetizationPaymentClient(),
         reminders=reminders or RecordingReminders(),
+        invoices=invoices or InMemoryInvoiceClient(),
     )
     runtime.register(workflow)
     dispatcher = OnboardingDispatcher(
@@ -105,6 +110,7 @@ def get_onboarding_platform() -> OnboardingPlatform:
             kyc=McpKycClient(mcp),
             payments=McpMonetizationPaymentAdapter(mcp),
             reminders=NudgeReminders(get_nudge_service()),
+            invoices=McpInvoiceClient(mcp),
             dedupe=dedupe,
         )
     return build_onboarding_platform()

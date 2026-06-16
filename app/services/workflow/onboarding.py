@@ -4767,6 +4767,22 @@ class OnboardingWorkflow(WorkflowDefinition):
                 paid=True,
                 last_status_source="poll",
             )
+        # UAT 2026-06-16 (afternoon, Madad note): ``qualified.waived``
+        # comes in as ``{type: payment, paid: True, event:
+        # qualified.waived}`` — same paid=True signal as payment.completed
+        # but the SME hasn't actually paid anything. Backend sends its
+        # own waiver WhatsApp; the agent must NOT also fire
+        # ``onboarding.payment.confirmed`` (which would say "Thank you
+        # — payment received!"). Advance silently, same end-state.
+        event_marker = (
+            str(result.get("event")) if isinstance(result, dict) else ""
+        )
+        if paid and event_marker == "qualified.waived":
+            return self._step(
+                "payment_await", ctx,
+                paid=True,
+                last_status_source="webhook",
+            )
         if paid:
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id

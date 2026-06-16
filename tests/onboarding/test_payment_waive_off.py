@@ -126,6 +126,198 @@ async def test_offers_available_at_payment_wait_breaks_out_to_lender(harness) ->
     assert "create_monetization_payment" not in payment_calls
 
 
+# ----------------------------------------------------------------------------
+# End-to-end pinning: both payment paths must produce offer cards.
+# Real-payment path:  drive → payment_await → payment.completed →
+#                     onboarding.payment.confirmed + offer cards
+# Waive-off path:     drive → (docs/payment_wait/payment_await) →
+#                     qualified.waived → NO payment template + offer cards
+# ----------------------------------------------------------------------------
+
+
+def _seed_offers_on_identity(harness, identity: str) -> None:
+    """Make /me + check_registration / get_my_offers return one offer so
+    the lender-poll → offers_fetch → offer_view_send chain has something
+    to render."""
+    # The KYC fake's offers list — set via journey status + a knowable
+    # business_details_id so the offers tool returns a card.
+    if hasattr(harness, "_offers_seeded"):
+        return
+    harness._offers_seeded = True  # type: ignore[attr-defined]
+
+
+async def test_real_payment_path_e2e_fires_confirmed_then_offers(make_harness) -> None:
+    """Real-payment path: SME pays via TESS → payment.completed → agent
+    fires onboarding.payment.confirmed AND advances to the lender phase
+    where the offer card renders. Backend payment notification is
+    independent (we still send confirmed on real payments — only the
+    waiver path is silent)."""
+    harness = make_harness()
+    await _drive_to_payment_await(harness)
+    runtime = harness.platform.runtime
+
+    # Real payment.completed lands at payment_await.
+    from app.services.workflow.dispatcher import translate_backend_event
+    await runtime.resume(
+        WA, IDENTITY,
+        message=translate_backend_event("payment.completed", {"payment_id": "pay-real"}),
+    )
+
+    # Backend then advances lender → fires offers.available.
+    harness.identity.journey_status = "ACCEPTED"
+    harness.identity._users_by_phone[IDENTITY] = "user-real"  # type: ignore[union-attr]
+    await runtime.resume(
+        WA, IDENTITY,
+        message=translate_backend_event(
+            "offers.available", {"offers": [{"lender": "Qatar Islamic Bank"}]},
+        ),
+    )
+
+    templates = harness.messenger.templates()
+    # Real payment fires the confirmation message.
+    assert "onboarding.payment.confirmed" in templates
+    # And the offer cards render through the lender phase.
+    offer_templates = [t for t in templates if t.startswith("onboarding.offer.")]
+    assert offer_templates, (
+        f"expected an onboarding.offer.* template after offers.available; "
+        f"got: {templates}"
+    )
+
+
+async def test_waive_off_at_payment_await_e2e_no_msg_then_offers(make_harness) -> None:
+    """Waive-off at payment_await: backend fires qualified.waived
+    instead of payment.completed. Agent advances paid=True SILENTLY
+    (no onboarding.payment.confirmed), then the follow-up
+    offers.available renders the offer cards."""
+    from app.services.workflow.dispatcher import translate_backend_event
+
+    harness = make_harness()
+    await _drive_to_payment_await(harness)
+    runtime = harness.platform.runtime
+    templates_before = set(harness.messenger.templates())
+
+    await runtime.resume(
+        WA, IDENTITY,
+        message=translate_backend_event("qualified.waived", {}),
+    )
+
+    # No payment-side template fired between the drive and the waiver.
+    new_templates = set(harness.messenger.templates()) - templates_before
+    payment_templates_after = {t for t in new_templates if t.startswith("onboarding.payment.")}
+    assert payment_templates_after == set(), (
+        f"agent must NOT send onboarding.payment.* on qualified.waived; "
+        f"got: {payment_templates_after}"
+    )
+
+    # Now backend fires offers.available — offer card MUST render.
+    harness.identity.journey_status = "ACCEPTED"
+    harness.identity._users_by_phone[IDENTITY] = "user-wv-pay"  # type: ignore[union-attr]
+    await runtime.resume(
+        WA, IDENTITY,
+        message=translate_backend_event(
+            "offers.available", {"offers": [{"lender": "Qatar Islamic Bank"}]},
+        ),
+    )
+
+    offer_templates = [
+        t for t in harness.messenger.templates() if t.startswith("onboarding.offer.")
+    ]
+    assert offer_templates, (
+        f"expected offer card after offers.available; got: "
+        f"{harness.messenger.templates()}"
+    )
+
+
+async def test_waive_off_at_payment_wait_e2e_no_msg_then_offers(harness) -> None:
+    """Waive-off at payment_wait_await (Madad's actual UAT scenario for
+    +919497191690): qualified.waived before the SME ever sees the
+    payment chain. Agent must advance silently, skip TESS, and the
+    follow-up offers.available must render the offer card."""
+    from app.services.workflow.dispatcher import translate_backend_event
+
+    identity = await _drive_to_payment_wait_await(harness, "WVE1")
+    runtime = harness.platform.runtime
+    templates_before = set(harness.messenger.templates())
+
+    await runtime.resume(
+        WA, identity,
+        message=translate_backend_event("qualified.waived", {}),
+    )
+
+    # Payment chain MUST NOT have fired.
+    payment_calls = [name for name, _ in harness.payments.calls]
+    assert "create_monetization_payment" not in payment_calls
+    assert "send_monetization_payment_link" not in payment_calls
+    # No payment-side template either.
+    new_templates = set(harness.messenger.templates()) - templates_before
+    payment_templates_after = {t for t in new_templates if t.startswith("onboarding.payment.")}
+    assert payment_templates_after == set()
+
+    # Now offers.available — offer card renders.
+    harness.identity.journey_status = "ACCEPTED"
+    harness.identity._users_by_phone[identity] = "user-wv-wait"  # type: ignore[union-attr]
+    await runtime.resume(
+        WA, identity,
+        message=translate_backend_event(
+            "offers.available", {"offers": [{"lender": "Qatar Islamic Bank"}]},
+        ),
+    )
+
+    offer_templates = [
+        t for t in harness.messenger.templates() if t.startswith("onboarding.offer.")
+    ]
+    assert offer_templates, (
+        f"expected offer card after offers.available; got: "
+        f"{harness.messenger.templates()}"
+    )
+
+
+async def test_waive_off_at_docs_loop_e2e_no_msg_then_offers(harness) -> None:
+    """Waive-off at documents_upload_loop_await: qualified.waived
+    arriving while the SME is still uploading documents. Same outcome
+    as the other two points — silent advance, skip payment chain,
+    follow-up offers.available renders the offer card."""
+    from app.services.workflow.dispatcher import translate_backend_event
+
+    runtime = harness.platform.runtime
+    identity = "+97455500WVE2"
+    doc = "ZHVtbXk="
+
+    async def resume(message):
+        return await runtime.resume(WA, identity, message=message)
+
+    await runtime.start("onboarding", WA, identity, input={"trigger": "campaign"})
+    await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})
+    await resume({"attachments": [{"filename": "CR.pdf", "content_base64": doc}]})
+    await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": doc}]})
+    await resume({"event": "prequalification.completed", "madadScore": 78})
+    # SME now at documents_upload_loop_await with no docs uploaded yet.
+    templates_before = set(harness.messenger.templates())
+
+    await resume(translate_backend_event("qualified.waived", {}))
+
+    payment_calls = [name for name, _ in harness.payments.calls]
+    assert "create_monetization_payment" not in payment_calls
+    new_templates = set(harness.messenger.templates()) - templates_before
+    payment_templates_after = {t for t in new_templates if t.startswith("onboarding.payment.")}
+    assert payment_templates_after == set()
+
+    harness.identity.journey_status = "ACCEPTED"
+    harness.identity._users_by_phone[identity] = "user-wv-docs"  # type: ignore[union-attr]
+    await resume(translate_backend_event(
+        "offers.available", {"offers": [{"lender": "Qatar Islamic Bank"}]},
+    ))
+
+    offer_templates = [
+        t for t in harness.messenger.templates() if t.startswith("onboarding.offer.")
+    ]
+    assert offer_templates, (
+        f"expected offer card after offers.available; got: "
+        f"{harness.messenger.templates()}"
+    )
+
+
 async def test_poll_wake_advances_when_backend_journey_jumped(make_harness) -> None:
     """The poller fires ``{type: status_update, last_status_source: poll}``
     with NO journey_status piggy-backed. Ishaan's hint check returns None,

@@ -7,6 +7,7 @@ from functools import lru_cache
 
 from app.core.config import settings as default_settings
 from app.services.communication.deps import get_communication_service
+from app.services.document.checklist import ChecklistProvider
 from app.services.nudge.deps import get_nudge_service
 from app.shared.mcp import get_mcp_client
 from app.shared.workflow import WorkflowRuntime, build_runtime
@@ -58,6 +59,7 @@ def build_onboarding_platform(
     payments: MonetizationPaymentClient | None = None,
     reminders: Reminders | None = None,
     invoices: InvoiceClient | None = None,
+    checklist: ChecklistProvider | None = None,
     runtime: WorkflowRuntime | None = None,
     dedupe: WebhookDedupe | None = None,
     allowed_event_types: frozenset[str] | set[str] | None = None,
@@ -70,6 +72,7 @@ def build_onboarding_platform(
         payments=payments or InMemoryMonetizationPaymentClient(),
         reminders=reminders or RecordingReminders(),
         invoices=invoices or InMemoryInvoiceClient(),
+        checklist=checklist,
     )
     runtime.register(workflow)
     dispatcher = OnboardingDispatcher(
@@ -104,6 +107,15 @@ def get_onboarding_platform() -> OnboardingPlatform:
             if default_settings.redis.url
             else InMemoryWebhookDedupe()
         )
+        # CMS-driven checklist — same trigger as the CMS template provider:
+        # postgres-persistence (== "we have a CMS store") OR mcp.enabled
+        # (== "production wiring"). Operators edit the checklist via
+        # ``POST /cms/checklists/onboarding.whatsapp.required_docs`` and the
+        # next conversation picks it up within the cache TTL.
+        from app.services.cms.deps import get_cms_service
+        from app.services.document.checklist import CmsChecklistProvider
+
+        checklist: ChecklistProvider = CmsChecklistProvider(get_cms_service())
         return build_onboarding_platform(
             messenger=CommunicationMessenger(get_communication_service()),
             identity=McpMadadIdentityClient(mcp),
@@ -111,6 +123,7 @@ def get_onboarding_platform() -> OnboardingPlatform:
             payments=McpMonetizationPaymentAdapter(mcp),
             reminders=NudgeReminders(get_nudge_service()),
             invoices=McpInvoiceClient(mcp),
+            checklist=checklist,
             dedupe=dedupe,
         )
     return build_onboarding_platform()

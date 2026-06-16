@@ -85,6 +85,7 @@ from app.shared.workflow import (
     WorkflowDefinition,
     await_input,
 )
+from app.services.document.checklist import ChecklistProvider
 from app.shared.workflow.enums import Channel
 from app.shared.workflow.state import HistoryEntry
 
@@ -1800,6 +1801,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         payments: MonetizationPaymentClient,
         reminders: Reminders,
         invoices: InvoiceClient | None = None,
+        checklist: ChecklistProvider | None = None,
     ) -> None:
         self._msg = messenger
         self._identity = identity
@@ -1812,6 +1814,10 @@ class OnboardingWorkflow(WorkflowDefinition):
         # the caller omits it, and ``build_onboarding_platform`` wires
         # the real ``McpInvoiceClient`` when ``mcp.enabled=True``.
         self._invoices: InvoiceClient = invoices or InMemoryInvoiceClient()
+        # CMS-driven document checklist (M1 acceptance: "adding a doc to the
+        # backend config must reflect in the next conversation"). None falls
+        # back to ``DEFAULT_WHATSAPP_REQUIRED_DOCS`` so tests/dev keep working.
+        self._checklist = checklist
 
     # -- graph wiring ---------------------------------------------------------
 
@@ -3282,10 +3288,21 @@ class OnboardingWorkflow(WorkflowDefinition):
         # admin-requested list is only a subset (it omits docs the admin hasn't
         # explicitly requested yet), which made the agent show just 3 items.
         if ctx.channel is Channel.WHATSAPP:
+            cms_required: list[str] = []
+            if self._checklist is not None:
+                try:
+                    items = await self._checklist.get_required(
+                        "onboarding.whatsapp.required_docs"
+                    )
+                    cms_required = [item.code for item in items if item.required]
+                except Exception as exc:
+                    ctx.logger.warning(
+                        "documents_list_fetch.cms_lookup_failed",
+                        error=str(exc)[:200],
+                    )
+            missing = cms_required or list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
             return self._step(
-                "documents_list_fetch",
-                ctx,
-                missing_documents=list(DEFAULT_WHATSAPP_REQUIRED_DOCS),
+                "documents_list_fetch", ctx, missing_documents=missing
             )
         missing: list[str] = []
         if state.access_token:

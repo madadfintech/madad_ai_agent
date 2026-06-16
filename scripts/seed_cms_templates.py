@@ -26,7 +26,9 @@ from typing import Any
 
 from app.services.cms.deps import get_cms_service
 from app.services.cms.enums import ConfigKind
+from app.services.cms.models import ChecklistItem
 from app.services.workflow import TEMPLATE_KEYS
+from app.services.workflow.onboarding import DEFAULT_WHATSAPP_REQUIRED_DOCS, DOCUMENT_LABELS
 from app.shared.i18n import Locale
 
 # -- Nudge timing constants --------------------------------------------------
@@ -695,12 +697,31 @@ async def run() -> int:
         seeded_schedules += 1
         print(f"  ✓ nudge schedule: {reason}")
 
+    # -- document checklists (ConfigKind.CHECKLIST) --
+    # Vendor Plan M1 acceptance criterion: adding a new required document via
+    # the CMS reflects in the agent's next conversation within 5 minutes.
+    # Seeding the WhatsApp default lets ops edit via
+    # ``POST /cms/checklists/onboarding.whatsapp.required_docs``.
+    seeded_checklists = 0
+    whatsapp_items = [
+        ChecklistItem(
+            code=code,
+            label={"en": DOCUMENT_LABELS.get(code, code)},
+            required=True,
+        )
+        for code in DEFAULT_WHATSAPP_REQUIRED_DOCS
+    ]
+    await cms.upsert_checklist("onboarding.whatsapp.required_docs", whatsapp_items)
+    seeded_checklists += 1
+    print("  ✓ checklist: onboarding.whatsapp.required_docs")
+
     if skipped:
         print(f"\n  Skipped (no body): {skipped}")
     print(
         f"\n  Seeded {seeded_templates} onboarding templates, "
-        f"{seeded_nudge_templates} nudge step templates, and "
-        f"{seeded_schedules} nudge schedules into the CMS."
+        f"{seeded_nudge_templates} nudge step templates, "
+        f"{seeded_schedules} nudge schedules, and "
+        f"{seeded_checklists} document checklists into the CMS."
     )
     return 0
 

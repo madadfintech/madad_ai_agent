@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from app.services.document.checklist import ChecklistProvider
 from app.services.workflow import (
     InMemoryInvoiceClient,
     InMemoryKycClient,
@@ -45,6 +46,7 @@ def make_harness() -> Callable[..., Harness]:
         business_details: dict[str, object] | None = None,
         products: list[dict[str, object]] | None = None,
         seeded_invoices: list[dict[str, object]] | None = None,
+        checklist: ChecklistProvider | None = None,
     ) -> Harness:
         messenger = RecordingMessenger()
         identity = InMemoryMadadIdentityClient(
@@ -70,6 +72,7 @@ def make_harness() -> Callable[..., Harness]:
             payments=payments,
             reminders=reminders,
             invoices=invoices,
+            checklist=checklist,
         )
         return Harness(
             platform, messenger, identity, kyc, payments, reminders, invoices,

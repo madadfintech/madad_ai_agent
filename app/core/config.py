@@ -9,10 +9,8 @@ service-specific settings will be layered on in their own modules.
 
 from __future__ import annotations
 
-from typing import Annotated, Any
-
-from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class RedisSettings(BaseModel):
@@ -257,6 +255,11 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
         extra="ignore",
+        # Allow Settings(admin_api_token_extras_raw=...) AND env
+        # ADMIN_API_TOKEN_EXTRAS to both populate the same field —
+        # needed because the field uses a validation_alias to keep
+        # the operator-facing env name pretty.
+        populate_by_name=True,
     )
 
     app_name: str = "madad_fintech_ai"
@@ -278,35 +281,44 @@ class Settings(BaseSettings):
     # token gates. Used to be a single token; the list is additive so
     # we never have to share the canonical 48-char prod token with
     # external callers that just need to wipe a session.
-    # ``NoDecode`` opts the field out of pydantic-settings' default
-    # env-source JSON parsing — our own validator below accepts either a
-    # JSON list or a comma-separated string. Without NoDecode the env
-    # source raises a SettingsError when the value isn't valid JSON
-    # (e.g. plain "dbwipe"), which crashes service startup.
-    admin_api_token_extras: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Stored as a raw string so the env source doesn't try to JSON-parse
+    # it — pydantic-settings 2.6 has no public NoDecode opt-out, and a
+    # plain ``dbwipe`` in env crashes startup if the field is typed
+    # ``list[str]``. Operators set ``ADMIN_API_TOKEN_EXTRAS=dbwipe`` (or
+    # ``=t1,t2,t3``); the parsed list is exposed via the
+    # ``admin_api_token_extras`` computed property below.
+    # ``validation_alias`` so the ENV var name stays the operator-friendly
+    # ``ADMIN_API_TOKEN_EXTRAS`` while the Python attribute is _raw.
+    admin_api_token_extras_raw: str | None = Field(
+        default=None,
+        validation_alias="ADMIN_API_TOKEN_EXTRAS",
+    )
 
-    @field_validator("admin_api_token_extras", mode="before")
-    @classmethod
-    def _parse_admin_extras(cls, value: Any) -> Any:
-        """Accept either a JSON list (Pydantic default) OR a comma-separated
-        string (operator-friendly) for ``ADMIN_API_TOKEN_EXTRAS``."""
-        if value is None:
+    @property
+    def admin_api_token_extras(self) -> list[str]:
+        """Parsed list of additional bearers ``require_admin`` accepts.
+
+        Accepts: a JSON list (``["a","b"]``), a comma-separated string
+        (``a,b,c``), a single token (``dbwipe``), or empty/None (no
+        extras). Whitespace around each entry is trimmed."""
+        raw = self.admin_api_token_extras_raw
+        if isinstance(raw, list):
+            return [str(t) for t in raw]
+        if not isinstance(raw, str):
             return []
-        if isinstance(value, list):
-            return value
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                return []
-            if stripped.startswith("["):
-                import json
-                try:
-                    parsed = json.loads(stripped)
-                except json.JSONDecodeError:
-                    return [stripped]
-                return parsed if isinstance(parsed, list) else [stripped]
-            return [t.strip() for t in stripped.split(",") if t.strip()]
-        return value
+        stripped = raw.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            import json
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return [stripped]
+            if isinstance(parsed, list):
+                return [str(t) for t in parsed]
+            return [stripped]
+        return [t.strip() for t in stripped.split(",") if t.strip()]
 
     # Inbound/outbound request-correlation header. Echoed on every response and
     # bound to the structured-logging context for end-to-end tracing.

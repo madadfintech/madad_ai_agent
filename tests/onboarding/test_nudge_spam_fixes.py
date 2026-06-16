@@ -137,22 +137,29 @@ async def test_business_email_await_silent_on_status_update(harness) -> None:
 # ---- 3. admin token extras list -----------------------------------------
 
 def test_admin_extras_parsed_from_comma_separated_env() -> None:
-    """Settings.admin_api_token_extras accepts a comma-separated string
-    so operators can set ``ADMIN_API_TOKEN_EXTRAS=dbwipe,other``
-    without writing JSON in env files."""
+    """``ADMIN_API_TOKEN_EXTRAS=dbwipe, other, third`` is parsed into
+    a clean list. Operators don't have to write JSON in env files."""
     from app.core.config import Settings
 
-    s = Settings(admin_api_token_extras="dbwipe, other,  third ")  # type: ignore[arg-type]
+    s = Settings(admin_api_token_extras_raw="dbwipe, other,  third ")
     assert s.admin_api_token_extras == ["dbwipe", "other", "third"]
 
 
 def test_admin_extras_accepts_json_list_form() -> None:
-    """Back-compat: the JSON list form (Pydantic's default for list
-    fields) still works."""
+    """Back-compat: a JSON list string also parses correctly."""
     from app.core.config import Settings
 
-    s = Settings(admin_api_token_extras=["a", "b"])
+    s = Settings(admin_api_token_extras_raw='["a","b"]')
     assert s.admin_api_token_extras == ["a", "b"]
+
+
+def test_admin_extras_empty_or_missing_yields_empty_list() -> None:
+    """Defaults: when the env var is unset or empty, no extras."""
+    from app.core.config import Settings
+
+    assert Settings(admin_api_token_extras_raw=None).admin_api_token_extras == []
+    assert Settings(admin_api_token_extras_raw="").admin_api_token_extras == []
+    assert Settings(admin_api_token_extras_raw="   ").admin_api_token_extras == []
 
 
 def test_require_admin_accepts_any_extra_token(monkeypatch) -> None:
@@ -165,7 +172,7 @@ def test_require_admin_accepts_any_extra_token(monkeypatch) -> None:
 
     test_settings = Settings(
         admin_api_token="primary-token",
-        admin_api_token_extras=["dbwipe"],
+        admin_api_token_extras_raw="dbwipe",
     )
     monkeypatch.setattr(security, "settings", test_settings)
 

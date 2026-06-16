@@ -1201,6 +1201,43 @@ class InvoiceClient(Protocol):
         """
         ...
 
+    async def extract_base64(
+        self,
+        *,
+        access_token: str,
+        filename: str,
+        content_base64: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        """UAT 2026-06-16 (#3): extract WITHOUT submitting. Returns the
+        OCR'd fields (invoice_number, supplier/customer, amount, due_date,
+        currency, line_items) so the agent can render a confirm card
+        with Approve/Edit/Reject buttons before any backend write."""
+        ...
+
+    async def submit_base64(
+        self,
+        *,
+        access_token: str,
+        filename: str,
+        content_base64: str,
+        mime_type: str | None = None,
+        user_id: str | None = None,
+        status: str = "UNVERIFIED",
+        invoice_number: str | None = None,
+        invoice_date: str | None = None,
+        due_date: str | None = None,
+        total_amount: str | None = None,
+        supplier_name: str | None = None,
+        customer_name: str | None = None,
+        line_items: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Submit the invoice once the SME has confirmed (or edited) the
+        extracted fields — the second half of the extract → confirm →
+        submit flow. All editable fields are explicit keyword args so
+        the agent can pass through whatever the SME confirmed."""
+        ...
+
     async def submit_zip_base64(
         self,
         *,
@@ -1278,6 +1315,83 @@ class InMemoryInvoiceClient:
             "total_amount": 1000,
             "currency": "QAR",
             "invoice_number": f"INV-{len(self.submitted) + 1}",
+        }
+        self.submitted.append(record)
+        return record
+
+    async def extract_base64(
+        self,
+        *,
+        access_token: str,
+        filename: str,
+        content_base64: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        self._record(
+            "extract_base64",
+            access_token=access_token,
+            filename=filename,
+            mime_type=mime_type,
+        )
+        if self._extract_error is not None:
+            raise self._extract_error
+        # Return an extracted-but-unsubmitted draft. Slightly different
+        # shape from extract_and_submit_base64 — no invoice_id yet
+        # because backend hasn't created the record.
+        return {
+            "filename": filename,
+            "supplier_name": "Test Supplier",
+            "customer_name": "Test Customer",
+            "total_amount": 1000,
+            "currency": "QAR",
+            "invoice_number": f"INV-{len(self.submitted) + 1}",
+            "invoice_date": "2026-06-01",
+            "due_date": "2026-07-01",
+        }
+
+    async def submit_base64(
+        self,
+        *,
+        access_token: str,
+        filename: str,
+        content_base64: str,
+        mime_type: str | None = None,
+        user_id: str | None = None,
+        status: str = "UNVERIFIED",
+        invoice_number: str | None = None,
+        invoice_date: str | None = None,
+        due_date: str | None = None,
+        total_amount: str | None = None,
+        supplier_name: str | None = None,
+        customer_name: str | None = None,
+        line_items: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        self._record(
+            "submit_base64",
+            access_token=access_token,
+            filename=filename,
+            mime_type=mime_type,
+            user_id=user_id,
+            status=status,
+            invoice_number=invoice_number,
+            invoice_date=invoice_date,
+            due_date=due_date,
+            total_amount=total_amount,
+            supplier_name=supplier_name,
+            customer_name=customer_name,
+            line_items=line_items,
+        )
+        record = {
+            "invoice_id": new_id("inv"),
+            "filename": filename,
+            "status": status,
+            "supplier_name": supplier_name or "Test Supplier",
+            "customer_name": customer_name or "Test Customer",
+            "total_amount": int(total_amount) if total_amount else 1000,
+            "currency": "QAR",
+            "invoice_number": invoice_number or f"INV-{len(self.submitted) + 1}",
+            "invoice_date": invoice_date,
+            "due_date": due_date,
         }
         self.submitted.append(record)
         return record

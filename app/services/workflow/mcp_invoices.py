@@ -37,6 +37,30 @@ def _infer_mime_type(filename: str) -> str:
     return guess or "application/pdf"
 
 
+def _normalise_invoice_envelope(
+    response: Any, filename: str
+) -> dict[str, Any]:
+    """Flatten the cluster's response envelopes into one dict shape.
+
+    The cluster may return ``{invoice: {...}}``, ``{body: {...}}``, or the
+    invoice dict directly. We also alias ``id`` to ``invoice_id`` and
+    inject the filename when missing — so every InvoiceClient path
+    returns the same shape regardless of which underlying tool ran.
+    """
+    if isinstance(response, dict):
+        if isinstance(response.get("invoice"), dict):
+            normalised = dict(response["invoice"])
+        elif isinstance(response.get("body"), dict):
+            normalised = dict(response["body"])
+        else:
+            normalised = dict(response)
+        if "invoice_id" not in normalised and "id" in normalised:
+            normalised["invoice_id"] = normalised["id"]
+        normalised.setdefault("filename", filename)
+        return normalised
+    return {"filename": filename, "raw": response}
+
+
 class McpInvoiceClient:
     """Production wrapper over the ``madad_invoices_*`` MCP tools."""
 
@@ -84,6 +108,75 @@ class McpInvoiceClient:
             normalized.setdefault("filename", filename)
             return normalized
         return {"filename": filename, "raw": response}
+
+    async def extract_base64(
+        self,
+        *,
+        access_token: str,
+        filename: str,
+        content_base64: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Wraps ``madad_invoices_extract_invoice_base64`` — extract-only
+        path for the confirm-card flow (UAT 2026-06-16 #3). Returns the
+        OCR'd fields without creating a backend invoice record."""
+        payload: dict[str, Any] = {
+            "access_token": access_token,
+            "file_name": filename,
+            "file_base64": content_base64,
+            "mime_type": mime_type or _infer_mime_type(filename),
+        }
+        response = await self._tools.call_tool(
+            Tools.INVOICES_EXTRACT_INVOICE_BASE64, payload
+        )
+        return _normalise_invoice_envelope(response, filename)
+
+    async def submit_base64(
+        self,
+        *,
+        access_token: str,
+        filename: str,
+        content_base64: str,
+        mime_type: str | None = None,
+        user_id: str | None = None,
+        status: str = "UNVERIFIED",
+        invoice_number: str | None = None,
+        invoice_date: str | None = None,
+        due_date: str | None = None,
+        total_amount: str | None = None,
+        supplier_name: str | None = None,
+        customer_name: str | None = None,
+        line_items: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Wraps ``madad_invoices_submit_invoice_base64`` — submit with
+        explicit (possibly SME-edited) fields. The cluster signature
+        carries 11 optional override fields; we forward whichever the
+        agent has after confirm/edit, leaving the rest for the backend
+        to fill from its own extraction."""
+        payload: dict[str, Any] = {
+            "access_token": access_token,
+            "file_name": filename,
+            "file_base64": content_base64,
+            "mime_type": mime_type or _infer_mime_type(filename),
+            "status": status,
+        }
+        # Forward only fields the caller actually supplied.
+        for name, value in (
+            ("user_id", user_id),
+            ("invoice_number", invoice_number),
+            ("invoice_date", invoice_date),
+            ("due_date", due_date),
+            ("total_amount", total_amount),
+            ("supplier_name", supplier_name),
+            ("customer_name", customer_name),
+            ("line_items", line_items),
+        ):
+            if value is not None:
+                payload[name] = value
+        response = await self._tools.call_tool(
+            Tools.INVOICES_SUBMIT_INVOICE_BASE64, payload
+        )
+        return _normalise_invoice_envelope(response, filename)
 
     async def submit_zip_base64(
         self,

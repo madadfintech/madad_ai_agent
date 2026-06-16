@@ -57,8 +57,11 @@ def _emit(event: str, payload: dict[str, object]) -> dict[str, object]:
 
 @pytest.mark.parametrize("event,template", [
     ("transaction.disbursed", "onboarding.disbursement.received"),
+    # UAT 2026-06-16 (PR #187): partially_paid + received both render the
+    # repayment.received card now; the closed card is gated on the
+    # ``closed=true`` flag in the payload.
     ("repayment.received", "onboarding.repayment.received"),
-    ("repayment.partially_paid", "onboarding.repayment.partially_paid"),
+    ("repayment.partially_paid", "onboarding.repayment.received"),
     ("repayment.closed", "onboarding.repayment.closed"),
     ("repayment.due_soon", "onboarding.repayment.due_soon"),
     ("repayment.overdue", "onboarding.repayment.overdue"),
@@ -81,6 +84,102 @@ async def test_each_phase1b_event_fires_its_template(harness, event, template) -
     assert template in harness.messenger.templates(), (
         f"{event} should fire {template}; got {harness.messenger.templates()}"
     )
+
+
+async def test_repayment_received_with_closed_flag_fires_closed_template(harness) -> None:
+    """Madad PR #187: backend fires ``repayment.received`` with
+    ``closed=true`` when the last EMI clears. Agent must render the
+    ``repayment.closed`` card (only event-name with no closed flag is
+    ambiguous; the flag wins when both are present)."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    await runtime.resume(
+        WA, IDENTITY,
+        message=_emit("repayment.received", {
+            "invoiceNumber": "INV-LAST",
+            "amount": 1000,
+            "totalRepaid": 32000,
+            "outstandingAmount": 0,
+            "emisTotal": 4, "emisPaid": 4, "emisRemaining": 0,
+            "paymasterName": "Qatar Pay",
+            "lenderName": "Qatar Islamic Bank",
+            "availableLimit": 100000,
+            "currency": "QAR",
+            "closed": True,
+        }),
+    )
+
+    assert "onboarding.repayment.closed" in harness.messenger.templates()
+
+
+async def test_disbursement_threads_utr_into_template(harness) -> None:
+    """Madad PR #187: transaction.disbursed payload now includes
+    ``utr`` + ``disbursedAmount`` + ``dueDate``. The template must
+    receive all three substitutions."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    await runtime.resume(
+        WA, IDENTITY,
+        message=_emit("transaction.disbursed", {
+            "invoiceNumber": "INV-42",
+            "disbursedAmount": 32000,
+            "utr": "UTR-XYZ-12345",
+            "dueDate": "2026-07-28",
+            "currency": "QAR",
+        }),
+    )
+
+    disb_sends = [
+        s for s in harness.messenger.sent
+        if s["template_key"] == "onboarding.disbursement.received"
+    ]
+    assert disb_sends, "expected disbursement template to fire"
+    vars_ = disb_sends[-1]["variables"]
+    assert vars_["utr"] == "UTR-XYZ-12345"
+    assert "32,000" in vars_["amount"]
+    assert vars_["ref"] == "INV-42"
+    assert vars_["due_date"] == "2026-07-28"
+
+
+async def test_repayment_received_threads_new_payload_fields(harness) -> None:
+    """All 9 new payload fields from Madad PR #187 must reach the template."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    await runtime.resume(
+        WA, IDENTITY,
+        message=_emit("repayment.received", {
+            "invoiceNumber": "INV-7",
+            "amount": 8000,
+            "totalRepaid": 16000,
+            "outstandingAmount": 24000,
+            "emisTotal": 4, "emisPaid": 2, "emisRemaining": 2,
+            "paymasterName": "Qatar Pay",
+            "lenderName": "Qatar Islamic Bank",
+            "availableLimit": 60000,
+            "currency": "QAR",
+            "dueDate": "2026-08-15",
+            "closed": False,
+        }),
+    )
+
+    sends = [
+        s for s in harness.messenger.sent
+        if s["template_key"] == "onboarding.repayment.received"
+    ]
+    assert sends, "expected repayment.received template to fire"
+    vars_ = sends[-1]["variables"]
+    assert "8,000" in vars_["amount"]
+    assert "16,000" in vars_["total_repaid"]
+    assert "24,000" in vars_["outstanding"]
+    assert vars_["emis_paid"] == "2"
+    assert vars_["emis_total"] == "4"
+    assert vars_["emis_remaining"] == "2"
+    assert vars_["paymaster"] == "Qatar Pay"
+    assert vars_["lender"] == "Qatar Islamic Bank"
+    assert vars_["due_date"] == "2026-08-15"
 
 
 async def test_disbursement_appends_to_state(harness) -> None:

@@ -54,7 +54,14 @@ PHASE1A_BACKEND_EVENTS: frozenset[str] = frozenset(
         "madad_score.ready",
         "payment.completed",
         "offers.available",
+        # UAT 2026-06-16 Bug #8: backend fires ``offer.selected`` at
+        # acceptance time per Ishan's confirmation, but the agent only
+        # accepted ``offer.accepted``. Result: 400 from the webhook
+        # chokepoint, ✅ confirmation only landed via the activated
+        # backfill block. Accept BOTH names so neither side has to wait
+        # on the other to rename.
         "offer.accepted",
+        "offer.selected",
         "credit_line.activated",
     }
 )
@@ -84,7 +91,10 @@ EVENT_TO_JOURNEY_STATUS: dict[str, str] = {
     "prequalification.completed": "PRE_QUALIFIED",
     "madad_score.ready": "QUALIFIED",
     "offers.available": "ACCEPTED",
+    # Both names map to the same OFFER_ACCEPTED journey state — see
+    # PHASE1A_BACKEND_EVENTS note about Bug #8.
     "offer.accepted": "OFFER_ACCEPTED",
+    "offer.selected": "OFFER_ACCEPTED",
     "credit_line.activated": "ACTIVATED",
 }
 

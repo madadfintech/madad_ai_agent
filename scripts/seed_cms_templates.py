@@ -376,31 +376,97 @@ _TEMPLATE_BODIES = {
         "{{ summary }}\n\n"
         "Send a new invoice anytime as a PDF or photo."
     ),
-    # Backend says funds disbursed to the SME's account.
-    "onboarding.disbursement.received": (
-        "💸 Funds disbursed!\n\n"
-        "{{ amount }} has been transferred for invoice {{ ref }}.\n"
-        "The amount should appear in your bank account shortly. 🏦\n\n"
-        "Track all invoices at uat-portal.madadfintech.com or just ask me here."
+    # UAT 2026-06-16 (#3): single-PDF confirm card body shown alongside
+    # the 3 interactive buttons (Approve / Edit / Reject). The same body
+    # is reused as a plain-text fallback when the interactive send path
+    # declines, so it must read sensibly without the buttons attached.
+    "onboarding.invoice.confirm": (
+        "{{ summary }}\n\n"
+        "Confirm to submit, Edit to correct a field (reply with "
+        "`edit amount: 32000` for example), or Reject to discard."
     ),
-    # Repayment lifecycle. Bodies template-substitute the same field
-    # names the workflow sets in ``_handle_phase1b_event``.
+    # When the SME taps "Edit" with no field — ask which to change.
+    "onboarding.invoice.edit.prompt": (
+        "Which field would you like to update? Reply like:\n\n"
+        "`edit amount: 32000`\n"
+        "`edit due: 2026-07-28`\n"
+        "`edit supplier: Almaha Medical`\n"
+        "`edit buyer: AIKHAJA STORE`\n"
+        "`edit invoice no: INV-2981`\n\n"
+        "Current draft:\n{{ summary }}"
+    ),
+    # When the SME taps "Reject" — confirm the discard, no backend write.
+    "onboarding.invoice.rejected": (
+        "🗑 Discarded — invoice {{ ref }} not submitted.\n\n"
+        "Send another invoice anytime as a PDF or photo."
+    ),
+    # UAT 2026-06-16 (#4): bulk ZIP CSV preview body.
+    "onboarding.invoice.batch.preview": (
+        "📋 Extracted {{ count }} invoice(s). Review and reply:\n\n"
+        "{{ table }}\n\n"
+        "Reply `APPROVE ALL` to submit, "
+        "`edit <row>: <field> <new value>` to change a row, "
+        "or `remove <row>` to drop one."
+    ),
+    # Sent when the SME's reply at batch-preview can't be parsed.
+    "onboarding.invoice.batch.help": (
+        "{{ hint }}\n\n"
+        "Reply `APPROVE ALL` to submit, "
+        "`edit <row>: <field> <new value>` to change a row, "
+        "or `remove <row>` to drop one."
+    ),
+    # APPROVE ALL → submit done.
+    "onboarding.invoice.batch.submitted": (
+        "✅ All {{ count }} submitted. Updates incoming at each "
+        "stage — disbursement, repayment, closure.\n\n"
+        "Send more anytime."
+    ),
+    # When every row was removed before APPROVE ALL.
+    "onboarding.invoice.batch.cleared": (
+        "🧹 Batch cleared — nothing submitted. Send another batch "
+        "whenever you're ready."
+    ),
+    # Backend ``transaction.disbursed`` event. Payload per Madad PR #187
+    # (UAT 2026-06-16): invoiceNumber, disbursedAmount, utr, dueDate.
+    "onboarding.disbursement.received": (
+        "💸 Disbursed: {{ amount }} for invoice {{ ref }}.\n"
+        "Due {{ due_date }}.\n"
+        "UTR: {{ utr }}\n\n"
+        "The amount should appear in your bank account shortly. 🏦"
+    ),
+    # Backend ``repayment.received`` with ``closed=false``. Payload per
+    # Madad PR #187: invoiceNumber, amount, totalRepaid, outstandingAmount,
+    # emisTotal, emisPaid, emisRemaining, paymasterName, lenderName,
+    # availableLimit, currency, dueDate.
     "onboarding.repayment.received": (
-        "✅ Repayment received\n\n"
-        "We've received {{ amount }} toward invoice {{ ref }}.\n"
-        "Outstanding balance: {{ outstanding }}\n\n"
+        "✅ Repayment received for invoice {{ ref }}.\n\n"
+        "This payment: {{ amount }}\n"
+        "Total repaid: {{ total_repaid }}\n"
+        "Outstanding: {{ outstanding }}\n"
+        "EMIs paid: {{ emis_paid }} / {{ emis_total }} "
+        "({{ emis_remaining }} remaining)\n"
+        "Next due: {{ due_date }}\n\n"
+        "Lender: {{ lender }} · Paymaster: {{ paymaster }}\n\n"
         "Thanks for staying on top of it! 🙌"
     ),
+    # Kept for back-compat; the unified handler now routes "partially_paid"
+    # to ``onboarding.repayment.received`` so this body is rarely seen.
     "onboarding.repayment.partially_paid": (
         "📩 Partial repayment received\n\n"
         "{{ amount }} received for invoice {{ ref }} — "
         "{{ outstanding }} still outstanding.\n\n"
         "Reply here if you have any questions about the remaining balance."
     ),
+    # Backend ``repayment.received`` with ``closed=true`` (or the discrete
+    # ``repayment.closed`` event — both supported). Only here can we say
+    # "fully closed". Show the updated available limit.
     "onboarding.repayment.closed": (
-        "🎉 Repayment closed for invoice {{ ref }}!\n\n"
-        "Total settled: {{ amount }}. Thanks for your business — "
-        "we'd love to finance more invoices for you anytime. 💼"
+        "🎉 This invoice is now fully closed.\n\n"
+        "Invoice: {{ ref }}\n"
+        "Total settled: {{ total_repaid }}\n"
+        "EMIs paid: {{ emis_paid }} / {{ emis_total }}\n\n"
+        "Updated Limit: {{ available_limit }} available.\n\n"
+        "Send another invoice anytime — single file or a ZIP both work. 💼"
     ),
     "onboarding.repayment.due_soon": (
         "⏰ Friendly reminder — repayment due soon\n\n"

@@ -149,6 +149,15 @@ TEMPLATE_KEYS = [
     "onboarding.invoice.received",
     "onboarding.invoice.failed",
     "onboarding.invoice.status",
+    # UAT 2026-06-16 #3: single-PDF confirm card + Approve/Edit/Reject UX.
+    "onboarding.invoice.confirm",
+    "onboarding.invoice.edit.prompt",
+    "onboarding.invoice.rejected",
+    # UAT 2026-06-16 #4: bulk ZIP CSV preview + APPROVE ALL/EDIT/REMOVE.
+    "onboarding.invoice.batch.preview",
+    "onboarding.invoice.batch.help",
+    "onboarding.invoice.batch.submitted",
+    "onboarding.invoice.batch.cleared",
     "onboarding.disbursement.received",
     "onboarding.repayment.received",
     "onboarding.repayment.partially_paid",
@@ -335,6 +344,483 @@ def _is_invoice_status_query(value: Any) -> bool:
     if text in _INVOICE_STATUS_SHORT_TOKENS:
         return True
     return any(phrase in text for phrase in _INVOICE_STATUS_PHRASES)
+
+
+# UAT 2026-06-16 (#9): structured Q&A intents the SME can ask at any
+# time in invoice_collect_await. Each maps a phrase set to a backend
+# read so we ground the answer in real data instead of LLM guesswork.
+_QA_LIMIT_PHRASES = (
+    "my limit", "credit limit", "approved limit", "available limit",
+    "how much can i borrow", "how much can i finance",
+    "what's my limit", "remaining limit",
+)
+_QA_DISBURSED_PHRASES = (
+    "total disbursed", "how much disbursed", "disbursed so far",
+    "total funded", "funded so far", "total funding",
+)
+_QA_DUE_PHRASES = (
+    "what is due", "what's due", "due now", "due amount", "amount due",
+    "what do i owe", "what do i need to pay", "outstanding",
+    "next payment", "next due", "next emi", "upcoming payment",
+)
+
+
+class _QAIntent:
+    """Tagged enum of supported self-service Q&A intents."""
+    LIMIT = "limit"
+    DISBURSED_TOTAL = "disbursed_total"
+    DUE = "due"
+
+
+def _qa_intent(value: Any) -> str | None:
+    """Classify the SME's text into one of the self-service Q&A intents.
+    Returns the intent tag or None if no Q&A intent matched."""
+    text = reply_text(value).strip().lower()
+    if not text:
+        return None
+    if any(p in text for p in _QA_LIMIT_PHRASES):
+        return _QAIntent.LIMIT
+    if any(p in text for p in _QA_DISBURSED_PHRASES):
+        return _QAIntent.DISBURSED_TOTAL
+    if any(p in text for p in _QA_DUE_PHRASES):
+        return _QAIntent.DUE
+    return None
+
+
+_CONFIRM_APPROVE_TOKENS = frozenset({
+    "approve", "approved", "ok", "okay", "confirm", "confirmed",
+    "yes", "submit", "submit it", "go", "go ahead", "send", "all good",
+    "looks good", "correct", "right",
+    "invoice_approve",
+})
+_CONFIRM_REJECT_TOKENS = frozenset({
+    "reject", "rejected", "cancel", "no", "discard", "delete", "stop",
+    "remove", "drop",
+    "invoice_reject",
+})
+_CONFIRM_EDIT_TOKENS = frozenset({
+    "edit", "change", "modify", "update", "correction", "wrong",
+    "fix", "fix it",
+    "invoice_edit",
+})
+
+
+def _classify_confirm_action(value: Any) -> str | None:
+    """Classify an invoice confirm reply (button tap or typed text) into
+    ``approve`` / ``edit`` / ``reject`` or None when it doesn't fit.
+
+    Buttons send the button title or id as the SME's text; we accept
+    both. Edits with an explicit field/value ("edit amount: 32000")
+    still classify as ``edit`` — the field/value parsing happens in
+    a separate helper."""
+    text = reply_text(value).strip().lower()
+    if not text:
+        return None
+    # Check for compound edit ("edit amount: 5000") first.
+    head = text.split(":", 1)[0].split()[0] if text else ""
+    if head in _CONFIRM_EDIT_TOKENS:
+        return "edit"
+    if text in _CONFIRM_APPROVE_TOKENS:
+        return "approve"
+    if text in _CONFIRM_REJECT_TOKENS:
+        return "reject"
+    if text in _CONFIRM_EDIT_TOKENS:
+        return "edit"
+    return None
+
+
+_EDIT_FIELD_ALIASES: dict[str, str] = {
+    "amount": "total_amount",
+    "total": "total_amount",
+    "total amount": "total_amount",
+    "totalamount": "total_amount",
+    "amt": "total_amount",
+    "due": "due_date",
+    "due date": "due_date",
+    "duedate": "due_date",
+    "invoice no": "invoice_number",
+    "invoice number": "invoice_number",
+    "no": "invoice_number",
+    "number": "invoice_number",
+    "inv": "invoice_number",
+    "supplier": "supplier_name",
+    "supplier name": "supplier_name",
+    "buyer": "customer_name",
+    "customer": "customer_name",
+    "customer name": "customer_name",
+}
+
+
+def _parse_edit_field_value(text: str) -> tuple[str | None, str | None]:
+    """Parse 'edit amount: 32000' / 'change buyer: ACME' style replies.
+
+    Returns ``(field_canonical, new_value)`` when both parts are present,
+    or ``(None, None)`` when the SME just tapped Edit with no field.
+    """
+    lowered = text.lower().strip()
+    if ":" not in lowered:
+        return None, None
+    head, _, tail = lowered.partition(":")
+    head = head.strip()
+    # Strip the leading edit-verb token if present.
+    head_tokens = head.split()
+    if head_tokens and head_tokens[0] in _CONFIRM_EDIT_TOKENS:
+        head = " ".join(head_tokens[1:]).strip()
+    if not head:
+        return None, None
+    field = _EDIT_FIELD_ALIASES.get(head)
+    if field is None:
+        # Try matching individual words from the head.
+        for word in head.split():
+            if word in _EDIT_FIELD_ALIASES:
+                field = _EDIT_FIELD_ALIASES[word]
+                break
+    if field is None:
+        return None, None
+    value = tail.strip()
+    # Preserve original case for the value by re-slicing on text.
+    raw_text = text.strip()
+    if ":" in raw_text:
+        value = raw_text.split(":", 1)[1].strip()
+    if not value:
+        return field, None
+    return field, value
+
+
+def _apply_invoice_edit(
+    draft: dict[str, Any], field: str, value: str
+) -> dict[str, Any]:
+    """Return a fresh draft dict with ``field`` updated to ``value``.
+    Numeric fields are coerced to int when the value parses cleanly."""
+    updated = dict(draft)
+    if field == "total_amount":
+        try:
+            updated[field] = int(float(value.replace(",", "")))
+        except (TypeError, ValueError):
+            updated[field] = value
+    else:
+        updated[field] = value
+    return updated
+
+
+_BATCH_APPROVE_PHRASES = (
+    "approve all", "approveall", "submit all", "submit everything",
+    "go", "go ahead", "confirm all", "ok all",
+    "batch_approve_all",
+)
+_BATCH_EDIT_HEADS = frozenset({"edit", "change", "modify", "update"})
+_BATCH_REMOVE_HEADS = frozenset({"remove", "delete", "drop", "discard"})
+
+
+def _classify_batch_action(value: Any) -> str | None:
+    """Classify a reply at a pending batch into ``approve_all``,
+    ``edit`` or ``remove``. Returns None when nothing matches."""
+    text = reply_text(value).strip().lower()
+    if not text:
+        return None
+    if any(p in text for p in _BATCH_APPROVE_PHRASES):
+        return "approve_all"
+    head = text.split()[0] if text else ""
+    if head in _BATCH_EDIT_HEADS:
+        return "edit"
+    if head in _BATCH_REMOVE_HEADS:
+        return "remove"
+    return None
+
+
+_ROW_NUMBER_RE = re.compile(r"\b(\d+)\b")
+
+
+def _parse_row_number(text: str) -> int | None:
+    """Pull the first integer out of the SME's reply — the row number."""
+    m = _ROW_NUMBER_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_batch_edit(
+    text: str,
+) -> tuple[int | None, str | None, str | None]:
+    """Parse ``edit 2: amount 32000`` / ``edit 3: due 2026-07-28``.
+
+    Returns ``(row, field_canonical, new_value)`` or all-None when the
+    shape doesn't fit. The colon between row and field/value is the
+    primary separator; field aliases come from ``_EDIT_FIELD_ALIASES``.
+    """
+    if ":" not in (text or ""):
+        return None, None, None
+    head, _, tail = text.partition(":")
+    row = _parse_row_number(head)
+    if row is None:
+        return None, None, None
+    tail = tail.strip()
+    if not tail:
+        return None, None, None
+    # tail looks like "amount 32000" or "due 2026-07-28".
+    tokens = tail.split(None, 1)
+    if len(tokens) < 2:
+        return None, None, None
+    field_raw, value = tokens[0].lower(), tokens[1].strip()
+    field = _EDIT_FIELD_ALIASES.get(field_raw)
+    if field is None:
+        return None, None, None
+    return row, field, value
+
+
+def _remove_batch_row(
+    batch: list[dict[str, Any]], row: int,
+) -> list[dict[str, Any]]:
+    """Remove the row matching ``row`` from the batch + renumber the
+    remaining rows so the SME's mental model stays 1-indexed."""
+    out: list[dict[str, Any]] = []
+    new_row = 1
+    for entry in batch or []:
+        if entry.get("row") == row:
+            continue
+        new_entry = dict(entry)
+        new_entry["row"] = new_row
+        out.append(new_entry)
+        new_row += 1
+    return out
+
+
+def _apply_batch_edit(
+    batch: list[dict[str, Any]], row: int, field: str, value: str,
+) -> list[dict[str, Any]]:
+    """Apply a field edit to one row, keeping the rest unchanged."""
+    out: list[dict[str, Any]] = []
+    for entry in batch or []:
+        if entry.get("row") != row:
+            out.append(entry)
+            continue
+        draft = entry.get("draft") or {}
+        updated_draft = _apply_invoice_edit(draft, field, value)
+        new_entry = dict(entry)
+        new_entry["draft"] = updated_draft
+        new_entry["flag"] = _flag_for_row(updated_draft)
+        out.append(new_entry)
+    return out
+
+
+def _sum_batch_total(batch: list[dict[str, Any]]) -> tuple[int, str]:
+    """Sum the per-row total_amount, returning (total, currency)."""
+    total = 0
+    currency = "QAR"
+    for entry in batch or []:
+        draft = entry.get("draft") or {}
+        amt = draft.get("total_amount")
+        try:
+            total += int(float(amt)) if amt is not None else 0
+        except (TypeError, ValueError):
+            continue
+        if isinstance(draft.get("currency"), str):
+            currency = draft["currency"]
+    return total, currency
+
+
+def _flag_for_row(draft: dict[str, Any]) -> str:
+    """Decide the per-row flag column. Marks rows whose extraction is
+    obviously incomplete so the SME can review before approving."""
+    missing: list[str] = []
+    for key, label in (
+        ("invoice_number", "ref"),
+        ("supplier_name",  "supplier"),
+        ("total_amount",   "amount"),
+        ("due_date",       "due"),
+    ):
+        v = draft.get(key)
+        if v in (None, "", "—"):
+            missing.append(label)
+    if missing:
+        return "⚠️ " + "/".join(missing)
+    # Low confidence flag from the extractor itself.
+    conf = draft.get("confidently_extracted")
+    if conf is False:
+        return "⚠️ review"
+    return "✅"
+
+
+def _render_invoice_batch_table(
+    batch: list[dict[str, Any]], currency: str, total: int,
+) -> str:
+    """Render a fixed-column table the SME can read on WhatsApp.
+
+    Madad's spec asks for a CSV; until the cluster exposes a WhatsApp
+    document-send tool, we render the same columns inline in a code
+    block so the SME can scan it. The columns map 1:1 to the CSV
+    Madad described."""
+    lines = [
+        "```",
+        "Row  Invoice No        Date         Due          Customer            Amount       Flag",
+    ]
+    for entry in batch:
+        draft = entry.get("draft") or {}
+        row = str(entry.get("row") or "?").ljust(4)
+        ref = str(draft.get("invoice_number") or "—")[:16].ljust(17)
+        date = str(draft.get("invoice_date") or "—")[:12].ljust(13)
+        due = str(draft.get("due_date") or "—")[:12].ljust(13)
+        cust = str(draft.get("customer_name") or "—")[:19].ljust(20)
+        amt = draft.get("total_amount")
+        try:
+            amt_s = f"{currency} {int(float(amt)):,}" if amt is not None else f"{currency} —"
+        except (TypeError, ValueError):
+            amt_s = f"{currency} {amt}"
+        amt_s = amt_s[:12].ljust(13)
+        flag = str(entry.get("flag") or "—")
+        lines.append(f"{row} {ref} {date} {due} {cust} {amt_s} {flag}")
+    lines.append("```")
+    lines.append(f"\n📊 Batch total: {_fmt_qar(total, currency)}")
+    return "\n".join(lines)
+
+
+def _confirm_card_variables(draft: dict[str, Any]) -> dict[str, Any]:
+    """Render the variables a confirm card template needs from a draft."""
+    supplier = draft.get("supplier_name") or "—"
+    invoice_number = draft.get("invoice_number") or "—"
+    total = draft.get("total_amount")
+    currency = draft.get("currency") or "QAR"
+    due_date = draft.get("due_date") or "—"
+    if total is None or total == "":
+        amount_str = f"{currency} —"
+    else:
+        try:
+            amount_str = f"{currency} {int(float(total)):,}"
+        except (TypeError, ValueError):
+            amount_str = f"{currency} {total}"
+    summary = (
+        f"📄 Extracted {invoice_number} · {amount_str} · Due {due_date}\n"
+        f"Supplier: {supplier}"
+    )
+    return {
+        "summary":   summary,
+        "supplier":  supplier,
+        "ref":       invoice_number,
+        "amount":    amount_str,
+        "due_date":  str(due_date),
+        "customer":  str(draft.get("customer_name") or "—"),
+    }
+
+
+def _extract_credit_line(me_response: Any) -> dict[str, Any]:
+    """Pull the active credit line dict off a /me response.
+
+    Backends vary: ``user.creditLine`` (singular, most common) and
+    ``user.creditLines[0]`` (legacy list). Returns the empty dict when
+    nothing's there so callers can safely chain ``.get``."""
+    if not isinstance(me_response, dict):
+        return {}
+    user = me_response.get("user") if isinstance(me_response.get("user"), dict) else me_response
+    if not isinstance(user, dict):
+        return {}
+    cl = user.get("creditLine") or user.get("credit_line")
+    if isinstance(cl, dict):
+        return cl
+    cls = user.get("creditLines") or user.get("credit_lines")
+    if isinstance(cls, list):
+        for entry in cls:
+            if isinstance(entry, dict):
+                return entry
+    return {}
+
+
+def _sum_disbursements(records: list[dict[str, Any]]) -> tuple[int, str]:
+    """Sum the disbursement amounts on the agent's local ledger.
+    Returns (total, currency). Defaults to QAR when the records don't
+    have a currency tag."""
+    total = 0
+    currency = "QAR"
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        amt = r.get("amount")
+        if isinstance(amt, (int, float)):
+            total += int(amt)
+        elif isinstance(amt, str):
+            try:
+                total += int(float(amt))
+            except (TypeError, ValueError):
+                continue
+        if isinstance(r.get("currency"), str):
+            currency = r["currency"]
+    return total, currency
+
+
+def _latest_emis_remaining(records: list[dict[str, Any]]) -> int | None:
+    """Read the EMIs-remaining count from the most recent repayment
+    record on state. Returns None when nothing is on file."""
+    for r in reversed(records or []):
+        if not isinstance(r, dict):
+            continue
+        v = r.get("emis_remaining")
+        if isinstance(v, (int, float)):
+            return int(v)
+    return None
+
+
+def _fmt_qar(value: Any, currency: str = "QAR") -> str:
+    if value in (None, ""):
+        return f"{currency} —"
+    try:
+        return f"{currency} {int(float(value)):,}"
+    except (TypeError, ValueError):
+        return f"{currency} {value}"
+
+
+def _format_limit_answer(currency: str, limit: Any, available: Any) -> str:
+    if limit is None and available is None:
+        return (
+            "I don't have your credit line details to hand right now. Please "
+            "log in to uat-portal.madadfintech.com to see your approved "
+            "limit, or call us on +974 3017 3888."
+        )
+    pieces: list[str] = []
+    if limit is not None:
+        pieces.append(f"Approved limit: {_fmt_qar(limit, currency)}")
+    if available is not None:
+        pieces.append(f"Available now: {_fmt_qar(available, currency)}")
+    body = "\n".join(pieces)
+    return (
+        f"💳 {body}\n\n"
+        "Send another invoice anytime and I'll submit it for financing."
+    )
+
+
+def _format_disbursed_answer(total: int, currency: str) -> str:
+    if total <= 0:
+        return (
+            "I don't have any disbursement records yet on this conversation. "
+            "Once a lender disburses an invoice you'll see the confirmation "
+            "here and the figure will start tracking."
+        )
+    return (
+        f"💸 Total disbursed so far: {_fmt_qar(total, currency)} "
+        "(this number reflects what I've seen come through this chat). "
+        "For the authoritative figure across all invoices, check "
+        "uat-portal.madadfintech.com."
+    )
+
+
+def _format_due_answer(
+    currency: str, outstanding: int | None, emis_remaining: int | None
+) -> str:
+    if outstanding is None and emis_remaining is None:
+        return (
+            "I don't have an outstanding balance recorded yet — once a "
+            "repayment update arrives I'll have the number ready. You can "
+            "also check uat-portal.madadfintech.com any time."
+        )
+    pieces: list[str] = []
+    if outstanding is not None:
+        pieces.append(f"Outstanding: {_fmt_qar(outstanding, currency)}")
+    if emis_remaining is not None:
+        word = "EMI" if emis_remaining == 1 else "EMIs"
+        pieces.append(f"Remaining: {emis_remaining} {word}")
+    body = " · ".join(pieces)
+    return f"📅 {body}.\n\nReply here if anything needs clarification."
 
 
 def _normalize_invoice_record(
@@ -4565,7 +5051,34 @@ class OnboardingWorkflow(WorkflowDefinition):
         if isinstance(reply, dict) and reply.get("type") == "phase1b_event":
             return await self._handle_phase1b_event(state, ctx, reply)
 
-        # Status-query path FIRST so the SME can ask "any update?" without
+        # UAT 2026-06-16 (Bug #2, +918287611995): "Whenever you have an
+        # invoice to finance, just send it here" fired 7 times in 6 min
+        # because Phase 1.a webhooks (offer.selected, credit_line.activated,
+        # transaction.disbursed echoes) AND the status poller / docs-settle
+        # sweep AND any backend status_update legitimately resume this
+        # parked-post-activation run. None of them are SME-side input, so
+        # all of them used to fall through to _smart_contextual and re-fire
+        # the canned prompt. Match journey_wait_await's pattern: re-park
+        # silently when the resume is synthetic / non-SME.
+        if isinstance(reply, dict):
+            reply_type = reply.get("type")
+            # Synthetic resumes — silently re-park, never message the SME.
+            if reply_type in {"status_update", "docs_settle"}:
+                return self._step("invoice_collect_await", ctx)
+            if reply.get("last_status_source") in {"poll", "webhook"}:
+                # A bare poll/webhook tick with no real SME content.
+                if not reply.get("text") and not reply.get("attachments"):
+                    return self._step("invoice_collect_await", ctx)
+
+        # Self-service Q&A intents (UAT 2026-06-16 #9). Take precedence
+        # over the broader status-query path because "what's my limit?"
+        # could otherwise be misdetected as a status query and lose the
+        # structured answer.
+        intent = _qa_intent(reply)
+        if intent is not None:
+            return await self._handle_invoice_qa(state, ctx, intent)
+
+        # Status-query path so the SME can ask "any update?" without
         # us misinterpreting it as chit-chat.
         if _is_invoice_status_query(reply):
             token, refresh, expires = await self._live_token(state, ctx)
@@ -4592,6 +5105,26 @@ class OnboardingWorkflow(WorkflowDefinition):
                 access_token=token, refresh_token=refresh, token_expires_at=expires,
             )
 
+        # Approve / Edit / Reject reply from a pending confirm card
+        # (UAT 2026-06-16 #3). The buttons send their title as the SME's
+        # text reply via the WhatsApp interactive callback.
+        if state.pending_invoice_draft is not None:
+            confirm_action = _classify_confirm_action(reply)
+            if confirm_action is not None:
+                return await self._handle_invoice_confirm(
+                    state, ctx, reply, confirm_action,
+                )
+
+        # Bulk CSV-preview controls (UAT 2026-06-16 #4): APPROVE ALL,
+        # EDIT <row>: <change>, REMOVE <row>. Only when there's a
+        # pending batch on state.
+        if state.pending_invoice_batch:
+            batch_action = _classify_batch_action(reply)
+            if batch_action is not None:
+                return await self._handle_invoice_batch_action(
+                    state, ctx, reply, batch_action,
+                )
+
         attachments = _valid_upload_attachments(reply)
         if not attachments:
             await self._smart_contextual(
@@ -4606,91 +5139,639 @@ class OnboardingWorkflow(WorkflowDefinition):
         # Mint a live token from the verified identity (a long-active user can
         # resume with an empty/expired cached token — same fix as doc uploads).
         token, refresh, expires = await self._live_token(state, ctx)
-        accepted: list[dict[str, Any]] = []
-        failed = 0
-        # Track how many of the failures were transport timeouts (vs real
-        # backend "couldn't parse the file" errors). Drives an honest
-        # SME-facing message when nothing went through.
-        transport_timeout_failures = 0
-        now_iso = ctx.clock.now().isoformat()
 
-        for att in attachments:
+        # Single non-ZIP attachment: EXTRACT-ONLY → confirm card → submit on
+        # Approve (UAT 2026-06-16 #3). We carry the bytes in state for
+        # one turn so we can re-call submit_base64 with the SME-confirmed
+        # fields. ZIP attachments and multi-file batches take the bulk
+        # CSV-preview path (UAT 2026-06-16 #4).
+        non_zip = [a for a in attachments if not _is_zip_attachment(a)]
+        has_zip = any(_is_zip_attachment(a) for a in attachments)
+        if non_zip and not has_zip and len(non_zip) == 1:
+            return await self._invoice_extract_for_confirm(
+                state, ctx, non_zip[0], token, refresh, expires,
+            )
+
+        # Bulk / multi-file / ZIP batch — extract-only per member, render
+        # a CSV-style preview, park awaiting APPROVE ALL / EDIT / REMOVE.
+        return await self._invoice_bulk_preview(
+            state, ctx, attachments, token, refresh, expires,
+        )
+
+    async def _invoice_extract_for_confirm(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        attachment: dict[str, Any],
+        token: str | None,
+        refresh: str | None,
+        expires: int | None,
+    ) -> dict[str, Any]:
+        """UAT 2026-06-16 #3 — single PDF flow.
+
+        Call extract-only, store the draft + bytes on state, render the
+        confirm card with Approve/Edit/Reject interactive buttons.
+        """
+        content = attachment.get("content_base64") or ""
+        filename = attachment.get("filename") or "invoice.pdf"
+        mime = attachment.get("mime_type")
+
+        if not content or not token:
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {"reason": "We didn't receive the file bytes — please resend."},
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+
+        try:
+            draft = await self._invoices.extract_base64(
+                access_token=token,
+                filename=filename,
+                content_base64=content,
+                mime_type=mime,
+            )
+        except Exception as exc:  # noqa: BLE001
+            ctx.logger.warning(
+                "invoice_extract.failed", filename=filename, error=str(exc)[:200],
+            )
+            reason = (
+                "Our invoice processor is taking longer than usual — please "
+                "try again in a minute. Your file looks fine; we just need "
+                "another moment to get it through."
+                if _looks_like_transport_timeout(exc)
+                else "We couldn't read the file — please resend as a clear "
+                     "PDF or photo."
+            )
+            await self._send(
+                ctx, state, "onboarding.invoice.failed", {"reason": reason},
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+
+        # Render the confirm card with 3 buttons. Title strings on the
+        # buttons drive the SME-side text reply via the WhatsApp
+        # interactive callback — match what _classify_confirm_action
+        # parses.
+        await self._send_invoice_confirm_card(ctx, state, draft)
+
+        return self._step(
+            "invoice_collect_await", ctx,
+            pending_invoice_draft=draft,
+            pending_invoice_filename=filename,
+            pending_invoice_content_b64=content,
+            pending_invoice_mime=mime,
+            pending_invoice_edit_field=None,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
+
+    async def _send_invoice_confirm_card(
+        self,
+        ctx: WorkflowContext,
+        state: OnboardingState,
+        draft: dict[str, Any],
+    ) -> None:
+        """Render the confirm body + Approve/Edit/Reject buttons.
+        Falls back to plain text when the interactive send path declines
+        — the SME can still type "Approve" / "Edit" / "Reject"."""
+        variables = _confirm_card_variables(draft)
+        sent = False
+        send_buttons = getattr(self._msg, "send_reply_buttons", None)
+        if send_buttons is not None and ctx.channel is Channel.WHATSAPP:
+            try:
+                sent = await send_buttons(
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    template_key="onboarding.invoice.confirm",
+                    buttons=[
+                        ("invoice_approve", "Approve"),
+                        ("invoice_edit",    "Edit"),
+                        ("invoice_reject",  "Reject"),
+                    ],
+                    variables=variables,
+                    locale=state.locale,
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back to text
+                ctx.logger.warning(
+                    "invoice_confirm.buttons_failed", error=str(exc)[:200],
+                )
+        if not sent:
+            await self._send(ctx, state, "onboarding.invoice.confirm", variables)
+
+    async def _handle_invoice_confirm(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        reply: Any,
+        action: str,
+    ) -> dict[str, Any]:
+        """UAT 2026-06-16 #3 — process Approve/Edit/Reject.
+
+        * approve → call submit_base64 with the (possibly edited)
+          fields, append to ledger, send "submitted" message, clear
+          draft from state.
+        * edit    → if SME also named the field+value in one message
+                    apply directly; otherwise ask which field, park.
+        * reject  → discard draft, confirm.
+        """
+        draft = state.pending_invoice_draft or {}
+
+        if action == "approve":
+            return await self._invoice_submit_confirmed(state, ctx, draft)
+        if action == "reject":
+            await self._send(
+                ctx, state, "onboarding.invoice.rejected",
+                {
+                    "ref": str(draft.get("invoice_number") or draft.get("invoice_id") or "—"),
+                },
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                pending_invoice_draft=None,
+                pending_invoice_filename=None,
+                pending_invoice_content_b64=None,
+                pending_invoice_mime=None,
+                pending_invoice_edit_field=None,
+            )
+        # action == "edit"
+        # Pattern 1: "Edit amount: 32000" — single-line update.
+        text = reply_text(reply).strip()
+        field, value = _parse_edit_field_value(text)
+        if field is not None and value is not None:
+            updated = _apply_invoice_edit(draft, field, value)
+            await self._send_invoice_confirm_card(ctx, state, updated)
+            return self._step(
+                "invoice_collect_await", ctx,
+                pending_invoice_draft=updated,
+                pending_invoice_edit_field=None,
+            )
+        # Pattern 2: SME just tapped "Edit" with no field — ask which.
+        await self._send(
+            ctx, state, "onboarding.invoice.edit.prompt",
+            {"summary": _confirm_card_variables(draft)["summary"]},
+        )
+        return self._step(
+            "invoice_collect_await", ctx,
+            pending_invoice_edit_field="awaiting_field",
+        )
+
+    async def _invoice_submit_confirmed(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        draft: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Submit the confirmed (possibly edited) draft via
+        ``submit_base64`` and clear the pending state."""
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not token or not state.pending_invoice_content_b64:
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {"reason": "Lost the file bytes mid-confirm. Please resend the invoice."},
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                pending_invoice_draft=None,
+                pending_invoice_filename=None,
+                pending_invoice_content_b64=None,
+                pending_invoice_mime=None,
+                pending_invoice_edit_field=None,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+
+        def _opt_str(key: str) -> str | None:
+            v = draft.get(key)
+            return None if v in (None, "") else str(v)
+
+        try:
+            record = await self._invoices.submit_base64(
+                access_token=token,
+                filename=(
+                    state.pending_invoice_filename
+                    or draft.get("filename")
+                    or "invoice.pdf"
+                ),
+                content_base64=state.pending_invoice_content_b64,
+                mime_type=state.pending_invoice_mime,
+                invoice_number=_opt_str("invoice_number"),
+                invoice_date=_opt_str("invoice_date"),
+                due_date=_opt_str("due_date"),
+                total_amount=_opt_str("total_amount"),
+                supplier_name=_opt_str("supplier_name"),
+                customer_name=_opt_str("customer_name"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            ctx.logger.warning(
+                "invoice_submit.failed", error=str(exc)[:200],
+            )
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {
+                    "reason": "We couldn't submit the invoice just now — please "
+                              "try again in a moment or call +974 3017 3888.",
+                },
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                pending_invoice_draft=None,
+                pending_invoice_filename=None,
+                pending_invoice_content_b64=None,
+                pending_invoice_mime=None,
+                pending_invoice_edit_field=None,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+
+        now_iso = ctx.clock.now().isoformat()
+        accepted = [_normalize_invoice_record(record, now_iso)]
+        await self._send(
+            ctx, state, "onboarding.invoice.received",
+            {
+                "summary": _format_accepted_invoices(accepted),
+                "count":   1,
+                "noun":    "invoice",
+                "failed":  0,
+            },
+        )
+        return self._step(
+            "invoice_collect_await", ctx,
+            invoices_submitted=[*state.invoices_submitted, *accepted],
+            pending_invoice_draft=None,
+            pending_invoice_filename=None,
+            pending_invoice_content_b64=None,
+            pending_invoice_mime=None,
+            pending_invoice_edit_field=None,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
+
+    async def _invoice_bulk_preview(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        attachments: list[dict[str, Any]],
+        token: str | None,
+        refresh: str | None,
+        expires: int | None,
+    ) -> dict[str, Any]:
+        """UAT 2026-06-16 #4 — bulk ZIP / multi-file preview path.
+
+        Local-unzip → per-member ``extract_base64`` → CSV-style table
+        rendered inline (WhatsApp doesn't yet expose a document-send
+        tool agent-side) → park awaiting APPROVE ALL / EDIT / REMOVE.
+        Rows are flagged when extraction is unreliable OR when batch
+        total > available credit limit (priority-order note follows).
+        """
+        members, saw_zip = _expand_zip_attachments(attachments)
+        if not members:
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {"reason": "We didn't see any invoice files in that batch. Please resend."},
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+
+        batch: list[dict[str, Any]] = []
+        failed = 0
+        transport_timeout_failures = 0
+        total_qar = 0
+        currency = "QAR"
+        row_num = 1
+        for att in members:
+            if _is_zip_attachment(att):
+                # A ZIP that local-unzip couldn't expand — skip it from the
+                # preview so the SME isn't told to "approve" a black box.
+                failed += 1
+                continue
             content = att.get("content_base64") or ""
-            filename = att.get("filename") or "invoice.pdf"
+            filename = att.get("filename") or f"invoice_{row_num}.pdf"
+            mime = att.get("mime_type")
             if not content or not token:
                 failed += 1
                 continue
             try:
-                if _is_zip_attachment(att):
-                    # Bulk path — server-side recursive extract + submit.
-                    bulk = await self._invoices.submit_zip_base64(
-                        access_token=token,
-                        filename=filename,
-                        content_base64=content,
-                    )
-                    for inv in bulk.get("invoices", []):
-                        if isinstance(inv, dict):
-                            accepted.append(_normalize_invoice_record(inv, now_iso))
-                    failed += int(bulk.get("failed") or 0)
-                else:
-                    record = await self._invoices.extract_and_submit_base64(
-                        access_token=token,
-                        filename=filename,
-                        content_base64=content,
-                        mime_type=att.get("mime_type"),
-                    )
-                    accepted.append(_normalize_invoice_record(record, now_iso))
-            except Exception as exc:  # noqa: BLE001 — never crash the run
-                ctx.logger.warning(
-                    "invoice_upload.failed",
+                draft = await self._invoices.extract_base64(
+                    access_token=token,
                     filename=filename,
-                    error=str(exc)[:200],
+                    content_base64=content,
+                    mime_type=mime,
+                )
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "invoice_extract.failed",
+                    filename=filename, error=str(exc)[:200],
                 )
                 if _looks_like_transport_timeout(exc):
-                    # UAT 2026-06-16: extract+submit was timing out at 30s
-                    # and the SME got a "couldn't read the file" message
-                    # that misdiagnosed the failure. Track separately so
-                    # the follow-up message blames the right thing.
                     transport_timeout_failures += 1
                 failed += 1
+                continue
 
-        if accepted:
-            await self._send(
-                ctx, state, "onboarding.invoice.received",
-                {
-                    "summary": _format_accepted_invoices(accepted),
-                    "count": len(accepted),
-                    "noun": "invoice" if len(accepted) == 1 else "invoices",
-                    "failed": failed,
-                },
+            amount = draft.get("total_amount")
+            try:
+                amount_int = int(float(amount)) if amount is not None else 0
+            except (TypeError, ValueError):
+                amount_int = 0
+            total_qar += amount_int
+            if isinstance(draft.get("currency"), str):
+                currency = draft["currency"]
+            flag = _flag_for_row(draft)
+            batch.append({
+                "row":          row_num,
+                "draft":        draft,
+                "filename":     filename,
+                "content_b64":  content,
+                "mime":         mime,
+                "flag":         flag,
+            })
+            row_num += 1
+
+        if not batch:
+            reason = (
+                "Our invoice processor is taking longer than usual — please "
+                "try again in a minute."
+                if transport_timeout_failures and transport_timeout_failures == failed
+                else "We couldn't read any of those invoices — please resend "
+                     "as clear PDFs or photos."
             )
-        else:
-            # Pick the most accurate message for what actually went wrong.
-            # If every failure was a transport timeout, the file is fine
-            # and our cluster was slow — don't tell the SME to resend.
-            if transport_timeout_failures and transport_timeout_failures == failed:
-                reason = (
-                    "Our invoice processor is taking longer than usual — please "
-                    "try again in a minute. Your file looks fine; we just need "
-                    "another moment to get it through."
-                )
-            else:
-                reason = (
-                    "We couldn't read the file — please resend as a clear PDF "
-                    "or photo."
-                )
             await self._send(
-                ctx, state, "onboarding.invoice.failed",
-                {"reason": reason},
+                ctx, state, "onboarding.invoice.failed", {"reason": reason},
             )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+
+        # Check batch total vs available limit; flag the priority note
+        # when total exceeds limit.
+        available_limit = await self._fetch_available_limit(state, ctx, token)
+        priority_note = ""
+        if available_limit is not None and total_qar > available_limit:
+            priority_note = (
+                f"\n\n⚠️ Total {_fmt_qar(total_qar, currency)} exceeds your "
+                f"available limit ({_fmt_qar(available_limit, currency)}). "
+                "Invoices will be processed in priority order until the "
+                "limit is reached."
+            )
+
+        table = _render_invoice_batch_table(batch, currency, total_qar)
+        await self._send(
+            ctx, state, "onboarding.invoice.batch.preview",
+            {
+                "table":         table + priority_note,
+                "count":         str(len(batch)),
+                "total":         _fmt_qar(total_qar, currency),
+                "saw_zip":       "yes" if saw_zip else "no",
+                "failed":        str(failed),
+            },
+        )
 
         return self._step(
-            "invoice_collect_await",
-            ctx,
-            access_token=token,
-            refresh_token=refresh,
-            token_expires_at=expires,
+            "invoice_collect_await", ctx,
+            pending_invoice_batch=batch,
+            pending_invoice_batch_total_qar=total_qar,
+            pending_invoice_batch_currency=currency,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
+
+    async def _fetch_available_limit(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        token: str | None,
+    ) -> int | None:
+        """Read the SME's currently-available credit limit from /me's
+        creditLine, returning an int or None if not reachable."""
+        if not token:
+            return None
+        try:
+            info = await self._identity.me(access_token=token)
+        except Exception as exc:  # noqa: BLE001
+            ctx.logger.warning(
+                "invoice_batch.limit_lookup_failed", error=str(exc)[:200]
+            )
+            return None
+        line = _extract_credit_line(info)
+        avail = line.get("availableLimit") or line.get("available_limit")
+        try:
+            return int(float(avail)) if avail is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def _handle_invoice_batch_action(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        reply: Any,
+        action: str,
+    ) -> dict[str, Any]:
+        """Apply APPROVE ALL / EDIT <row>: <change> / REMOVE <row> to a
+        pending batch. Returns the next workflow step."""
+        if action == "approve_all":
+            return await self._invoice_batch_submit_all(state, ctx)
+
+        text = reply_text(reply).strip()
+        if action == "remove":
+            row = _parse_row_number(text)
+            if row is None:
+                await self._send(
+                    ctx, state, "onboarding.invoice.batch.help",
+                    {"hint": "I couldn't read the row number — try `remove 3`."},
+                )
+                return self._step("invoice_collect_await", ctx)
+            new_batch = _remove_batch_row(state.pending_invoice_batch, row)
+            new_total, currency = _sum_batch_total(new_batch)
+            if not new_batch:
+                await self._send(
+                    ctx, state, "onboarding.invoice.batch.cleared", {},
+                )
+                return self._step(
+                    "invoice_collect_await", ctx,
+                    pending_invoice_batch=[],
+                    pending_invoice_batch_total_qar=None,
+                    pending_invoice_batch_currency=None,
+                )
+            table = _render_invoice_batch_table(new_batch, currency, new_total)
+            await self._send(
+                ctx, state, "onboarding.invoice.batch.preview",
+                {
+                    "table":  table,
+                    "count":  str(len(new_batch)),
+                    "total":  _fmt_qar(new_total, currency),
+                    "saw_zip": "yes",
+                    "failed":  "0",
+                },
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                pending_invoice_batch=new_batch,
+                pending_invoice_batch_total_qar=new_total,
+                pending_invoice_batch_currency=currency,
+            )
+
+        # action == "edit"
+        row, field, value = _parse_batch_edit(text)
+        if row is None or field is None or value is None:
+            await self._send(
+                ctx, state, "onboarding.invoice.batch.help",
+                {
+                    "hint": (
+                        "I need row + field + new value. Try "
+                        "`edit 2: amount 32000` or `edit 3: due 2026-07-28`."
+                    ),
+                },
+            )
+            return self._step("invoice_collect_await", ctx)
+        new_batch = _apply_batch_edit(state.pending_invoice_batch, row, field, value)
+        new_total, currency = _sum_batch_total(new_batch)
+        table = _render_invoice_batch_table(new_batch, currency, new_total)
+        await self._send(
+            ctx, state, "onboarding.invoice.batch.preview",
+            {
+                "table":  table,
+                "count":  str(len(new_batch)),
+                "total":  _fmt_qar(new_total, currency),
+                "saw_zip": "yes",
+                "failed":  "0",
+            },
+        )
+        return self._step(
+            "invoice_collect_await", ctx,
+            pending_invoice_batch=new_batch,
+            pending_invoice_batch_total_qar=new_total,
+            pending_invoice_batch_currency=currency,
+        )
+
+    async def _invoice_batch_submit_all(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+    ) -> dict[str, Any]:
+        """Submit every row in the pending batch via ``submit_base64``
+        and append the resulting records to the ledger. Clears the
+        batch on success or partial success."""
+        token, refresh, expires = await self._live_token(state, ctx)
+        accepted: list[dict[str, Any]] = []
+        failed = 0
+        now_iso = ctx.clock.now().isoformat()
+        if not token:
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {"reason": "Lost authentication — please resend the batch."},
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                pending_invoice_batch=[],
+                pending_invoice_batch_total_qar=None,
+                pending_invoice_batch_currency=None,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+
+        def _opt_field(d: dict[str, Any], key: str) -> str | None:
+            v = d.get(key)
+            return None if v in (None, "") else str(v)
+
+        for row in state.pending_invoice_batch:
+            draft = row.get("draft") or {}
+            content = row.get("content_b64") or ""
+            try:
+                record = await self._invoices.submit_base64(
+                    access_token=token,
+                    filename=row.get("filename") or "invoice.pdf",
+                    content_base64=content,
+                    mime_type=row.get("mime"),
+                    invoice_number=_opt_field(draft, "invoice_number"),
+                    invoice_date=_opt_field(draft, "invoice_date"),
+                    due_date=_opt_field(draft, "due_date"),
+                    total_amount=_opt_field(draft, "total_amount"),
+                    supplier_name=_opt_field(draft, "supplier_name"),
+                    customer_name=_opt_field(draft, "customer_name"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "invoice_batch_submit.failed",
+                    row=row.get("row"), error=str(exc)[:200],
+                )
+                failed += 1
+                continue
+            accepted.append(_normalize_invoice_record(record, now_iso))
+
+        await self._send(
+            ctx, state, "onboarding.invoice.batch.submitted",
+            {
+                "count":  str(len(accepted)),
+                "failed": str(failed),
+            },
+        )
+        return self._step(
+            "invoice_collect_await", ctx,
             invoices_submitted=[*state.invoices_submitted, *accepted],
+            pending_invoice_batch=[],
+            pending_invoice_batch_total_qar=None,
+            pending_invoice_batch_currency=None,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
+
+    async def _handle_invoice_qa(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        intent: str,
+    ) -> dict[str, Any]:
+        """Render a structured self-service answer at invoice_collect_await.
+
+        Three intents (UAT 2026-06-16 #9):
+        * ``limit``           — approved credit limit + currently available.
+        * ``disbursed_total`` — sum of disbursements so far on this run.
+        * ``due``             — outstanding balance + count of pending EMIs.
+
+        All answers prefer real backend reads (``/me`` for limit + credit
+        line, the in-state ledgers for disbursement/repayment totals).
+        When a read fails we fall back to whatever's on state — that lets
+        us still answer accurately for invoices the SME submitted in
+        THIS run even if /me hiccups.
+        """
+        token, refresh, expires = await self._live_token(state, ctx)
+
+        if intent == _QAIntent.LIMIT:
+            currency, limit, available = "QAR", None, None
+            if token:
+                try:
+                    info = await self._identity.me(access_token=token)
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning(
+                        "invoice_qa.me_failed", error=str(exc)[:200]
+                    )
+                    info = {}
+                line = _extract_credit_line(info)
+                currency = line.get("currency") or currency
+                limit = line.get("creditLimit") or line.get("credit_limit")
+                available = (
+                    line.get("availableLimit") or line.get("available_limit")
+                )
+            answer = _format_limit_answer(currency, limit, available)
+        elif intent == _QAIntent.DISBURSED_TOTAL:
+            total, currency = _sum_disbursements(state.disbursements_received)
+            answer = _format_disbursed_answer(total, currency)
+        else:  # DUE
+            outstanding = state.repayment_outstanding_qar
+            currency = "QAR"
+            # Sum remaining EMIs from the latest repayment record on state
+            # (backend is the source of truth — we just expose the most
+            # recent snapshot we have on hand).
+            emis_remaining = _latest_emis_remaining(state.repayments_recorded)
+            answer = _format_due_answer(currency, outstanding, emis_remaining)
+
+        await self._send(
+            ctx, state, "onboarding.help.contextual",
+            {"answer": answer, "next_step": ""},
+        )
+        return self._step(
+            "invoice_collect_await", ctx,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
         )
 
     async def _handle_phase1b_event(
@@ -4710,7 +5791,8 @@ class OnboardingWorkflow(WorkflowDefinition):
         event = str(payload.get("event") or "")
         now_iso = ctx.clock.now().isoformat()
 
-        # Best-effort amount + reference extraction (camel and snake).
+        # Best-effort field reader: backend uses camelCase, our older test
+        # fixtures use snake_case — accept both.
         def _get(*keys: str) -> Any:
             for k in keys:
                 v = payload.get(k)
@@ -4718,18 +5800,24 @@ class OnboardingWorkflow(WorkflowDefinition):
                     return v
             return None
 
-        amount = _get("amount", "amount_qar", "amountQar", "total_amount", "totalAmount")
+        def _fmt_money(value: Any, currency: str) -> str:
+            try:
+                return f"{currency} {int(float(value)):,}"
+            except (TypeError, ValueError):
+                return f"{currency} {value}" if value not in (None, "") else f"{currency} —"
+
+        # Canonical payload fields per Madad PR #187 + UAT 2026-06-16 notes.
+        # transaction.disbursed: invoiceNumber, disbursedAmount, utr.
+        # repayment.received / .closed (single event, branch on `closed`):
+        #   invoiceNumber, amount, totalRepaid, outstandingAmount, emisTotal,
+        #   emisPaid, emisRemaining, paymasterName, lenderName, availableLimit,
+        #   currency, dueDate, closed (bool).
         currency = _get("currency") or "QAR"
         invoice_ref = _get(
-            "invoice_id", "invoiceId", "invoice_number", "invoiceNumber",
+            "invoiceNumber", "invoice_number",
+            "invoice_id", "invoiceId",
             "reference_number", "referenceNumber", "ref",
         )
-        try:
-            amount_str = (
-                f"{currency} {int(amount):,}" if amount is not None else f"{currency} —"
-            )
-        except (TypeError, ValueError):
-            amount_str = f"{currency} {amount}" if amount is not None else f"{currency} —"
 
         # State accumulators — append to whichever ledger the event maps to.
         disbursements = list(state.disbursements_received)
@@ -4737,93 +5825,129 @@ class OnboardingWorkflow(WorkflowDefinition):
         outstanding = state.repayment_outstanding_qar
 
         if event == "transaction.disbursed":
+            disbursed = _get(
+                "disbursedAmount", "disbursed_amount",
+                "amount", "amount_qar", "amountQar",
+                "total_amount", "totalAmount",
+            )
+            utr = _get("utr", "UTR", "transaction_id", "transactionId")
+            due_date = _get("dueDate", "due_date")
             disbursements.append({
-                "amount": amount,
+                "amount": disbursed,
                 "currency": currency,
                 "invoice_ref": invoice_ref,
+                "utr": utr,
+                "due_date": due_date,
                 "received_at": now_iso,
                 "payload": payload,
             })
             await self._send(
                 ctx, state, "onboarding.disbursement.received",
-                {"amount": amount_str, "ref": invoice_ref or "—"},
-            )
-        elif event == "repayment.received":
-            repayments.append({
-                "amount": amount, "currency": currency,
-                "invoice_ref": invoice_ref, "kind": "received",
-                "received_at": now_iso,
-            })
-            # Backend is the source of truth for the outstanding balance.
-            # When it omits the field the previous "—" in the message
-            # used to leave state pointing at the prior (stale) number,
-            # so /status would show one figure and the live message
-            # another. Clear state to None when the backend has nothing
-            # to say so the two stay aligned.
-            remaining = _get("outstanding", "outstanding_qar", "outstandingQar")
-            if isinstance(remaining, (int, float)):
-                outstanding = int(remaining)
-                rem_str = f"{currency} {int(remaining):,}"
-            else:
-                outstanding = None
-                rem_str = f"{currency} —"
-            await self._send(
-                ctx, state, "onboarding.repayment.received",
                 {
-                    "amount": amount_str,
-                    "ref": invoice_ref or "—",
-                    "outstanding": rem_str,
+                    "amount":   _fmt_money(disbursed, currency),
+                    "ref":      invoice_ref or "—",
+                    "utr":      str(utr) if utr else "—",
+                    "due_date": str(due_date) if due_date else "—",
                 },
             )
-        elif event == "repayment.partially_paid":
-            repayments.append({
-                "amount": amount, "currency": currency,
-                "invoice_ref": invoice_ref, "kind": "partial",
-                "received_at": now_iso,
-            })
-            remaining = _get("outstanding", "outstanding_qar", "outstandingQar", "remaining")
-            if isinstance(remaining, (int, float)):
-                outstanding = int(remaining)
-                rem_str = f"{currency} {int(remaining):,}"
+        elif event in {"repayment.received", "repayment.partially_paid", "repayment.closed"}:
+            # Madad PR #187 unified flow: a single ``repayment.received``
+            # event with ``closed`` (bool) tells us whether this payment
+            # cleared every EMI. ``repayment.closed`` and
+            # ``repayment.partially_paid`` are kept as event types for
+            # back-compat — both branch through the same rendering logic
+            # using either the explicit event suffix or the closed flag.
+            amount_this = _get("amount", "amount_qar", "amountQar")
+            total_repaid = _get("totalRepaid", "total_repaid")
+            outstanding_amount = _get(
+                "outstandingAmount", "outstanding_amount",
+                "outstanding", "outstanding_qar", "outstandingQar",
+                "remaining",
+            )
+            emis_total = _get("emisTotal", "emis_total")
+            emis_paid = _get("emisPaid", "emis_paid")
+            emis_remaining = _get("emisRemaining", "emis_remaining")
+            paymaster = _get("paymasterName", "paymaster_name", "paymaster")
+            lender = _get("lenderName", "lender_name", "lender")
+            available_limit = _get(
+                "availableLimit", "available_limit", "credit_limit_available",
+            )
+            due_date = _get("dueDate", "due_date")
+            closed_flag = payload.get("closed")
+            is_closed = (
+                bool(closed_flag)
+                if closed_flag is not None
+                else event == "repayment.closed"
+            )
+            # Outstanding: when fully closed it's 0 regardless of what the
+            # backend sent; otherwise the explicit number wins, falling
+            # back to None when nothing was provided.
+            if is_closed:
+                outstanding = 0
+            elif isinstance(outstanding_amount, (int, float)):
+                outstanding = int(outstanding_amount)
             else:
                 outstanding = None
-                rem_str = f"{currency} —"
-            await self._send(
-                ctx, state, "onboarding.repayment.partially_paid",
-                {
-                    "amount": amount_str,
-                    "ref": invoice_ref or "—",
-                    "outstanding": rem_str,
-                },
-            )
-        elif event == "repayment.closed":
+
             repayments.append({
-                "amount": amount, "currency": currency,
-                "invoice_ref": invoice_ref, "kind": "closed",
+                "amount": amount_this,
+                "currency": currency,
+                "invoice_ref": invoice_ref,
+                "total_repaid": total_repaid,
+                "outstanding": outstanding,
+                "emis_total": emis_total,
+                "emis_paid": emis_paid,
+                "emis_remaining": emis_remaining,
+                "paymaster_name": paymaster,
+                "lender_name": lender,
+                "available_limit": available_limit,
+                "due_date": due_date,
+                "kind": "closed" if is_closed else "received",
                 "received_at": now_iso,
             })
-            outstanding = 0
-            await self._send(
-                ctx, state, "onboarding.repayment.closed",
-                {"ref": invoice_ref or "—", "amount": amount_str},
+
+            template_key = (
+                "onboarding.repayment.closed" if is_closed
+                else "onboarding.repayment.received"
             )
+            variables: dict[str, Any] = {
+                "amount":          _fmt_money(amount_this, currency),
+                "ref":             invoice_ref or "—",
+                "total_repaid":    _fmt_money(total_repaid, currency),
+                "outstanding":     _fmt_money(outstanding_amount, currency),
+                "emis_total":      str(emis_total) if emis_total is not None else "—",
+                "emis_paid":       str(emis_paid) if emis_paid is not None else "—",
+                "emis_remaining":  str(emis_remaining) if emis_remaining is not None else "—",
+                "paymaster":       str(paymaster) if paymaster else "—",
+                "lender":          str(lender) if lender else "—",
+                "available_limit": _fmt_money(available_limit, currency),
+                "due_date":        str(due_date) if due_date else "—",
+            }
+            await self._send(ctx, state, template_key, variables)
         elif event == "repayment.due_soon":
-            due_date = _get("due_date", "dueDate")
+            due_date = _get("dueDate", "due_date")
+            amount_due = _get(
+                "amount", "amount_qar", "amountQar", "amountDue", "amount_due",
+            )
             await self._send(
                 ctx, state, "onboarding.repayment.due_soon",
                 {
-                    "amount": amount_str,
-                    "ref": invoice_ref or "—",
+                    "amount":   _fmt_money(amount_due, currency),
+                    "ref":      invoice_ref or "—",
                     "due_date": str(due_date) if due_date else "soon",
                 },
             )
         elif event == "repayment.overdue":
-            days_overdue = _get("days_overdue", "daysOverdue")
+            days_overdue = _get("daysOverdue", "days_overdue")
+            amount_due = _get(
+                "amount", "amount_qar", "amountQar",
+                "outstandingAmount", "outstanding_amount",
+            )
             await self._send(
                 ctx, state, "onboarding.repayment.overdue",
                 {
-                    "amount": amount_str,
-                    "ref": invoice_ref or "—",
+                    "amount":       _fmt_money(amount_due, currency),
+                    "ref":          invoice_ref or "—",
                     "days_overdue": str(days_overdue) if days_overdue else "—",
                 },
             )

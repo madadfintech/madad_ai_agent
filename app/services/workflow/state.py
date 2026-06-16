@@ -263,6 +263,33 @@ class OnboardingState(WorkflowState):
     # so the message can render a number without an extra read.
     repayment_outstanding_qar: int | None = None
 
+    # UAT 2026-06-16 (#3): single-invoice confirm-card flow staging.
+    # When the SME sends a PDF, we extract (no submit) → render the
+    # confirm card → park here until they tap Approve / Edit / Reject.
+    # On Approve we re-submit with the (possibly edited) fields, so the
+    # base64 content has to be carried across the confirm await. Stripped
+    # to None on Approve / Reject so it doesn't linger in checkpoints.
+    pending_invoice_draft: dict[str, Any] | None = None
+    pending_invoice_filename: str | None = None
+    # NOT exposed via /ops/runs/{id} — PII + non-trivial size.
+    pending_invoice_content_b64: str | None = Field(default=None, exclude=True)
+    pending_invoice_mime: str | None = None
+    # When the SME tapped "Edit", the field name they want to change.
+    pending_invoice_edit_field: str | None = None
+
+    # UAT 2026-06-16 (#4): bulk ZIP CSV-preview flow staging. Each entry
+    # is ``{row, draft, content_b64 (excluded), filename, mime, flag}``.
+    # APPROVE ALL submits every row; EDIT/REMOVE mutate the batch in
+    # place; on submit the batch clears. ``content_b64`` is stripped
+    # from /ops/runs/{id} state and from checkpoint snapshots via
+    # exclude=True on the parent list — we mark it via the per-row
+    # name and the snapshot-scrubber's allow-list.
+    pending_invoice_batch: list[dict[str, Any]] = Field(
+        default_factory=list, exclude=True,
+    )
+    pending_invoice_batch_total_qar: int | None = None
+    pending_invoice_batch_currency: str | None = None
+
     # Terminal/decline tracking.
     outcome: str | None = None  # completed | declined | not_eligible | domain_blocked | ...
 

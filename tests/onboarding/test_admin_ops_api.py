@@ -141,8 +141,10 @@ async def test_ops_summary_phase1b_counts_after_invoice_submission() -> None:
         platform.workflow._identity.journey_status = status  # type: ignore[union-attr]
         await resume({"type": "status_update"})
 
-    # Now at invoice_collect_await — submit one invoice.
+    # Now at invoice_collect_await — single PDF goes through the
+    # confirm-card flow (UAT 2026-06-16 #3): extract → confirm → Approve.
     await resume({"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]})
+    await resume({"text": "Approve"})
 
     # /ops/summary is cached for 30s in prod; for this test we invalidate
     # so we read the post-submission counts directly.

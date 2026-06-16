@@ -23,7 +23,10 @@ IDENTITY = "+97455500900"
 # -- Static contract: event taxonomy ----------------------------------------
 
 
-def test_phase1a_event_set_has_eight_canonical_events() -> None:
+def test_phase1a_event_set_has_nine_canonical_events() -> None:
+    # UAT 2026-06-16 Bug #8: backend fires ``offer.selected`` (not
+    # ``offer.accepted``) at acceptance time. Accept both names so the
+    # dispatcher never rejects the legit acceptance webhook.
     assert PHASE1A_BACKEND_EVENTS == frozenset(
         {
             "eligibility.updated",
@@ -33,9 +36,19 @@ def test_phase1a_event_set_has_eight_canonical_events() -> None:
             "payment.completed",
             "offers.available",
             "offer.accepted",
+            "offer.selected",
             "credit_line.activated",
         }
     )
+
+
+def test_offer_selected_maps_to_offer_accepted_journey_status() -> None:
+    """``offer.selected`` and ``offer.accepted`` both produce the same
+    OFFER_ACCEPTED journey status so downstream routing is identical."""
+    selected = translate_backend_event("offer.selected", {})
+    accepted = translate_backend_event("offer.accepted", {})
+    assert selected["journey_status"] == "OFFER_ACCEPTED"
+    assert accepted["journey_status"] == "OFFER_ACCEPTED"
 
 
 def test_phase1b_event_set_has_six_canonical_events() -> None:
@@ -53,7 +66,7 @@ def test_phase1b_event_set_has_six_canonical_events() -> None:
 
 def test_all_backend_events_is_union_of_phase1a_and_phase1b() -> None:
     assert ALL_BACKEND_EVENTS == PHASE1A_BACKEND_EVENTS | PHASE1B_BACKEND_EVENTS
-    assert len(ALL_BACKEND_EVENTS) == 14
+    assert len(ALL_BACKEND_EVENTS) == 15  # 9 + 6 (Phase 1.a now includes offer.selected)
 
 
 # -- Payload translation ----------------------------------------------------

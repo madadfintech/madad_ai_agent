@@ -50,34 +50,100 @@ async def _drive_to_activated(harness) -> None:
     await resume({"type": "status_update", "lenderName": "Qatar Islamic Bank"})
 
 
-async def test_single_invoice_routes_through_extract_and_submit(harness) -> None:
+async def test_single_invoice_extract_then_confirm_then_submit(harness) -> None:
+    """UAT 2026-06-16 #3: single-PDF flow is now extract-only → confirm
+    card → submit on Approve. ``extract_and_submit_base64`` is reserved
+    for the bulk/legacy paths."""
     await _drive_to_activated(harness)
     runtime = harness.platform.runtime
 
+    # Step 1: SME sends the PDF — agent extracts only and shows confirm card.
     result = await runtime.resume(
         WA, IDENTITY,
         message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
     )
-
-    # Run stays parked at invoice_collect for the next invoice.
     assert result.status == RunStatus.WAITING_FOR_INPUT
     assert result.prompt == {"waiting_for": "invoice", "step": "invoice_collect"}
 
-    # The new client got called via the preferred extract+submit path
-    # (not the deprecated KYC upload_invoice tool).
-    inv_calls = [name for name, _ in harness.invoices.calls]
-    assert inv_calls == ["extract_and_submit_base64"]
-    assert "submit_zip_base64" not in inv_calls
+    inv_calls_after_upload = [name for name, _ in harness.invoices.calls]
+    assert inv_calls_after_upload == ["extract_base64"]
+    assert "onboarding.invoice.confirm" in harness.messenger.templates()
 
-    # The receipt template was used (not the catch-all help.contextual).
+    # Step 2: SME taps Approve — agent submits with the extracted fields.
+    await runtime.resume(WA, IDENTITY, message={"text": "Approve"})
+
+    inv_calls_after_approve = [name for name, _ in harness.invoices.calls]
+    assert "submit_base64" in inv_calls_after_approve
+    # ``onboarding.invoice.received`` confirms the submission to the SME.
     assert "onboarding.invoice.received" in harness.messenger.templates()
+    # ZIP path didn't fire.
+    assert "submit_zip_base64" not in inv_calls_after_approve
 
 
-async def test_zip_invoice_routes_through_submit_zip(harness) -> None:
+async def test_invoice_reject_discards_without_submitting(harness) -> None:
+    """Reject button drops the draft — no submit_base64 call, no
+    invoice_id appended to the ledger."""
     await _drive_to_activated(harness)
     runtime = harness.platform.runtime
 
-    # Build a real ZIP archive so `_is_zip_attachment` recognises it.
+    await runtime.resume(
+        WA, IDENTITY,
+        message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
+    )
+    await runtime.resume(WA, IDENTITY, message={"text": "Reject"})
+
+    inv_calls = [name for name, _ in harness.invoices.calls]
+    assert "submit_base64" not in inv_calls
+    assert "onboarding.invoice.rejected" in harness.messenger.templates()
+
+
+async def test_invoice_edit_inline_updates_draft_and_reshows_card(harness) -> None:
+    """``edit amount: 32000`` updates the draft and re-renders the
+    confirm card with the new value."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    await runtime.resume(
+        WA, IDENTITY,
+        message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
+    )
+    confirm_count_before = harness.messenger.templates().count(
+        "onboarding.invoice.confirm"
+    )
+    await runtime.resume(WA, IDENTITY, message={"text": "edit amount: 32000"})
+
+    # Confirm card re-rendered (or its fallback content fired).
+    assert (
+        harness.messenger.templates().count("onboarding.invoice.confirm")
+        > confirm_count_before
+    )
+    # And the new amount made it into the variables of the latest send.
+    last_confirm = [
+        s for s in harness.messenger.sent
+        if s["template_key"] == "onboarding.invoice.confirm"
+    ][-1]
+    assert "32,000" in last_confirm["variables"]["amount"]
+
+    # Approve now submits the EDITED amount.
+    await runtime.resume(WA, IDENTITY, message={"text": "Approve"})
+    submit_payloads = [
+        payload for name, payload in harness.invoices.calls
+        if name == "submit_base64"
+    ]
+    assert submit_payloads, "expected a submit_base64 call after Approve"
+    assert str(submit_payloads[-1]["total_amount"]) == "32000"
+
+
+async def test_zip_invoice_routes_through_bulk_preview(harness) -> None:
+    """UAT 2026-06-16 #4: ZIP attachments now route through the local-
+    unzip + per-member ``extract_base64`` preview path. ``submit_zip_base64``
+    is no longer used for SME-WhatsApp uploads (kept on the port for
+    completeness)."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    # Build a real ZIP archive so `_is_zip_attachment` + the local
+    # unzip helper recognise it.
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("inv1.pdf", b"dummy invoice 1")
@@ -98,8 +164,64 @@ async def test_zip_invoice_routes_through_submit_zip(harness) -> None:
     )
 
     inv_calls = [name for name, _ in harness.invoices.calls]
-    assert "submit_zip_base64" in inv_calls
-    assert "extract_and_submit_base64" not in inv_calls
+    # Local-unzip then one extract_base64 per member (2 here).
+    assert inv_calls.count("extract_base64") == 2
+    assert "submit_zip_base64" not in inv_calls
+    # The preview template fired.
+    assert "onboarding.invoice.batch.preview" in harness.messenger.templates()
+
+
+async def test_zip_batch_approve_all_submits_every_row(harness) -> None:
+    """APPROVE ALL on a 2-row batch calls submit_base64 twice and
+    appends both records to the ledger."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("inv1.pdf", b"x")
+        zf.writestr("inv2.pdf", b"y")
+    zip_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    await runtime.resume(WA, IDENTITY, message={
+        "attachments": [{
+            "filename": "invoices.zip",
+            "content_base64": zip_b64,
+            "mime_type": "application/zip",
+        }],
+    })
+    # Now park at preview — SME taps "APPROVE ALL".
+    await runtime.resume(WA, IDENTITY, message={"text": "APPROVE ALL"})
+
+    inv_calls = [name for name, _ in harness.invoices.calls]
+    assert inv_calls.count("submit_base64") == 2
+    assert "onboarding.invoice.batch.submitted" in harness.messenger.templates()
+
+
+async def test_zip_batch_remove_row_drops_one(harness) -> None:
+    """REMOVE 1 drops the first row + re-renders the preview with 1 left."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("inv1.pdf", b"x")
+        zf.writestr("inv2.pdf", b"y")
+    zip_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    await runtime.resume(WA, IDENTITY, message={
+        "attachments": [{
+            "filename": "invoices.zip",
+            "content_base64": zip_b64,
+            "mime_type": "application/zip",
+        }],
+    })
+    await runtime.resume(WA, IDENTITY, message={"text": "remove 1"})
+    await runtime.resume(WA, IDENTITY, message={"text": "APPROVE ALL"})
+
+    inv_calls = [name for name, _ in harness.invoices.calls]
+    # Only one row left → only one submit.
+    assert inv_calls.count("submit_base64") == 1
 
 
 async def test_status_query_dispatches_get_my_invoices(harness) -> None:
@@ -135,17 +257,24 @@ async def test_off_script_chat_does_not_call_client(harness) -> None:
 
 
 async def test_invoice_state_appends_per_submission(harness) -> None:
+    """Each Approve adds one record to ``state.invoices_submitted`` —
+    requires the new extract → confirm → Approve flow per #3."""
     await _drive_to_activated(harness)
     runtime = harness.platform.runtime
 
+    # 1st invoice: extract → approve.
     await runtime.resume(
         WA, IDENTITY,
         message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
     )
+    await runtime.resume(WA, IDENTITY, message={"text": "Approve"})
+
+    # 2nd invoice: extract → approve.
     await runtime.resume(
         WA, IDENTITY,
         message={"attachments": [{"filename": "INV-2.pdf", "content_base64": DOC}]},
     )
+    await runtime.resume(WA, IDENTITY, message={"text": "Approve"})
 
     # Read state via the LangGraph checkpoint snapshot.
     session = await runtime.sessions.get(WA, IDENTITY)
@@ -231,6 +360,148 @@ async def test_invoice_extract_timeout_uses_transport_message(harness) -> None:
     assert "taking longer than usual" in reason
     # And critically: the SME is NOT told the file is corrupt.
     assert "couldn't read" not in reason
+
+
+async def test_status_update_resume_at_invoice_collect_is_silent(harness) -> None:
+    """UAT 2026-06-16 Bug #2 (+918287611995): backend Phase 1.a webhooks
+    (offer.selected, credit_line.activated, etc.) and synthetic resumes
+    (status poller, docs-settle sweep) legitimately land on the parked
+    post-activation run. Each one used to drop into _smart_contextual
+    and fire the canned "Whenever you have an invoice" prompt — 7 sends
+    in 6 minutes for one SME. The node must re-park silently for these,
+    and only respond to genuine SME-side text or attachments."""
+    await _drive_to_activated(harness)
+    template_count_before = len(harness.messenger.templates())
+
+    runtime = harness.platform.runtime
+    # Status-update from poller — no SME content.
+    await runtime.resume(
+        WA, IDENTITY,
+        message={"type": "status_update", "last_status_source": "poll"},
+    )
+    # Status-update from a backend Phase 1.a webhook.
+    await runtime.resume(
+        WA, IDENTITY,
+        message={
+            "type": "status_update",
+            "event": "offer.selected",
+            "journey_status": "OFFER_ACCEPTED",
+            "last_status_source": "webhook",
+        },
+    )
+    # Docs-settle sweep (shouldn't happen here but defensive).
+    await runtime.resume(WA, IDENTITY, message={"type": "docs_settle"})
+
+    # All three were silent — no new template fired.
+    assert len(harness.messenger.templates()) == template_count_before
+
+
+async def test_qa_limit_answers_from_me_credit_line(harness, monkeypatch) -> None:
+    """UAT 2026-06-16 #9: "what's my limit?" reads /me's creditLine and
+    renders an approved/available answer with the real number."""
+    await _drive_to_activated(harness)
+
+    # Once parked at invoice_collect_await, return the creditLine shape
+    # from /me. We swap AFTER the drive so the drive itself uses the
+    # default me() that returns the journey status.
+    original_me = harness.identity.me
+
+    async def fake_me(*, access_token: str):
+        await original_me(access_token=access_token)  # keep call-log
+        return {
+            "user": {
+                "creditLine": {
+                    "creditLimit": 100000,
+                    "availableLimit": 75000,
+                    "currency": "QAR",
+                },
+            },
+        }
+    monkeypatch.setattr(harness.identity, "me", fake_me)
+
+    runtime = harness.platform.runtime
+    await runtime.resume(WA, IDENTITY, message={"text": "what's my limit?"})
+
+    sends = [
+        s for s in harness.messenger.sent
+        if s["template_key"] == "onboarding.help.contextual"
+    ]
+    assert sends, "expected help.contextual to fire for the limit Q&A"
+    last_answer = sends[-1]["variables"]["answer"]
+    assert "100,000" in last_answer
+    assert "75,000" in last_answer
+
+
+async def test_qa_disbursed_total_sums_state_ledger(harness) -> None:
+    """UAT 2026-06-16 #9: "total disbursed?" sums the in-state ledger
+    populated by transaction.disbursed webhooks."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    # Fire two disbursement webhooks.
+    for amt, ref in [(10000, "INV-1"), (7500, "INV-2")]:
+        await runtime.resume(WA, IDENTITY, message={
+            "type": "phase1b_event",
+            "event": "transaction.disbursed",
+            "last_status_source": "webhook",
+            "invoiceNumber": ref,
+            "disbursedAmount": amt,
+            "currency": "QAR",
+        })
+
+    # Now ask.
+    await runtime.resume(WA, IDENTITY, message={"text": "how much disbursed so far?"})
+
+    sends = [
+        s for s in harness.messenger.sent
+        if s["template_key"] == "onboarding.help.contextual"
+    ]
+    last_answer = sends[-1]["variables"]["answer"]
+    assert "17,500" in last_answer
+
+
+async def test_qa_due_uses_repayment_outstanding_and_emis(harness) -> None:
+    """UAT 2026-06-16 #9: "what's due?" reports outstanding + EMIs
+    remaining from the latest repayment.received webhook record."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    # Fire a repayment with new payload fields.
+    await runtime.resume(WA, IDENTITY, message={
+        "type": "phase1b_event",
+        "event": "repayment.received",
+        "last_status_source": "webhook",
+        "invoiceNumber": "INV-77",
+        "amount": 5000,
+        "outstandingAmount": 25000,
+        "emisTotal": 4, "emisPaid": 1, "emisRemaining": 3,
+        "currency": "QAR",
+        "closed": False,
+    })
+
+    await runtime.resume(WA, IDENTITY, message={"text": "what's due now?"})
+
+    sends = [
+        s for s in harness.messenger.sent
+        if s["template_key"] == "onboarding.help.contextual"
+    ]
+    last_answer = sends[-1]["variables"]["answer"]
+    assert "25,000" in last_answer
+    assert "3 EMIs" in last_answer
+
+
+async def test_genuine_text_still_triggers_contextual(harness) -> None:
+    """Regression guard: real SME text input (not a synthetic resume)
+    still produces the contextual answer."""
+    await _drive_to_activated(harness)
+    template_count_before = len(harness.messenger.templates())
+
+    runtime = harness.platform.runtime
+    await runtime.resume(WA, IDENTITY, message={"text": "hello what now?"})
+
+    # The SME asked a real question — contextual answer SHOULD fire.
+    assert len(harness.messenger.templates()) > template_count_before
+    assert "onboarding.help.contextual" in harness.messenger.templates()
 
 
 def test_is_invoice_status_query_recognizes_common_phrasings() -> None:

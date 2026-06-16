@@ -6720,11 +6720,36 @@ class OnboardingWorkflow(WorkflowDefinition):
         *,
         locale: str | None = None,
     ) -> None:
+        variables = variables or {}
+        # 24h-window fix: status messages can land outside Meta's customer-care
+        # window, where free text is silently dropped. Approved templates are
+        # valid in AND out of the window, so for mapped status keys we always
+        # send the template; ANY failure (build error, send rejected, no data)
+        # falls through to the original free-text send below — so behaviour is
+        # unchanged for every other message and there is no regression.
+        tpl = _STATUS_TEMPLATES.get(template_key)
+        if tpl and ctx.channel is Channel.WHATSAPP:
+            try:
+                comps = _status_components(template_key, variables, state)
+                if comps is not None and await self._msg.send_template(
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    template_name=tpl,
+                    template_key=template_key,
+                    language_code=locale or state.locale,
+                    components=comps,
+                    variables=variables,
+                ):
+                    return
+            except Exception as exc:  # noqa: BLE001 — fall back to free text
+                ctx.logger.warning(
+                    "status_template.failed", key=template_key, error=str(exc)[:200]
+                )
         await self._msg.send(
             channel=_channel(ctx),
             identity=ctx.identity,
             template_key=template_key,
-            variables=variables or {},
+            variables=variables,
             locale=locale or state.locale,
         )
 
@@ -6780,6 +6805,122 @@ class OnboardingWorkflow(WorkflowDefinition):
 def _channel(ctx: WorkflowContext) -> Channel:
     assert ctx.channel is not None
     return ctx.channel
+
+
+# ── 24h-safe status templates ────────────────────────────────────────────────
+# Maps a CMS template_key (the free-text body used in-window) to its approved
+# Meta WhatsApp template name (delivers IN and OUT of the 24h window). _send()
+# prefers the template for these keys and falls back to the free text on any
+# failure. See _status_components() for the per-template variable order.
+_STATUS_TEMPLATES: dict[str, str] = {
+    "onboarding.documents.checklist":   "onboarding_documents_checklist",
+    "onboarding.payment.request":       "onboarding_payment_request",
+    "onboarding.payment.confirmed":     "onboarding_payment_confirmed",
+    "onboarding.offer.handoff":         "onboarding_offers_available",
+    "onboarding.offer.confirmed":       "onboarding_offer_confirmed",
+    "onboarding.activated":             "onboarding_activated",
+    "onboarding.disbursement.received": "onboarding_disbursement_received",
+    "onboarding.repayment.received":    "onboarding_repayment_received",
+    "onboarding.repayment.closed":      "onboarding_repayment_closed",
+    "onboarding.repayment.due_soon":    "onboarding_repayment_due_soon",
+    "onboarding.repayment.overdue":     "onboarding_repayment_overdue",
+}
+
+
+def _tpl_txt(v: Any) -> str:
+    """A safe Meta body/button parameter: single line, never empty."""
+    s = str(v if v is not None else "").replace("\n", " ").replace("\t", " ").strip()
+    while "    " in s:
+        s = s.replace("    ", " ")
+    return s or "—"
+
+
+def _strip_qar(v: Any) -> str:
+    """Drop a leading 'QAR ' so a template that already prints 'QAR {{n}}' does
+    not render 'QAR QAR 500,000'."""
+    s = _tpl_txt(v)
+    return s[4:].strip() if s.upper().startswith("QAR ") else s
+
+
+def _offers_block(state: OnboardingState) -> str:
+    """One line per offer ('QIB — QAR 500,000 · 1.5%/mo · 90 days') for the
+    offers_available template's single {{1}} variable (1-2 offers in practice)."""
+    rows: list[str] = []
+    for o in (getattr(state, "offers", None) or []):
+        if not isinstance(o, dict):
+            continue
+        lender = _lender_name(o) or "Bank"
+        try:
+            limit = f"QAR {int(o.get('creditLimit') or o.get('credit_limit') or o.get('limit') or 0):,}"
+        except (TypeError, ValueError):
+            limit = "QAR —"
+        try:
+            rate = f"{float(o.get('interestRate') or o.get('interest_rate') or o.get('rate') or 0):g}%/mo"
+        except (TypeError, ValueError):
+            rate = "—"
+        try:
+            tenure = f"{int(o.get('tenureDays') or o.get('tenure_days') or o.get('tenure') or 0)} days"
+        except (TypeError, ValueError):
+            tenure = "—"
+        rows.append(f"{lender} — {limit} · {rate} · {tenure}")
+    return "\n".join(rows) if rows else "Please log in to view your offer details."
+
+
+def _status_components(
+    key: str, variables: dict[str, Any], state: OnboardingState
+) -> list[dict[str, Any]] | None:
+    """Build Meta `components` for a status template from the per-event variables
+    the workflow already passes to _send(). Returns ``None`` when a required
+    value is missing → _send() falls back to free text (no broken send)."""
+    v = variables or {}
+
+    def body(*vals: Any) -> list[dict[str, Any]]:
+        return [{"type": "body",
+                 "parameters": [{"type": "text", "text": _tpl_txt(x)} for x in vals]}]
+
+    if key == "onboarding.documents.checklist":
+        return []  # static body, no variables
+    if key == "onboarding.payment.confirmed":
+        return body(v.get("provider_ref") or v.get("ref") or "—")
+    if key == "onboarding.offer.confirmed":
+        return body(v.get("lender"))
+    if key == "onboarding.activated":
+        return body(v.get("lender"), _strip_qar(v.get("limit")), v.get("rate"), v.get("tenure"))
+    if key == "onboarding.disbursement.received":
+        return body(
+            v.get("ref"), _strip_qar(v.get("amount")), v.get("lender") or "—",
+            v.get("utr"), v.get("due_date"),
+            _strip_qar(v.get("available_limit")) if v.get("available_limit") else "—",
+        )
+    if key == "onboarding.repayment.received":
+        return body(
+            v.get("ref"), _strip_qar(v.get("amount")), _strip_qar(v.get("outstanding")),
+            v.get("emis_paid"), v.get("emis_remaining"),
+        )
+    if key == "onboarding.repayment.closed":
+        return body(
+            v.get("ref"),
+            _strip_qar(v.get("available_limit")) if v.get("available_limit") else "—",
+        )
+    if key == "onboarding.repayment.due_soon":
+        return body(v.get("ref"), _strip_qar(v.get("amount")), v.get("due_date"))
+    if key == "onboarding.repayment.overdue":
+        return body(v.get("ref"), _strip_qar(v.get("amount")), v.get("due_date") or "—")
+    if key == "onboarding.offer.handoff":
+        return body(_offers_block(state))
+    if key == "onboarding.payment.request":
+        pid = getattr(state, "payment_id", None)
+        if not pid:
+            return None  # no payment id → can't form the Pay button → free-text fallback
+        return [
+            {"type": "body", "parameters": [
+                {"type": "text", "text": _tpl_txt(v.get("score"))},
+                {"type": "text", "text": _strip_qar(v.get("amount"))},
+            ]},
+            {"type": "button", "sub_type": "url", "index": 0,
+             "parameters": [{"type": "text", "text": _tpl_txt(pid)}]},
+        ]
+    return None
 
 
 def _extract_status_source(payload: Any) -> str:

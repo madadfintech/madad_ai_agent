@@ -300,6 +300,91 @@ async def test_invoice_state_appends_per_submission(harness) -> None:
         assert field in record
 
 
+async def test_invoice_upload_fires_processing_ack_before_extract(harness) -> None:
+    """UAT 2026-06-16 (PM): the SME should see an immediate "got your
+    invoice, please wait" ack BEFORE the cluster's extract call (which
+    can take 60-90s). Without this the chat was silent between the
+    upload and the confirm card."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    await runtime.resume(
+        WA, IDENTITY,
+        message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
+    )
+
+    templates = harness.messenger.templates()
+    assert "onboarding.invoice.processing" in templates
+    # And the processing ack came BEFORE the confirm card.
+    assert templates.index("onboarding.invoice.processing") < templates.index(
+        "onboarding.invoice.confirm"
+    )
+
+
+async def test_invoice_approve_fires_submitting_ack_before_submit(harness) -> None:
+    """UAT 2026-06-16 (PM): the SME should see a "submitting your
+    invoice…" ack when they tap Approve, before the cluster's submit
+    round-trip lands."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    await runtime.resume(
+        WA, IDENTITY,
+        message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
+    )
+    await runtime.resume(WA, IDENTITY, message={"text": "Approve"})
+
+    templates = harness.messenger.templates()
+    assert "onboarding.invoice.submitting" in templates
+    # Submitting ack fires BEFORE the receipt.
+    assert templates.index("onboarding.invoice.submitting") < templates.index(
+        "onboarding.invoice.received"
+    )
+
+
+async def test_empty_extract_draft_triggers_resend_instead_of_empty_card(
+    make_harness,
+) -> None:
+    """UAT 2026-06-16 PM (+919497191690 screenshot): when the cluster
+    extract returns a draft with no usable fields ("Extracted —, QAR —,
+    Due —, Supplier: —"), DON'T render an em-dash confirm card the SME
+    might approve only to hit a generic submit failure. Send a clear
+    resend message instead."""
+    from app.services.workflow import InMemoryInvoiceClient
+
+    class _EmptyExtractClient(InMemoryInvoiceClient):
+        async def extract_base64(  # type: ignore[override]
+            self, *, access_token, filename, content_base64, mime_type=None,
+        ):
+            self._record(
+                "extract_base64", access_token=access_token,
+                filename=filename, mime_type=mime_type,
+            )
+            return {"filename": filename, "currency": "QAR"}
+
+    harness = make_harness()
+    await _drive_to_activated(harness)
+    harness.platform.workflow._invoices = _EmptyExtractClient()  # type: ignore[union-attr]
+    harness.invoices = harness.platform.workflow._invoices  # type: ignore[union-attr]
+
+    runtime = harness.platform.runtime
+    await runtime.resume(
+        WA, IDENTITY,
+        message={"attachments": [{"filename": "blurry.pdf", "content_base64": DOC}]},
+    )
+
+    # No confirm card was rendered.
+    assert "onboarding.invoice.confirm" not in harness.messenger.templates()
+    # Resend message fired with the new copy.
+    failed_sends = [
+        s for s in harness.messenger.sent
+        if s["template_key"] == "onboarding.invoice.failed"
+    ]
+    assert failed_sends, "expected the resend prompt"
+    reason = failed_sends[-1]["variables"]["reason"]
+    assert "couldn't read the key details" in reason
+
+
 async def test_extract_failure_falls_back_to_invoice_failed_template(
     harness, monkeypatch
 ) -> None:

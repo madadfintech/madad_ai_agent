@@ -200,9 +200,10 @@ _TEMPLATE_BODIES = {
     ),
     "onboarding.documents.complete": (
         "🎊 Great — all documents received!\n\n"
-        "We will share your assessment report within 24 hours. If all looks good, "
-        "we will forward your application to our banking partners in Qatar.\n\n"
-        "Meanwhile, enjoy your coffee ☕\n\n"
+        "⏳ Please wait while our team processes them — we’ll share your "
+        "assessment report within 24 hours. If all looks good, we’ll forward "
+        "your application to our banking partners in Qatar. 🏦\n\n"
+        "Thank you for being with us. ☕\n\n"
         "For any query call +974 3017 3888 or visit madadfintech.com"
     ),
     "onboarding.upload.required": (
@@ -236,6 +237,14 @@ _TEMPLATE_BODIES = {
     # prompt fails (QA Bug #1 + Ishan handover §9 / 2026-06-09).
     "onboarding.cr.received": (
         "📄 Got your CR — processing it now…"
+    ),
+    # UAT 2026-06-16 (PM): same pattern for the audited financial
+    # statement — the upload + account-create round-trip used to be
+    # silent on the chat between the SME's send and the
+    # ``onboarding.account.created`` message.
+    "onboarding.financials.received": (
+        "📊 Got your audited financial statement — processing it now…\n\n"
+        "Thank you for being with us. 🙏"
     ),
     # Immediate ack on any document upload in the post-prequal docs loop.
     # Rewritten 2026-06-09 (UAT feedback): the previous copy assumed the
@@ -356,6 +365,23 @@ _TEMPLATE_BODIES = {
     # ----------------------------------------------------------------
     # Phase 1.b — invoice financing (Steps 10–13).
     # ----------------------------------------------------------------
+    # UAT 2026-06-16 (PM): immediate ack the moment the SME's invoice
+    # PDF lands — fires BEFORE the cluster's extract round-trip (which
+    # can take 60–90s) so the SME isn't watching a silent chat.
+    "onboarding.invoice.processing": (
+        "📄 Got your invoice — reading it now…\n\n"
+        "Please wait a moment while we extract the details. ⏳\n\n"
+        "Thank you for being with us. 🙏"
+    ),
+    # Fires AFTER the SME taps Approve on the confirm card — the
+    # cluster's submit step can take a few seconds and the SME used
+    # to see a silent chat between Approve and the receipt. UAT
+    # 2026-06-16 (PM).
+    "onboarding.invoice.submitting": (
+        "📤 Submitting your invoice for financing…\n\n"
+        "This usually takes a moment — we’ll confirm here as soon as "
+        "it’s in. ⏳"
+    ),
     # Receipt after each invoice submission. ``summary`` is the
     # per-invoice ✅ block built by ``_format_accepted_invoices``;
     # ``count`` / ``noun`` / ``failed`` reflect the batch.

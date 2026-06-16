@@ -130,6 +130,7 @@ TEMPLATE_KEYS = [
     "onboarding.documents.complete",
     "onboarding.upload.required",
     "onboarding.cr.received",
+    "onboarding.financials.received",
     "onboarding.documents.processing",
     "onboarding.documents.more_docs_prompt",
     "onboarding.documents.settle_prompt",
@@ -146,6 +147,8 @@ TEMPLATE_KEYS = [
     "onboarding.offer.confirmed",
     "onboarding.activated",
     # Phase 1.b — invoice financing (post-activation) + repayment lifecycle.
+    "onboarding.invoice.processing",
+    "onboarding.invoice.submitting",
     "onboarding.invoice.received",
     "onboarding.invoice.failed",
     "onboarding.invoice.status",
@@ -675,6 +678,27 @@ def _render_invoice_batch_table(
     lines.append("```")
     lines.append(f"\n📊 Batch total: {_fmt_qar(total, currency)}")
     return "\n".join(lines)
+
+
+def _draft_is_empty(draft: dict[str, Any]) -> bool:
+    """True when the cluster's extract returned a draft with none of the
+    fields the SME needs to confirm. Backend rejects empty submissions,
+    so we'd rather ask for a resend than show an em-dash confirm card."""
+    if not isinstance(draft, dict):
+        return True
+    significant_fields = (
+        "invoice_number", "invoiceNumber",
+        "total_amount", "totalAmount", "amount",
+        "supplier_name", "supplierName",
+        "customer_name", "customerName",
+        "due_date", "dueDate",
+        "invoice_date", "invoiceDate",
+    )
+    for key in significant_fields:
+        value = draft.get(key)
+        if value not in (None, "", "—", 0):
+            return False
+    return True
 
 
 def _confirm_card_variables(draft: dict[str, Any]) -> dict[str, Any]:
@@ -3174,6 +3198,16 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             return self._step("financials_await", ctx, financials_received=False)
         first = attachments[0]
+        # UAT 2026-06-16 (PM): immediate ack so the SME sees a response
+        # before the cluster's upload + account-create roundtrip. The
+        # financials → account.created chain takes a few seconds and the
+        # silent gap matched the same pattern Bug #1 fixed for CR.
+        try:
+            await self._send(ctx, state, "onboarding.financials.received")
+        except Exception as exc:  # noqa: BLE001 — ack failure must not kill the run
+            ctx.logger.warning(
+                "financials_received_ack.failed", error=str(exc)[:200],
+            )
         return self._step(
             "financials_await",
             ctx,
@@ -5322,6 +5356,17 @@ class OnboardingWorkflow(WorkflowDefinition):
                 access_token=token, refresh_token=refresh, token_expires_at=expires,
             )
 
+        # UAT 2026-06-16 (PM): immediate ack BEFORE the cluster call.
+        # The extract step can take 60-90s; without this the SME was
+        # watching a silent chat between their upload and the confirm
+        # card, then sometimes wandered off and missed the buttons.
+        try:
+            await self._send(ctx, state, "onboarding.invoice.processing")
+        except Exception as exc:  # noqa: BLE001 — never block extract on the ack
+            ctx.logger.warning(
+                "invoice_processing_ack.failed", error=str(exc)[:200],
+            )
+
         try:
             draft = await self._invoices.extract_base64(
                 access_token=token,
@@ -5343,6 +5388,34 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             await self._send(
                 ctx, state, "onboarding.invoice.failed", {"reason": reason},
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+            )
+
+        # UAT 2026-06-16 (PM): guard the empty-extract case. When the
+        # cluster's OCR returns a draft with no usable fields, the SME
+        # used to see "Extracted — · QAR — · Due — / Supplier: —" and
+        # the Approve→submit then failed with a generic error because
+        # the backend rejects empty data. Treat the empty draft as a
+        # read-failure and ask the SME to resend instead.
+        if _draft_is_empty(draft):
+            ctx.logger.warning(
+                "invoice_extract.empty_draft",
+                filename=filename,
+                draft_keys=sorted(draft.keys()),
+            )
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {
+                    "reason": (
+                        "We couldn't read the key details from this file. "
+                        "Please resend it as a clear, full-page PDF or photo "
+                        "where the invoice number, amount, and due date are "
+                        "all visible."
+                    ),
+                },
             )
             return self._step(
                 "invoice_collect_await", ctx,
@@ -5482,6 +5555,18 @@ class OnboardingWorkflow(WorkflowDefinition):
         def _opt_str(key: str) -> str | None:
             v = draft.get(key)
             return None if v in (None, "") else str(v)
+
+        # UAT 2026-06-16 (PM): ack the moment the SME taps Approve.
+        # The cluster's submit step can take several seconds; without
+        # this the chat is silent between the Approve tap and the
+        # receipt template. Best-effort — never block the submit on
+        # the ack send.
+        try:
+            await self._send(ctx, state, "onboarding.invoice.submitting")
+        except Exception as exc:  # noqa: BLE001
+            ctx.logger.warning(
+                "invoice_submit_ack.failed", error=str(exc)[:200],
+            )
 
         try:
             record = await self._invoices.submit_base64(

@@ -2018,6 +2018,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                 # message (the checklist isn't actually complete) and
                 # the now-redundant payment_wait_await stop.
                 "payment": "business_details_fetch",
+                # UAT 2026-06-16 (afternoon): waiver path skips even the
+                # payment chain — fee is already settled, go straight
+                # to the lender phase to await offers.
+                "lender": "lender_status_poll",
                 "missing": "documents_upload_loop_send",
                 "await_again": "documents_upload_loop_await",
                 # SME replied NO to "any more documents?" → proceed to the
@@ -2041,7 +2045,16 @@ class OnboardingWorkflow(WorkflowDefinition):
         graph.add_conditional_edges(
             "payment_wait_await",
             self._route_payment_wait,
-            {"go": "business_details_fetch", "wait": "payment_wait_await"},
+            {
+                "go":     "business_details_fetch",
+                "wait":   "payment_wait_await",
+                # UAT 2026-06-16 (afternoon): on a waiver the backend
+                # advances the SME into the lender phase WITHOUT a real
+                # payment ever being made — jump straight to the lender
+                # poll so the payment chain (which would create + send a
+                # TESS link the SME doesn't need) is skipped.
+                "lender": "lender_status_poll",
+            },
         )
 
         graph.add_conditional_edges(
@@ -3467,6 +3480,30 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "documents"})
+        # UAT 2026-06-16 (afternoon): ``qualified.waived`` can land here
+        # if the admin waived the fee while the SME was still in the
+        # docs loop. Backend already sent its own waiver message, so
+        # advance silently with paid=True + documents_received=True
+        # (skips the rest of the checklist + the payment chain).
+        if (
+            isinstance(reply, dict)
+            and reply.get("type") == "payment"
+            and bool(reply.get("paid"))
+        ):
+            await self._reminders.suppress(
+                target_ref=state.madad_user_id or ctx.session_id
+            )
+            progress_step = await self._update_progress(state, ctx, step=5)
+            fields: dict[str, Any] = {
+                "missing_documents": list(state.missing_documents),
+                "documents_received": True,
+                "paid": True,
+                "payment_ready": True,
+                "last_status_source": _extract_status_source(reply),
+            }
+            if progress_step is not None:
+                fields["onboarding_progress_step"] = progress_step
+            return self._step("documents_upload_loop_await", ctx, **fields)
         # A backend webhook / status event (e.g. admin pre-qualified the user)
         # can land on this step if they haven't uploaded yet. Do NOT re-send the
         # document checklist — treat the document phase as satisfied and let the
@@ -3488,8 +3525,22 @@ class OnboardingWorkflow(WorkflowDefinition):
                 JourneyStatus.OFFER_ACCEPTED,
                 JourneyStatus.ACTIVATED,
             }
+            # UAT 2026-06-16 (afternoon, per Madad note): the post-
+            # payment statuses (ACCEPTED+) imply the fee has been
+            # settled by a real payment or a waiver. Mark paid=True so
+            # the downstream ``_route_payment_wait`` (and route_payment
+            # if a checkpoint replay brings us through payment_await)
+            # jumps STRAIGHT to ``lender_status_poll`` instead of
+            # running through ``business_details_fetch → payment_create
+            # → payment_send_link`` and sending the SME a payment link
+            # they don't need.
+            fee_satisfied = forced_status in {
+                JourneyStatus.ACCEPTED,
+                JourneyStatus.OFFER_ACCEPTED,
+                JourneyStatus.ACTIVATED,
+            }
             score = _extract_madad_score(reply)
-            fields: dict[str, Any] = {
+            fields = {
                 "missing_documents": list(state.missing_documents),
                 "documents_received": True,
                 "journey_status": forced_status,
@@ -3497,6 +3548,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             }
             if fast_forward:
                 fields["payment_ready"] = True
+                if fee_satisfied:
+                    fields["paid"] = True
                 if score is not None:
                     fields["madad_score"] = score
                 # Refinement (2026-06-09): when admin overrides the
@@ -4219,11 +4272,43 @@ class OnboardingWorkflow(WorkflowDefinition):
         # we already have the trigger so the same event continues
         # straight into the payment chain (business_details_fetch →
         # products_list_fetch → payment_create → payment_send_link).
-        if state.payment_ready:
-            return self._step("payment_wait_await", ctx, payment_ready=True)
+        if state.payment_ready or state.paid:
+            return self._step("payment_wait_await", ctx)
         # PARK after the coffee message until the payment step is triggered
         # (Postman in the demo). Capture the Madad score from the trigger payload.
         payload = await_input({"waiting_for": "payment_ready", "step": "payment_wait"})
+        # UAT 2026-06-16 (afternoon): ``qualified.waived`` lands here
+        # as the dispatcher-translated ``{type: payment, paid: True,
+        # event: qualified.waived, ...}`` payload (same shape as
+        # ``payment.completed``). Mark the fee satisfied + jump to the
+        # lender phase via the route. NO SME-facing message — backend
+        # already sent its own waiver WhatsApp.
+        if (
+            isinstance(payload, dict)
+            and payload.get("type") == "payment"
+            and bool(payload.get("paid"))
+        ):
+            return self._step(
+                "payment_wait_await", ctx,
+                paid=True, payment_ready=True,
+                last_status_source=_extract_status_source(payload),
+            )
+        # Same break-out for any post-payment journey_status hint
+        # piggy-backed on a webhook (offers.available, offer.selected,
+        # credit_line.activated). Mirrors the existing ``_payment_await``
+        # short-circuit Ishaan added in 1bb9786.
+        advanced = _extract_journey_status(payload)
+        if advanced in (
+            JourneyStatus.ACCEPTED,
+            JourneyStatus.OFFER_ACCEPTED,
+            JourneyStatus.ACTIVATED,
+        ):
+            return self._step(
+                "payment_wait_await", ctx,
+                paid=True, payment_ready=True,
+                journey_status=advanced,
+                last_status_source=_extract_status_source(payload),
+            )
         if self._is_payment_trigger(payload):
             score = _extract_madad_score(payload)
             return self._step(
@@ -6068,6 +6153,19 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "received" if state.shareholders else "missing"
 
     def _route_documents(self, state: OnboardingState) -> str:
+        # UAT 2026-06-16 (afternoon): waiver path. ``qualified.waived``
+        # OR a post-payment status hint (ACCEPTED/OFFER_ACCEPTED/
+        # ACTIVATED) landed at the docs loop — the SME shouldn't go
+        # through the TESS payment chain because the fee is already
+        # settled. Jump STRAIGHT to ``lender_status_poll`` instead of
+        # ``business_details_fetch`` (which would create + send a
+        # payment link the SME doesn't need).
+        if state.paid or state.journey_status in {
+            JourneyStatus.ACCEPTED,
+            JourneyStatus.OFFER_ACCEPTED,
+            JourneyStatus.ACTIVATED,
+        }:
+            return "lender"
         # Refinement per Ishan (UAT 2026-06-09): when admin QUALIFIES
         # mid-docs-loop, jump STRAIGHT to the payment chain. The
         # ``documents_complete`` coffee message ("🎊 all documents
@@ -6077,12 +6175,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         # _documents_upload_loop_await, so this route catches the
         # override and bypasses both ``documents_complete`` and the
         # short-circuited ``payment_wait_await`` stop.
-        if state.payment_ready or state.journey_status in {
-            JourneyStatus.QUALIFIED,
-            JourneyStatus.ACCEPTED,
-            JourneyStatus.OFFER_ACCEPTED,
-            JourneyStatus.ACTIVATED,
-        }:
+        if state.payment_ready or state.journey_status == JourneyStatus.QUALIFIED:
             return "payment"
         # Frustrated-user escape hatch: the SME replied NO to "any more
         # documents?" while some required docs were still undetected — proceed
@@ -6110,6 +6203,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "go" if state.prequalified else "wait"
 
     def _route_payment_wait(self, state: OnboardingState) -> str:
+        # UAT 2026-06-16 waiver path: backend's ``qualified.waived``
+        # webhook (or any post-payment status_update) sets paid=True
+        # via the in-node handler. We then jump STRAIGHT to the lender
+        # poll, bypassing business_details_fetch → payment_create →
+        # payment_send_link (which would create a TESS link the SME
+        # doesn't need on the waived path).
+        if state.paid:
+            return "lender"
         # Bug #12 (UAT 2026-06-09): the payment trigger is the same
         # ``madad_score.ready`` event that exits the docs loop. When it
         # arrives mid-docs-loop, the docs-loop handler consumes it,

@@ -23,10 +23,11 @@ IDENTITY = "+97455500900"
 # -- Static contract: event taxonomy ----------------------------------------
 
 
-def test_phase1a_event_set_has_nine_canonical_events() -> None:
-    # UAT 2026-06-16 Bug #8: backend fires ``offer.selected`` (not
-    # ``offer.accepted``) at acceptance time. Accept both names so the
-    # dispatcher never rejects the legit acceptance webhook.
+def test_phase1a_event_set_has_ten_canonical_events() -> None:
+    # UAT 2026-06-16:
+    #   Bug #8 added ``offer.selected`` alongside ``offer.accepted``.
+    #   Afternoon: added ``qualified.waived`` — the dispatcher used to
+    #   400 it, so a waived SME never advanced into the lender phase.
     assert PHASE1A_BACKEND_EVENTS == frozenset(
         {
             "eligibility.updated",
@@ -34,12 +35,24 @@ def test_phase1a_event_set_has_nine_canonical_events() -> None:
             "prequalification.completed",
             "madad_score.ready",
             "payment.completed",
+            "qualified.waived",
             "offers.available",
             "offer.accepted",
             "offer.selected",
             "credit_line.activated",
         }
     )
+
+
+def test_qualified_waived_translates_to_paid_true() -> None:
+    """``qualified.waived`` produces the same resume-payload shape as
+    ``payment.completed`` (type=payment, paid=True) so every wait node
+    that branches on ``paid`` advances on the waiver path."""
+    out = translate_backend_event("qualified.waived", {})
+    assert out["type"] == "payment"
+    assert out["paid"] is True
+    assert out["event"] == "qualified.waived"
+    assert out["last_status_source"] == "webhook"
 
 
 def test_offer_selected_maps_to_offer_accepted_journey_status() -> None:
@@ -66,7 +79,7 @@ def test_phase1b_event_set_has_six_canonical_events() -> None:
 
 def test_all_backend_events_is_union_of_phase1a_and_phase1b() -> None:
     assert ALL_BACKEND_EVENTS == PHASE1A_BACKEND_EVENTS | PHASE1B_BACKEND_EVENTS
-    assert len(ALL_BACKEND_EVENTS) == 15  # 9 + 6 (Phase 1.a now includes offer.selected)
+    assert len(ALL_BACKEND_EVENTS) == 16  # 10 + 6 (Phase 1.a now includes qualified.waived)
 
 
 # -- Payload translation ----------------------------------------------------

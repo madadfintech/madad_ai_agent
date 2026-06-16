@@ -99,19 +99,32 @@ def test_route_documents_qualify_always_routes_to_payment() -> None:
     This guarantees the qualify/payment message is never swallowed by the
     document phase (the recurring stuck-message bug)."""
     wf = _wf()
+    # QUALIFIED → payment chain (real payment path).
+    state = OnboardingState(
+        identity=IDENTITY,
+        missing_documents=list(DEFAULT_WHATSAPP_REQUIRED_DOCS),
+        documents_complete_sent=True,
+        journey_status=JourneyStatus.QUALIFIED,
+    )
+    assert wf._route_documents(state) == "payment"  # noqa: SLF001
+    # UAT 2026-06-16 (afternoon): post-payment statuses imply the fee
+    # has been settled (paid OR waived) — route directly to the lender
+    # phase and SKIP the TESS payment chain.
     for status in (
-        JourneyStatus.QUALIFIED,
         JourneyStatus.ACCEPTED,
         JourneyStatus.OFFER_ACCEPTED,
         JourneyStatus.ACTIVATED,
     ):
         state = OnboardingState(
             identity=IDENTITY,
-            missing_documents=list(DEFAULT_WHATSAPP_REQUIRED_DOCS),  # docs not done
+            missing_documents=list(DEFAULT_WHATSAPP_REQUIRED_DOCS),
             documents_complete_sent=True,
             journey_status=status,
         )
-        assert wf._route_documents(state) == "payment"  # noqa: SLF001
+        assert wf._route_documents(state) == "lender"  # noqa: SLF001
     # Same via the explicit payment_ready flag (set on the score.ready event).
     state = OnboardingState(identity=IDENTITY, payment_ready=True)
     assert wf._route_documents(state) == "payment"  # noqa: SLF001
+    # paid=True alone (waiver detected at the docs loop) → lender.
+    state = OnboardingState(identity=IDENTITY, paid=True)
+    assert wf._route_documents(state) == "lender"  # noqa: SLF001

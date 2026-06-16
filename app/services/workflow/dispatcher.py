@@ -53,6 +53,13 @@ PHASE1A_BACKEND_EVENTS: frozenset[str] = frozenset(
         "prequalification.completed",
         "madad_score.ready",
         "payment.completed",
+        # UAT 2026-06-16 (afternoon): backend fires ``qualified.waived``
+        # when ops "waive off" the onboarding fee. Per Madad, treat it
+        # as functionally equivalent to ``payment.completed`` — the fee
+        # is satisfied — and advance the run into the lender phase.
+        # Backend sends its OWN waiver WhatsApp message, so the agent
+        # must stay silent here (only state advances).
+        "qualified.waived",
         "offers.available",
         # UAT 2026-06-16 Bug #8: backend fires ``offer.selected`` at
         # acceptance time per Ishan's confirmation, but the agent only
@@ -120,8 +127,16 @@ def translate_backend_event(
     """
 
     base: dict[str, Any] = {"last_status_source": "webhook"}
-    if event_type == "payment.completed":
-        return {"type": "payment", "paid": True, **base, **payload}
+    if event_type in {"payment.completed", "qualified.waived"}:
+        # Both produce the same effect: paid=True so ``_route_payment``
+        # (and the new ``_route_payment_wait`` lender-jump) advance the
+        # run into the lender phase. The wait-node handlers detect the
+        # ``qualified.waived`` event marker on the payload and stay
+        # silent — backend already sent the SME the waiver message.
+        return {
+            "type": "payment", "paid": True, "event": event_type,
+            **base, **payload,
+        }
     if event_type in PHASE1B_BACKEND_EVENTS:
         return {"type": "phase1b_event", "event": event_type, **base, **payload}
     if event_type in EVENT_TO_JOURNEY_STATUS:

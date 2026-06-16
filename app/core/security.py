@@ -46,15 +46,28 @@ def _bearer_token(request: Request) -> str | None:
 
 
 async def require_admin(request: Request) -> None:
-    """FastAPI dependency that enforces the admin bearer token (except probes)."""
+    """FastAPI dependency that enforces the admin bearer token (except probes).
 
-    token = settings.admin_api_token
-    if not token:
-        return  # dev mode: no token configured
+    UAT 2026-06-16: also accepts any bearer in ``settings.admin_api_token_extras``
+    so Madad's reset tooling (which uses its own ``dbwipe``-style helper
+    token) can call ``/workflow/admin/forget-session`` without us having
+    to share the canonical 48-char prod token. The primary token still
+    works; extras are additive."""
+
+    primary = settings.admin_api_token
+    extras = settings.admin_api_token_extras
+    if not primary and not extras:
+        return  # dev mode: no token configured at all
     if _is_public_path(request.url.path):
         return
-    if _bearer_token(request) != token:
+    presented = _bearer_token(request)
+    if presented is None:
         raise UnauthorizedError("Admin authentication required")
+    if primary and presented == primary:
+        return
+    if presented in extras:
+        return
+    raise UnauthorizedError("Admin authentication required")
 
 
 async def require_api_auth(request: Request) -> None:

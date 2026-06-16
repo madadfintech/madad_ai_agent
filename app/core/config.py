@@ -9,7 +9,9 @@ service-specific settings will be layered on in their own modules.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Any
+
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -268,6 +270,30 @@ class Settings(BaseSettings):
     # Bearer token gating the admin services (CMS, Operational Visibility).
     # Unset = open (local dev only); set in staging/prod. JWT/OIDC can replace it.
     admin_api_token: str | None = None
+    # UAT 2026-06-16: Madad's reset tooling calls forget-session with a
+    # different bearer than the platform's primary admin token (e.g.
+    # "dbwipe" for their DB-wipe helper). Operators add their token(s)
+    # to this list as a comma-separated string in env (parsed below);
+    # require_admin accepts ANY of them. Empty list = only the primary
+    # token gates. Used to be a single token; the list is additive so
+    # we never have to share the canonical 48-char prod token with
+    # external callers that just need to wipe a session.
+    admin_api_token_extras: list[str] = Field(default_factory=list)
+
+    @field_validator("admin_api_token_extras", mode="before")
+    @classmethod
+    def _parse_admin_extras(cls, value: Any) -> Any:
+        """Accept either a JSON list (Pydantic default) OR a comma-separated
+        string (operator-friendly) for ``ADMIN_API_TOKEN_EXTRAS``."""
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            # JSON list form passes through to the standard parser.
+            if stripped.startswith("["):
+                return value
+            return [t.strip() for t in stripped.split(",") if t.strip()]
+        return value
 
     # Inbound/outbound request-correlation header. Echoed on every response and
     # bound to the structured-logging context for end-to-end tracing.

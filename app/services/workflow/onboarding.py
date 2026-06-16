@@ -2163,6 +2163,21 @@ class OnboardingWorkflow(WorkflowDefinition):
 
     async def _campaign_await(self, state: OnboardingState, ctx: WorkflowContext) -> dict[str, Any]:
         reply = await_input({"waiting_for": "reply", "step": "campaign"})
+        # UAT 2026-06-16 nudge-spam RCA: a status poll / docs settle /
+        # backend status_update webhook resuming at campaign_await
+        # would fall into the else-branch below and fire its default
+        # answer ("Are you interested in financing? Please reply YES
+        # or NO.") via _contextual_off_script — every minute, forever,
+        # while the run sat parked. Same guard as invoice_collect_await
+        # uses for the same reason: re-park silently when the resume
+        # is synthetic / non-SME and has no real text payload.
+        if isinstance(reply, dict):
+            reply_type = reply.get("type")
+            if reply_type in {"status_update", "docs_settle", "phase1b_event"}:
+                return self._step("campaign_await", ctx)
+            if reply.get("last_status_source") in {"poll", "webhook"}:
+                if not reply.get("text") and not reply.get("attachments"):
+                    return self._step("campaign_await", ctx)
         help_template = _off_script_template(reply)
         if help_template is not None:
             await self._send(
@@ -2755,6 +2770,15 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "email", "step": "business_email"})
+        # UAT 2026-06-16 nudge-spam RCA: same synthetic-resume guard so
+        # an orphaned-run poll never re-fires the "send your email" nag.
+        if isinstance(reply, dict):
+            reply_type = reply.get("type")
+            if reply_type in {"status_update", "docs_settle", "phase1b_event"}:
+                return self._step("business_email_await", ctx)
+            if reply.get("last_status_source") in {"poll", "webhook"}:
+                if not reply.get("text") and not reply.get("attachments"):
+                    return self._step("business_email_await", ctx)
         email = _extract_email(reply_text(reply))
         if not email:
             # Off-script / not an email — clarify in context and keep waiting.
@@ -2812,6 +2836,17 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "consent_cr"})
+        # UAT 2026-06-16 nudge-spam RCA (Madad explicit ask): same
+        # synthetic-resume guard as invoice_collect_await + campaign_await.
+        # Without this, an orphaned-run poll OR a backend status_update
+        # webhook landing here re-fires the canned CR/consent prompt.
+        if isinstance(reply, dict):
+            reply_type = reply.get("type")
+            if reply_type in {"status_update", "docs_settle", "phase1b_event"}:
+                return self._step("consent_await", ctx, consent=False)
+            if reply.get("last_status_source") in {"poll", "webhook"}:
+                if not reply.get("text") and not reply.get("attachments"):
+                    return self._step("consent_await", ctx, consent=False)
         help_template = _off_script_template(reply)
         if help_template is not None:
             await self._send(

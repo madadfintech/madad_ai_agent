@@ -249,6 +249,31 @@ async def run_status_poller(
             if run.channel is None or not run.identity:
                 stats.failed += 1
                 continue
+            # UAT 2026-06-16 nudge-spam RCA: the dispatcher's
+            # resume_external resolves to the SESSION's active_run_id,
+            # not the run_id the poller just picked. So when an
+            # identity has multiple still-waiting runs (e.g. a stuck
+            # old payment_await PLUS a newer campaign_await), a poll
+            # meant for the OLD run wakes the NEW one — and
+            # ``_campaign_await`` then fires its canned "are you
+            # interested in financing?" answer every minute.
+            # Guard: skip orphaned runs (run_id != active_run_id) and
+            # mark them CANCELLED so the next tick doesn't see them.
+            session = await platform.runtime.sessions.get(
+                run.channel, run.identity
+            )
+            if session is None or session.active_run_id != run.run_id:
+                from app.shared.workflow.enums import RunStatus as _RS
+                run.status = _RS.CANCELLED
+                try:
+                    await platform.runtime.run_store.save(run)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "poller.cancel_orphan_failed",
+                        run_id=run.run_id, error=str(exc)[:200],
+                    )
+                stats.skipped_step += 1
+                continue
             await platform.dispatcher.resume_external(
                 run.channel,
                 run.identity,

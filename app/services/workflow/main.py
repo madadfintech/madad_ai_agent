@@ -123,13 +123,71 @@ class RunStatusDTO(BaseModel):
 
 @app.post("/workflow/campaign/start", response_model=RunStatusDTO)
 async def start_campaign(req: CampaignStartRequest, platform: Platform) -> RunStatusDTO:
+    """Start a fresh onboarding campaign for (channel, identity).
+
+    UAT 2026-06-16 (nudge-spam RCA): the previous behaviour was to call
+    ``runtime.start`` unconditionally — every retrigger created another
+    workflow run for the same identity. The poller iterates by
+    (status, step) so stacked runs each took their next poll tick, and
+    the runtime's ``resume`` resolves to the session's active_run_id
+    (the LATEST run). Result: a poll meant for the SME's old
+    payment_await run woke their newest campaign_await run, and
+    ``_campaign_await`` fired its "Are you interested in financing"
+    answer every minute.
+
+    Fix: BEFORE starting a new run, cancel every still-waiting run for
+    the same (channel, identity). The session is reset and the new
+    run takes over as active. Madad's "campaign/start must not stack"
+    is the same code path — one explicit, one as a side-effect of
+    a forget-session that 401'd.
+    """
+    cancelled_runs = await _cancel_active_runs_for(
+        platform, req.channel, req.identity,
+    )
     result = await platform.runtime.start(
         "onboarding",
         req.channel,
         req.identity,
         input={"trigger": "campaign", "locale": req.locale},
     )
+    if cancelled_runs:
+        # Log so ops can see when retriggers were absorbed into a clean
+        # new run — helps explain "wait, where did my old run go?".
+        from app.core.logging import get_logger
+        get_logger("workflow.campaign").info(
+            "campaign_start.cancelled_predecessors",
+            new_run=result.run.run_id,
+            cancelled=cancelled_runs,
+        )
     return RunStatusDTO.from_result(result)
+
+
+async def _cancel_active_runs_for(
+    platform: OnboardingPlatform, channel: Channel, identity: str,
+) -> list[str]:
+    """Cancel every still-waiting workflow run for ``(channel, identity)``.
+
+    Returns the list of cancelled run_ids. Idempotent — no-op when
+    there are no live runs for the identity. Touches the run-store
+    directly (cheap status flip), not the LangGraph checkpoint, so
+    the next /workflow/admin/forget-session call still cleans those
+    up if a deeper wipe is needed.
+    """
+    from app.shared.workflow import RunStatus
+
+    cancelled: list[str] = []
+    waiting = await platform.runtime.run_store.list_by_status(
+        RunStatus.WAITING_FOR_INPUT, RunStatus.RUNNING, RunStatus.PENDING,
+    )
+    ch_str = str(getattr(channel, "value", channel)).lower()
+    for run in waiting:
+        run_ch = str(getattr(run, "channel", "") or "").lower()
+        run_id_str = getattr(run, "identity", "") or ""
+        if run_ch == ch_str and run_id_str == identity:
+            run.status = RunStatus.CANCELLED
+            await platform.runtime.run_store.save(run)
+            cancelled.append(run.run_id)
+    return cancelled
 
 
 @app.post("/workflow/inbound", response_model=None)

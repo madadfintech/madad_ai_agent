@@ -4059,6 +4059,28 @@ class OnboardingWorkflow(WorkflowDefinition):
         if _is_status_query(result):
             await self._send(ctx, state, "onboarding.payment.awaiting")
             return self._step("payment_await", ctx, paid=False)
+        # The qualification fee can be WAIVED by an admin: no payment.completed
+        # ever reaches us — the backend sends its OWN consolidated "fee waived →
+        # forwarded to banks" message and advances the journey straight to the
+        # lender phase. A later offers.available / offer.selected /
+        # credit_line.activated then lands HERE and used to be swallowed as
+        # "unpaid" (so the lender offer card never rendered — UAT 2026-06-16).
+        # If the resume carries a status already at/after the lender phase,
+        # treat the fee as satisfied and break out into the lender flow. No
+        # payment-confirmed message — the backend already messaged the waive.
+        advanced = _extract_journey_status(result)
+        if advanced in (
+            JourneyStatus.ACCEPTED,
+            JourneyStatus.OFFER_ACCEPTED,
+            JourneyStatus.ACTIVATED,
+        ):
+            return self._step(
+                "payment_await",
+                ctx,
+                paid=True,
+                journey_status=advanced,
+                last_status_source=_extract_status_source(result),
+            )
         paid = bool(result.get("paid")) if isinstance(result, dict) else False
         if paid:
             await self._reminders.suppress(

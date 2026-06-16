@@ -4082,6 +4082,51 @@ class OnboardingWorkflow(WorkflowDefinition):
                 last_status_source=_extract_status_source(result),
             )
         paid = bool(result.get("paid")) if isinstance(result, dict) else False
+        # UAT 2026-06-16 (+918287611995): waiver detection on the POLL path.
+        # Ishaan's commit 1bb9786 handles the webhook path — when a Phase 1
+        # event (offers.available etc) lands at payment_await with the
+        # journey_status piggy-backed on the resume payload, that
+        # short-circuit fires first. But the background poller fires
+        # ``{type: status_update, last_status_source: poll}`` with NO
+        # journey_status, so Ishaan's hint check returns None and we'd
+        # otherwise re-park forever for a silent admin waiver that fires
+        # NO subsequent webhook at all. Read /me here as a defense-in-
+        # depth: ``onboardingFeePaid=true`` OR a journey jump past
+        # QUALIFIED both mean the fee is cleared. NO message is sent —
+        # the backend's own consolidated "fee waived → forwarded to
+        # banks" notice already reached the SME (same policy as
+        # Ishaan's webhook branch above).
+        waived = False
+        if not paid and isinstance(result, dict) and result.get("type") in {
+            "status_update", "phase1b_event",
+        }:
+            token = (await self._live_token(state, ctx))[0]
+            if token:
+                try:
+                    info = await self._identity.me(access_token=token)
+                except Exception as exc:  # noqa: BLE001 — fall through and stay parked
+                    ctx.logger.warning(
+                        "payment_await.me_failed", error=str(exc)[:200],
+                    )
+                else:
+                    user = info.get("user") if isinstance(info, dict) else None
+                    if isinstance(user, dict):
+                        if bool(user.get("onboardingFeePaid") or user.get("onboarding_fee_paid")):
+                            waived = True
+                        raw_js = user.get("journeyStatus") or user.get("journey_status")
+                        if isinstance(raw_js, str) and raw_js.upper() in {
+                            "ACCEPTED", "OFFER_ACCEPTED", "ACTIVATED", "OPEN",
+                        }:
+                            waived = True
+        if waived and not paid:
+            # Mirror Ishaan's webhook short-circuit — advance silently into
+            # the lender flow. last_status_source stays "poll" so the
+            # poller suppresses its next tick for this run.
+            return self._step(
+                "payment_await", ctx,
+                paid=True,
+                last_status_source="poll",
+            )
         if paid:
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id

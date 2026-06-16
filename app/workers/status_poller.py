@@ -44,7 +44,15 @@ from app.shared.workflow.persistence import WorkflowRun
 logger = structlog.get_logger(__name__)
 
 # Polling step names — the only awaits this worker advances.
-POLLABLE_STEPS: frozenset[str] = frozenset({"journey_wait_await", "lender_wait_await"})
+POLLABLE_STEPS: frozenset[str] = frozenset({
+    "journey_wait_await",
+    "lender_wait_await",
+    # UAT 2026-06-16: poll payment_await too so an admin "waive off" — which
+    # never fires payment.completed — is picked up by the next status tick
+    # and routed through _payment_await's waiver branch instead of the run
+    # sitting parked forever.
+    "payment_await",
+})
 
 # Document-upload await: the settle sweep resumes a run parked here once the SME
 # has stopped uploading, so the workflow can send the end-of-batch checklist +

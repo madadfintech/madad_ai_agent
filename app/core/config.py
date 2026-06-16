@@ -9,10 +9,10 @@ service-specific settings will be layered on in their own modules.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class RedisSettings(BaseModel):
@@ -278,20 +278,33 @@ class Settings(BaseSettings):
     # token gates. Used to be a single token; the list is additive so
     # we never have to share the canonical 48-char prod token with
     # external callers that just need to wipe a session.
-    admin_api_token_extras: list[str] = Field(default_factory=list)
+    # ``NoDecode`` opts the field out of pydantic-settings' default
+    # env-source JSON parsing — our own validator below accepts either a
+    # JSON list or a comma-separated string. Without NoDecode the env
+    # source raises a SettingsError when the value isn't valid JSON
+    # (e.g. plain "dbwipe"), which crashes service startup.
+    admin_api_token_extras: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     @field_validator("admin_api_token_extras", mode="before")
     @classmethod
     def _parse_admin_extras(cls, value: Any) -> Any:
         """Accept either a JSON list (Pydantic default) OR a comma-separated
         string (operator-friendly) for ``ADMIN_API_TOKEN_EXTRAS``."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
         if isinstance(value, str):
             stripped = value.strip()
             if not stripped:
                 return []
-            # JSON list form passes through to the standard parser.
             if stripped.startswith("["):
-                return value
+                import json
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    return [stripped]
+                return parsed if isinstance(parsed, list) else [stripped]
             return [t.strip() for t in stripped.split(",") if t.strip()]
         return value
 

@@ -190,6 +190,47 @@ async def test_extract_failure_falls_back_to_invoice_failed_template(
     )
 
     assert "onboarding.invoice.failed" in harness.messenger.templates()
+    # Backend-style error means "blame the file" copy — not a transport
+    # timeout, so the SME is told to resend.
+    sent_failures = [
+        s for s in harness.messenger.sent
+        if s["template_key"] == "onboarding.invoice.failed"
+    ]
+    assert sent_failures
+    assert "couldn't read the file" in sent_failures[-1]["variables"]["reason"]
+
+
+async def test_invoice_extract_timeout_uses_transport_message(harness) -> None:
+    """UAT 2026-06-16: when the MCP cluster times out on
+    extract_and_submit (NOT a real "unreadable" backend error), the SME
+    must NOT be told the file is bad. They get the honest "our processor
+    is slow, try again" copy so they don't waste time resending a
+    perfectly valid PDF."""
+    await _drive_to_activated(harness)
+
+    timeout_client = InMemoryInvoiceClient(
+        extract_error=TimeoutError("Timed out while waiting for response"),
+    )
+    harness.platform.workflow._invoices = timeout_client  # type: ignore[union-attr]
+    harness.invoices = timeout_client
+
+    runtime = harness.platform.runtime
+    await runtime.resume(
+        WA, IDENTITY,
+        message={"attachments": [
+            {"filename": "8044-invoice.pdf", "content_base64": DOC}
+        ]},
+    )
+
+    sent_failures = [
+        s for s in harness.messenger.sent
+        if s["template_key"] == "onboarding.invoice.failed"
+    ]
+    assert sent_failures, "expected onboarding.invoice.failed to fire"
+    reason = sent_failures[-1]["variables"]["reason"]
+    assert "taking longer than usual" in reason
+    # And critically: the SME is NOT told the file is corrupt.
+    assert "couldn't read" not in reason
 
 
 def test_is_invoice_status_query_recognizes_common_phrasings() -> None:

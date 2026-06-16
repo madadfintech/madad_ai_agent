@@ -80,10 +80,16 @@ class MCPClient(ABC):
         attempts = requested if self.is_idempotent(name) else 1
         delay = self._settings.retry_base_delay_seconds
         last_error: Exception | None = None
+        # Per-tool timeout override: heavy backend tools (invoice extraction,
+        # ZIP processing) can routinely need 60-120s vs the default 10-30s.
+        # When unset (the common case) we fall back to the global default.
+        tool_timeout = self._settings.tool_timeouts.get(
+            name, self._settings.timeout_seconds
+        )
         for attempt in range(1, attempts + 1):
             try:
                 raw = await asyncio.wait_for(
-                    self._invoke(name, payload), timeout=self._settings.timeout_seconds
+                    self._invoke(name, payload), timeout=tool_timeout
                 )
                 return _unwrap_madad_envelope(raw)
             except Exception as exc:  # noqa: BLE001 - normalise + (optionally) retry
@@ -223,7 +229,15 @@ def _build_fastmcp_client(
             f"Unknown MCP auth_mode {settings.auth_mode!r}",
             details={"auth_mode": settings.auth_mode},
         )
-    return fastmcp.Client(settings.endpoint, auth=auth, timeout=settings.timeout_seconds)
+    # The underlying httpx-based transport gets the LONGEST budget across
+    # any configured tool — otherwise the http layer would kill a heavy
+    # call (e.g. invoice extract+submit at 120s) before our per-tool
+    # asyncio.wait_for budget could apply. Cheap calls are still bounded
+    # by their per-call wait_for; this only changes the upper ceiling.
+    transport_timeout = max(
+        [settings.timeout_seconds, *settings.tool_timeouts.values()]
+    )
+    return fastmcp.Client(settings.endpoint, auth=auth, timeout=transport_timeout)
 
 
 class HttpMCPClient(MCPClient):

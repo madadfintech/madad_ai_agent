@@ -630,6 +630,40 @@ def _is_zip_attachment(attachment: dict[str, Any]) -> bool:
     return filename.endswith(".zip")
 
 
+_TRANSPORT_TIMEOUT_MARKERS = (
+    "timed out",
+    "timeout",
+    "deadline exceeded",
+    "connection closed",
+    "connection reset",
+    "stream closed",
+    "transport closed",
+    "remote disconnected",
+)
+
+
+def _looks_like_transport_timeout(exc: BaseException) -> bool:
+    """True when the exception (or any link in its cause chain) looks like
+    a transport-side timeout / disconnect rather than a backend "could not
+    parse this file" error.
+
+    Used to drive an honest invoice-failure message — when the MCP cluster
+    timed out, the SME's file is fine and we should say so instead of
+    asking them to resend.
+    """
+
+    cur: BaseException | None = exc
+    while cur is not None:
+        # asyncio.TimeoutError is the canonical wait_for cancellation.
+        if isinstance(cur, asyncio.TimeoutError | TimeoutError):
+            return True
+        msg = str(cur).lower()
+        if any(marker in msg for marker in _TRANSPORT_TIMEOUT_MARKERS):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def _guess_mime_for(filename: str) -> str:
     lowered = filename.lower()
     if lowered.endswith(".pdf"):
@@ -4574,6 +4608,10 @@ class OnboardingWorkflow(WorkflowDefinition):
         token, refresh, expires = await self._live_token(state, ctx)
         accepted: list[dict[str, Any]] = []
         failed = 0
+        # Track how many of the failures were transport timeouts (vs real
+        # backend "couldn't parse the file" errors). Drives an honest
+        # SME-facing message when nothing went through.
+        transport_timeout_failures = 0
         now_iso = ctx.clock.now().isoformat()
 
         for att in attachments:
@@ -4608,6 +4646,12 @@ class OnboardingWorkflow(WorkflowDefinition):
                     filename=filename,
                     error=str(exc)[:200],
                 )
+                if _looks_like_transport_timeout(exc):
+                    # UAT 2026-06-16: extract+submit was timing out at 30s
+                    # and the SME got a "couldn't read the file" message
+                    # that misdiagnosed the failure. Track separately so
+                    # the follow-up message blames the right thing.
+                    transport_timeout_failures += 1
                 failed += 1
 
         if accepted:
@@ -4621,9 +4665,23 @@ class OnboardingWorkflow(WorkflowDefinition):
                 },
             )
         else:
+            # Pick the most accurate message for what actually went wrong.
+            # If every failure was a transport timeout, the file is fine
+            # and our cluster was slow — don't tell the SME to resend.
+            if transport_timeout_failures and transport_timeout_failures == failed:
+                reason = (
+                    "Our invoice processor is taking longer than usual — please "
+                    "try again in a minute. Your file looks fine; we just need "
+                    "another moment to get it through."
+                )
+            else:
+                reason = (
+                    "We couldn't read the file — please resend as a clear PDF "
+                    "or photo."
+                )
             await self._send(
                 ctx, state, "onboarding.invoice.failed",
-                {"reason": "We couldn't read the file — please resend as a clear PDF or photo."},
+                {"reason": reason},
             )
 
         return self._step(

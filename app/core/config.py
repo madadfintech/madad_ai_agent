@@ -142,6 +142,14 @@ class McpSettings(BaseModel):
     # Tool names safe to retry transparently. Reads are always safe; payment write
     # tools are safe because Ishan now honours an ``idempotency_key`` parameter.
     idempotent_tools: set[str] = Field(default_factory=set)
+    # Per-tool timeout override (seconds). UAT 2026-06-16 (+918287611995):
+    # ``madad_invoices_extract_and_submit_invoice_base64`` does OCR + extract
+    # + submit in one backend round-trip — it routinely needs 60-90s on real
+    # invoices, far above the default 10-30s budget. Heavy tools listed here
+    # get a longer asyncio.wait_for budget AND the underlying fastmcp.Client
+    # is created with ``max(timeout_seconds, max(tool_timeouts.values()))``
+    # so the underlying httpx transport doesn't kill the call first.
+    tool_timeouts: dict[str, float] = Field(default_factory=dict)
 
 
 class SecuritySettings(BaseModel):

@@ -48,6 +48,13 @@ def _default_tool_timeouts() -> dict[str, float]:
         Tools.INVOICES_EXTRACT_AND_SUBMIT_INVOICE_BASE64: 120.0,
         Tools.INVOICES_EXTRACT_AND_SUBMIT_INVOICE: 120.0,
         Tools.INVOICES_UPLOAD_ZIP: 180.0,  # ZIPs can carry many invoices
+        # UAT 2026-06-16 (#3 + #4): the new extract-only / submit-with-
+        # fields tools also OCR a PDF and benefit from the same budget.
+        # 120s covers the observed tail comfortably for both halves.
+        Tools.INVOICES_EXTRACT_INVOICE_BASE64: 120.0,
+        Tools.INVOICES_EXTRACT_INVOICE: 120.0,
+        Tools.INVOICES_SUBMIT_INVOICE_BASE64: 120.0,
+        Tools.INVOICES_SUBMIT_INVOICE: 120.0,
         # KYC classify path is also OCR-heavy; the docs loop already wraps
         # it in its own 50s wait_for but the underlying MCP layer should
         # not pre-empt that with a 30s cap.

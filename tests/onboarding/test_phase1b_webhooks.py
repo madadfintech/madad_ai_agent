@@ -238,6 +238,68 @@ async def test_unknown_phase1b_event_is_dropped_silently(harness) -> None:
     assert "onboarding.disbursement.received" not in harness.messenger.templates()
 
 
+async def _drive_to_journey_wait(harness) -> None:
+    """Drive a fresh run all the way to journey_wait_await (post-handoff)."""
+    runtime = harness.platform.runtime
+
+    async def resume(message):
+        return await runtime.resume(WA, IDENTITY, message=message)
+
+    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
+    await resume({"text": "YES"})
+    await resume({"text": "biz@example.com"})
+    await resume({"attachments": [{"filename": "CR.pdf", "content_base64": DOC}]})
+    await resume({"attachments": [{"filename": "Audited.pdf", "content_base64": DOC}]})
+    await resume({"event": "prequalification.completed", "madadScore": 78})
+    await resume(
+        {"attachments": [{"filename": "Establishment.pdf", "content_base64": DOC}]}
+    )
+    harness.identity.journey_status = "QUALIFIED"
+    await resume({"event": "madad_score.ready", "journey_status": "QUALIFIED"})
+    await resume({"type": "payment", "paid": True})
+    harness.identity.journey_status = "ACCEPTED"
+    await resume({"type": "status_update"})
+    harness.identity.journey_status = "OFFER_ACCEPTED"
+    await resume({"type": "status_update"})
+
+
+async def test_disbursement_at_journey_wait_still_updates_ledger(harness) -> None:
+    """UAT 2026-06-16 (PM audit P0): a Phase 1.b webhook misrouted to
+    a non-invoice wait node used to be silently dropped, losing the
+    disbursement record. The new safety seam ensures the ledger AND
+    SME-facing template still fire from journey_wait_await without
+    forcing the run to jump to invoice_collect_await."""
+    await _drive_to_journey_wait(harness)
+    runtime = harness.platform.runtime
+    # Confirm via the run record that we're at journey_wait_await.
+    session = await runtime.sessions.get(WA, IDENTITY)
+    assert session is not None and session.active_run_id
+    run_before = await runtime.run_store.get(session.active_run_id)
+    assert run_before.current_step == "journey_wait_await"
+
+    await runtime.resume(
+        WA, IDENTITY,
+        message=_emit("transaction.disbursed", {
+            "invoiceNumber": "INV-misrouted",
+            "disbursedAmount": 25000,
+            "utr": "UTR-9999",
+            "currency": "QAR",
+        }),
+    )
+
+    # Ledger updated even though we weren't at invoice_collect_await.
+    snap_after = await _snapshot(runtime)
+    disbursements = snap_after.values["disbursements_received"]
+    assert len(disbursements) == 1
+    assert disbursements[0]["invoice_ref"] == "INV-misrouted"
+    assert disbursements[0]["utr"] == "UTR-9999"
+    # Template fired (SME notified).
+    assert "onboarding.disbursement.received" in harness.messenger.templates()
+    # AND the run stayed at journey_wait_await — we didn't force a node jump.
+    run_after = await runtime.run_store.get(session.active_run_id)
+    assert run_after.current_step == "journey_wait_await"
+
+
 async def test_translate_marks_phase1b_event() -> None:
     """``translate_backend_event`` distinguishes Phase 1.b events from
     status_updates so ``_invoice_collect_await`` can branch reliably."""

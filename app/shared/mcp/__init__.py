@@ -12,8 +12,13 @@ from __future__ import annotations
 from .client import (
     HttpMCPClient,
     InMemoryMCPClient,
+    MCPAuthError,
+    MCPBackendError,
     MCPClient,
+    MCPConflictError,
     MCPError,
+    MCPNotFoundError,
+    MCPTimeoutError,
     MCPToolCaller,
 )
 from .provider import get_mcp_client
@@ -22,8 +27,13 @@ from .registry import Tools
 __all__ = [
     "HttpMCPClient",
     "InMemoryMCPClient",
+    "MCPAuthError",
+    "MCPBackendError",
     "MCPClient",
+    "MCPConflictError",
     "MCPError",
+    "MCPNotFoundError",
+    "MCPTimeoutError",
     "MCPToolCaller",
     "Tools",
     "get_mcp_client",

@@ -1160,10 +1160,18 @@ def _looks_like_transport_timeout(exc: BaseException) -> bool:
     Used to drive an honest invoice-failure message — when the MCP cluster
     timed out, the SME's file is fine and we should say so instead of
     asking them to resend.
-    """
+
+    Prefers the typed ``MCPTimeoutError`` raised by the MCP client (the
+    classifier handles asyncio.TimeoutError + transport-disconnect
+    markers uniformly), falls back to the original string-scan for
+    paths that haven't gone through ``call_tool`` (local-zip code,
+    etc.)."""
 
     cur: BaseException | None = exc
     while cur is not None:
+        from app.shared.mcp import MCPTimeoutError
+        if isinstance(cur, MCPTimeoutError):
+            return True
         # asyncio.TimeoutError is the canonical wait_for cancellation.
         if isinstance(cur, asyncio.TimeoutError | TimeoutError):
             return True
@@ -1756,13 +1764,19 @@ def _next_step_hint(state: OnboardingState) -> str:
 def _is_conflict_error(exc: BaseException) -> bool:
     """True if any link in the exception's cause chain reports HTTP 409.
 
-    The MCP client wraps backend HTTP failures as ``MCPError("MCP tool
-    failed after N attempt(s)")`` with the underlying ``ToolError`` set as
-    ``__cause__``; the upstream status code is embedded in that cause's
-    message string (e.g. ``Madad API returned HTTP 409``).
+    The MCP client classifier promotes 409s to ``MCPConflictError``
+    (preferred path); the legacy string-scan stays as a fallback so
+    callers that pre-date the typed errors still work.
     """
-    seen: set[int] = set()
+    from app.shared.mcp import MCPConflictError
     cur: BaseException | None = exc
+    while cur is not None:
+        if isinstance(cur, MCPConflictError):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    # Fall through to the legacy string-scan for non-MCPError paths.
+    seen: set[int] = set()
+    cur = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
         message = str(cur)
@@ -4401,6 +4415,17 @@ class OnboardingWorkflow(WorkflowDefinition):
         # implied journey_status; capture it so the next poll routes
         # immediately rather than waiting for the backend to catch up.
         payload = await_input({"waiting_for": "journey_status", "step": "journey_wait"})
+        # UAT 2026-06-16 (PM audit P0): a Phase 1.b webhook (disbursed
+        # /repayment.*) misrouted here used to be silently re-parked,
+        # losing the ledger update. Route it through the apply seam so
+        # the SME-facing template still fires + state.disbursements /
+        # repayments / outstanding still update, while staying at
+        # journey_wait_await rather than forcing a node jump to
+        # invoice_collect_await.
+        if isinstance(payload, dict) and payload.get("type") == "phase1b_event":
+            return await self._apply_phase1b_event_to_state(
+                state, ctx, payload, target_step="journey_wait_await",
+            )
         help_template = _off_script_template(payload)
         if help_template is not None:
             await self._send(
@@ -4933,6 +4958,15 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         payload = await_input({"waiting_for": "journey_status", "step": "lender_wait"})
+        # UAT 2026-06-16 (PM audit P0): same Phase 1.b safety net as
+        # journey_wait_await. Backend should not normally fire a Phase
+        # 1.b event at this stage, but if it does (delayed delivery,
+        # race condition), update the ledger + render the SME-facing
+        # template rather than silently dropping the data.
+        if isinstance(payload, dict) and payload.get("type") == "phase1b_event":
+            return await self._apply_phase1b_event_to_state(
+                state, ctx, payload, target_step="lender_wait_await",
+            )
         help_template = _off_script_template(payload)
         if help_template is not None:
             await self._send(
@@ -6001,8 +6035,39 @@ class OnboardingWorkflow(WorkflowDefinition):
         ctx: WorkflowContext,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        """Dispatch the 6 Phase 1.b webhook events to their SME-facing
-        templates and update the local invoice/repayment ledger.
+        """Dispatch a Phase 1.b webhook (canonical entry from
+        ``_invoice_collect_await``). Renders the SME-facing template +
+        updates the ledger, then returns the agent to
+        ``invoice_collect_await``.
+
+        Other wait nodes (journey/lender) call
+        :meth:`_apply_phase1b_event_to_state` instead so a misrouted
+        webhook doesn't force them to leave their current step.
+        """
+        return await self._apply_phase1b_event_to_state(
+            state, ctx, payload, target_step="invoice_collect_await",
+        )
+
+    async def _apply_phase1b_event_to_state(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        payload: dict[str, Any],
+        *,
+        target_step: str,
+    ) -> dict[str, Any]:
+        """Render the SME-facing template + update the ledger from a
+        Phase 1.b webhook payload, returning a ``_step`` result with
+        ``target_step``. This lets non-canonical wait nodes process
+        the event without forcing a node change.
+
+        UAT 2026-06-16 (PM audit): backend SHOULD only fire Phase 1.b
+        events after credit_line.activated when the SME is parked at
+        invoice_collect_await. But race conditions (delayed
+        credit_line.activated; SME mid-journey when a backend retry
+        fires) could land the event at journey_wait_await or
+        lender_wait_await — without this seam those nodes silently
+        re-parked and the ledger update was lost.
 
         ``payload`` carries ``event`` (the backend event_type) plus all
         the webhook's fields verbatim — amount, ref, due_date, etc. The
@@ -6176,12 +6241,17 @@ class OnboardingWorkflow(WorkflowDefinition):
             # Defensive — unknown phase1b event, stay parked silently.
             ctx.logger.warning("phase1b_event.unknown", event=event)
 
+        # Thread ``last_status_source`` from the payload so the poller's
+        # suppression-window logic still applies (a webhook just arrived
+        # → skip the next 1-2 cadence ticks). Phase 1.b events from the
+        # dispatcher always carry source="webhook".
         return self._step(
-            "invoice_collect_await",
+            target_step,
             ctx,
             disbursements_received=disbursements,
             repayments_recorded=repayments,
             repayment_outstanding_qar=outstanding,
+            last_status_source=_extract_status_source(payload),
         )
 
     # -- routers --------------------------------------------------------------

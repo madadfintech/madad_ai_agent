@@ -368,3 +368,91 @@ def test_build_fastmcp_client_iam_uses_injected_fetcher():
     client = _build_fastmcp_client(settings, iam_token_fetcher=fake_fetcher)
     # The Client's auth must trigger the fetcher when the first request runs.
     assert hasattr(client, "transport")  # construction succeeded
+
+
+# ---- Typed-error classifier (UAT 2026-06-16 PM audit P1) -----------------
+
+
+async def test_classifier_promotes_timeout_to_MCPTimeoutError() -> None:
+    """asyncio.TimeoutError on the underlying call surfaces as the
+    typed ``MCPTimeoutError`` so workflow nodes can branch on it
+    rather than scanning exception strings."""
+    import asyncio
+
+    from app.core.config import McpSettings
+    from app.shared.mcp import InMemoryMCPClient, MCPTimeoutError
+
+    class _Slow(InMemoryMCPClient):
+        async def _invoke(self, name, payload):
+            await asyncio.sleep(10)
+            return {}
+
+    client = _Slow(settings=McpSettings(timeout_seconds=0.05))
+    try:
+        await client.call_tool("some_tool", {})
+    except MCPTimeoutError:
+        return  # expected
+    raise AssertionError("expected MCPTimeoutError")
+
+
+async def test_classifier_promotes_401_in_message_to_MCPAuthError() -> None:
+    """When the cluster's MadadAPIError carries a 401 status and the
+    fastmcp wrapping embeds ``HTTP 401`` in the error message, the
+    classifier promotes it to ``MCPAuthError``."""
+    from app.shared.mcp import InMemoryMCPClient, MCPAuthError
+
+    class _Auth(InMemoryMCPClient):
+        async def _invoke(self, name, payload):
+            raise RuntimeError("Madad API returned HTTP 401: token expired")
+
+    try:
+        await _Auth().call_tool("any_tool", {})
+    except MCPAuthError:
+        return
+    raise AssertionError("expected MCPAuthError")
+
+
+async def test_classifier_promotes_409_to_MCPConflictError() -> None:
+    from app.shared.mcp import InMemoryMCPClient, MCPConflictError
+
+    class _Dupe(InMemoryMCPClient):
+        async def _invoke(self, name, payload):
+            raise RuntimeError("Madad API returned HTTP 409: duplicate")
+
+    try:
+        await _Dupe().call_tool("add_buyer", {})
+    except MCPConflictError:
+        return
+    raise AssertionError("expected MCPConflictError")
+
+
+async def test_classifier_promotes_5xx_to_MCPBackendError() -> None:
+    from app.shared.mcp import InMemoryMCPClient, MCPBackendError
+
+    class _Boom(InMemoryMCPClient):
+        async def _invoke(self, name, payload):
+            raise RuntimeError("Madad API returned HTTP 503: service unavailable")
+
+    try:
+        await _Boom().call_tool("any_tool", {})
+    except MCPBackendError:
+        return
+    raise AssertionError("expected MCPBackendError")
+
+
+async def test_classifier_falls_back_to_plain_MCPError() -> None:
+    """Unmappable errors stay as plain ``MCPError`` so existing
+    ``except MCPError`` callers keep working unchanged."""
+    from app.shared.mcp import InMemoryMCPClient, MCPError
+
+    class _Weird(InMemoryMCPClient):
+        async def _invoke(self, name, payload):
+            raise RuntimeError("totally unrelated failure")
+
+    try:
+        await _Weird().call_tool("any_tool", {})
+    except MCPError as exc:
+        # Must NOT be one of the subclasses.
+        assert type(exc).__name__ == "MCPError"
+        return
+    raise AssertionError("expected MCPError")

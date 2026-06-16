@@ -51,6 +51,123 @@ class MCPError(UpstreamError):
     code = "mcp_error"
 
 
+class MCPTimeoutError(MCPError):
+    """Transport / per-tool timeout — the cluster never responded.
+
+    Raised when ``asyncio.wait_for`` cancels the call, when the
+    underlying transport raises an asyncio.TimeoutError, or when
+    fastmcp surfaces a "deadline exceeded" disconnect.
+    """
+
+    code = "mcp_timeout"
+
+
+class MCPAuthError(MCPError):
+    """Backend rejected the call as unauthorised (HTTP 401 / 403).
+
+    Surfaced by the cluster as ``MadadAPIError(status_code=401)``;
+    callers can catch this specifically to refresh the access token
+    and retry instead of failing the whole node.
+    """
+
+    code = "mcp_auth"
+
+
+class MCPConflictError(MCPError):
+    """Backend reported the resource already exists or the write is a
+    duplicate (HTTP 409). Common for ``add_buyer`` / ``add_shareholders``
+    when the SME has already been onboarded with the same details.
+    """
+
+    code = "mcp_conflict"
+
+
+class MCPNotFoundError(MCPError):
+    """Backend reported the target resource doesn't exist (HTTP 404).
+
+    Almost always a programming error (referring to a non-existent
+    payment_id, document_id, etc.) — callers should fail loudly
+    rather than silently retry.
+    """
+
+    code = "mcp_not_found"
+
+
+class MCPBackendError(MCPError):
+    """Backend returned a 5xx — the cluster reached it but Madad's
+    server failed. Retry MAY help (transient infra hiccup); callers
+    that retry must be idempotent."""
+
+    code = "mcp_backend_error"
+
+
+# Markers used to classify exceptions raised by the underlying
+# transport (fastmcp + httpx) when the response body / message isn't
+# structured. Lowercase for case-insensitive matching.
+_TIMEOUT_MARKERS = (
+    "timed out", "timeout", "deadline exceeded",
+    "connection closed", "connection reset", "stream closed",
+    "transport closed", "broken pipe", "remote disconnected",
+)
+
+
+def _status_code_from_exception(exc: BaseException) -> int | None:
+    """Walk an exception's cause chain looking for an HTTP status code.
+
+    The cluster's ``MadadAPIError`` carries the upstream status code as
+    ``exc.status_code`` (and we re-stringify it into the message in the
+    form ``"Madad API returned HTTP 401"``). fastmcp's ToolError just
+    embeds the formatted message, so we look at both."""
+    cur: BaseException | None = exc
+    while cur is not None:
+        code = getattr(cur, "status_code", None)
+        if isinstance(code, int):
+            return code
+        msg = str(cur)
+        import re
+        m = re.search(r"HTTP (\d{3})", msg)
+        if m:
+            try:
+                return int(m.group(1))
+            except (TypeError, ValueError):
+                pass
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
+def _classify_mcp_error(
+    tool_name: str, attempts: int, exc: Exception,
+) -> MCPError:
+    """Wrap a raw transport/cluster exception in the most specific
+    MCPError subclass we can determine. Falls back to plain MCPError
+    when nothing matches so callers using ``except MCPError`` continue
+    to work."""
+
+    details = {"tool": tool_name, "attempts": attempts}
+    msg = f"MCP tool {tool_name!r} failed after {attempts} attempt(s)"
+
+    # Timeout — both asyncio + transport-disconnect surface as same UX.
+    if isinstance(exc, asyncio.TimeoutError | TimeoutError):
+        return MCPTimeoutError(msg, details=details)
+    exc_msg_lower = str(exc).lower()
+    if any(marker in exc_msg_lower for marker in _TIMEOUT_MARKERS):
+        return MCPTimeoutError(msg, details=details)
+
+    status = _status_code_from_exception(exc)
+    if status is not None:
+        details["status_code"] = status
+        if status in (401, 403):
+            return MCPAuthError(msg, details=details)
+        if status == 404:
+            return MCPNotFoundError(msg, details=details)
+        if status == 409:
+            return MCPConflictError(msg, details=details)
+        if 500 <= status < 600:
+            return MCPBackendError(msg, details=details)
+
+    return MCPError(msg, details=details)
+
+
 @runtime_checkable
 class MCPToolCaller(Protocol):
     """Structural interface the service gateways/adapters depend on."""
@@ -105,10 +222,19 @@ class MCPClient(ABC):
                     break
                 await self._sleep(delay)
                 delay = min(delay * 2, self._settings.retry_max_delay_seconds)
-        raise MCPError(
-            f"MCP tool {name!r} failed after {attempts} attempt(s)",
-            details={"tool": name, "attempts": attempts},
-        ) from last_error
+        # Classify the underlying exception into the most specific
+        # MCPError subclass we can determine. Falls back to plain
+        # MCPError when nothing matches so callers using
+        # ``except MCPError`` continue to work unchanged.
+        wrapped = (
+            _classify_mcp_error(name, attempts, last_error)
+            if last_error is not None
+            else MCPError(
+                f"MCP tool {name!r} failed after {attempts} attempt(s)",
+                details={"tool": name, "attempts": attempts},
+            )
+        )
+        raise wrapped from last_error
 
     @abstractmethod
     async def _invoke(self, name: str, payload: dict[str, Any]) -> dict[str, Any]: ...

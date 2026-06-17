@@ -45,14 +45,16 @@ def _default_tool_timeouts() -> dict[str, float]:
     """
 
     return {
-        Tools.INVOICES_EXTRACT_AND_SUBMIT_INVOICE_BASE64: 120.0,
-        Tools.INVOICES_EXTRACT_AND_SUBMIT_INVOICE: 120.0,
-        Tools.INVOICES_UPLOAD_ZIP: 180.0,  # ZIPs can carry many invoices
-        # UAT 2026-06-16 (#3 + #4): the new extract-only / submit-with-
-        # fields tools also OCR a PDF and benefit from the same budget.
-        # 120s covers the observed tail comfortably for both halves.
-        Tools.INVOICES_EXTRACT_INVOICE_BASE64: 120.0,
-        Tools.INVOICES_EXTRACT_INVOICE: 120.0,
+        # UAT 2026-06-17 (+919497191690): SME's extract calls failed with
+        # "We couldn't read the file" after ~90s. The web portal handles
+        # the SAME invoice fine — confirming OCR is slow but works given
+        # enough time. Bump extract budget to 180s so the agent's call
+        # window matches what the OCR backend actually needs.
+        Tools.INVOICES_EXTRACT_AND_SUBMIT_INVOICE_BASE64: 180.0,
+        Tools.INVOICES_EXTRACT_AND_SUBMIT_INVOICE: 180.0,
+        Tools.INVOICES_UPLOAD_ZIP: 240.0,  # ZIPs can carry many invoices
+        Tools.INVOICES_EXTRACT_INVOICE_BASE64: 180.0,
+        Tools.INVOICES_EXTRACT_INVOICE: 180.0,
         Tools.INVOICES_SUBMIT_INVOICE_BASE64: 120.0,
         Tools.INVOICES_SUBMIT_INVOICE: 120.0,
         # KYC classify path is also OCR-heavy; the docs loop already wraps

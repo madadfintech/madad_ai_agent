@@ -253,7 +253,9 @@ _TEMPLATE_BODIES = {
     # SME sent a ZIP and was wordy / unprofessional. Now generic, short,
     # and channel-agnostic so it fits both single-file and ZIP uploads.
     "onboarding.documents.processing": (
-        "📄 Got it — validating your document(s) now…"
+        "📄 Got it — please wait while we process your document(s). "
+        "It may take up to 10 minutes.\n\n"
+        "Thank you for being with us. ☕"
     ),
     # Final fallback sent at the end of the docs loop when neither the
     # classifier nor the local-unzip pipeline could land a single file the
@@ -282,6 +284,18 @@ _TEMPLATE_BODIES = {
         "We will update you as soon as financing offers are received — typically "
         "within 3–5 business days. 📲\n\n"
         "Track your status at uat-portal.madadfintech.com (Ref: {{ ref }})"
+    ),
+    # UAT 2026-06-17 RCA fix: sent when the admin marks the user as
+    # ``qualified.waived`` (qualified + onboarding fee waived). Replaces
+    # the silent-advance behaviour added on 2026-06-16 — backend does not
+    # actually send a customer-facing waiver message, so the SME was
+    # left in silence after the coffee message.
+    "onboarding.qualified.waived": (
+        "🎊 Great news — you're qualified!\n\n"
+        "Your onboarding fee has been waived, so there's nothing to pay. "
+        "Your application is now being reviewed by our lender partners — "
+        "we'll send you their offers as soon as they're ready. 📲\n\n"
+        "For any query, call +974 3017 3888."
     ),
     "onboarding.not_qualified": (
         "Unfortunately your application wasn't accepted by our lender "

@@ -219,6 +219,11 @@ class OnboardingState(WorkflowState):
 
     # Step 7–8: payment + offers.
     paid: bool = False
+    # UAT 2026-06-17 (+919497191690 screenshot): the status poller can
+    # re-enter ``_payment_await`` with paid=True after the run advanced,
+    # firing ``onboarding.payment.confirmed`` a second time. One-shot
+    # flag so the SME never sees two "Payment received" messages.
+    payment_confirmed_sent: bool = False
     offers: list[dict[str, Any]] = []
     selected_offer: dict[str, Any] | None = None
     # One-time guard for the ✅ "offer selected" confirmation so a later
@@ -229,6 +234,13 @@ class OnboardingState(WorkflowState):
     # every ~minute; this lets us re-send the offer cards ONLY when a new lender
     # actually adds an offer, not on every routine poll.
     offers_shown_sig: str | None = None
+    # UAT 2026-06-17: parallel sig but for the preview-cards node. Without
+    # this guard ``_offer_view_send`` re-sent the cards 40s apart when the
+    # poller re-entered the route before ``_offer_handoff_to_madad`` (the
+    # only writer of ``offers_shown_sig``) had recorded the sig. We can't
+    # share the sig field because that would suppress the handoff node's
+    # one-shot send.
+    offers_preview_shown_sig: str | None = None
 
     # -- Step 5: monetization payment (Phase 3 will populate) ----------------
     business_details_id: str | None = None
@@ -262,6 +274,16 @@ class OnboardingState(WorkflowState):
     # backend is the source of truth — this is the agent's optimistic mirror
     # so the message can render a number without an extra read.
     repayment_outstanding_qar: int | None = None
+
+    # UAT 2026-06-17 (+919497191690 screenshot 2:58/2:59 PM): SME saw
+    # the "Got your invoice — reading it now…" ack TWICE 64s apart for
+    # ONE upload. Same root cause as the duplicate failure 53s after —
+    # Meta/WhatsApp delivered the same attachment twice (or the bridge
+    # fanned it out). Fingerprint the most recent invoice attempt so a
+    # second arrival of the SAME content within the dedupe window is
+    # silently dropped (no ack, no extract call, no failure message).
+    last_invoice_attempt_sig: str | None = None
+    last_invoice_attempt_at: str | None = None
 
     # UAT 2026-06-16 (#3): single-invoice confirm-card flow staging.
     # When the SME sends a PDF, we extract (no submit) → render the

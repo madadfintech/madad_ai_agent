@@ -90,15 +90,18 @@ async def test_qualified_waived_at_payment_wait_skips_payment_chain(harness) -> 
     payload = translate_backend_event("qualified.waived", {})
     await runtime.resume(WA, identity, message=payload)
 
-    # No agent-side payment message — backend owns the waiver notice.
+    # No "payment received" template — that would mislead the SME.
     pay_templates_after = [
         t for t in harness.messenger.templates()
         if t.startswith("onboarding.payment.")
     ]
     assert pay_templates_after == pay_templates_before, (
-        "Agent must stay silent on qualified.waived; "
+        "Agent must NOT send onboarding.payment.* on qualified.waived; "
         f"new payment templates: {set(pay_templates_after) - set(pay_templates_before)}"
     )
+    # UAT 2026-06-17 RCA: SME MUST see the waiver-qualified message so
+    # they're not left in silence after the coffee message.
+    assert "onboarding.qualified.waived" in harness.messenger.templates()
     # Payment chain (TESS link create+send) MUST NOT have run.
     payment_calls = [name for name, _ in harness.payments.calls]
     assert "create_monetization_payment" not in payment_calls
@@ -208,6 +211,8 @@ async def test_waive_off_at_payment_await_e2e_no_msg_then_offers(make_harness) -
         f"agent must NOT send onboarding.payment.* on qualified.waived; "
         f"got: {payment_templates_after}"
     )
+    # UAT 2026-06-17 RCA: SME MUST get the waiver-qualified message.
+    assert "onboarding.qualified.waived" in harness.messenger.templates()
 
     # Now backend fires offers.available — offer card MUST render.
     harness.identity.journey_status = "ACCEPTED"
@@ -252,6 +257,8 @@ async def test_waive_off_at_payment_wait_e2e_no_msg_then_offers(harness) -> None
     new_templates = set(harness.messenger.templates()) - templates_before
     payment_templates_after = {t for t in new_templates if t.startswith("onboarding.payment.")}
     assert payment_templates_after == set()
+    # UAT 2026-06-17 RCA: SME MUST get the waiver-qualified message.
+    assert "onboarding.qualified.waived" in harness.messenger.templates()
 
     # Now offers.available — offer card renders.
     harness.identity.journey_status = "ACCEPTED"
@@ -302,6 +309,8 @@ async def test_waive_off_at_docs_loop_e2e_no_msg_then_offers(harness) -> None:
     new_templates = set(harness.messenger.templates()) - templates_before
     payment_templates_after = {t for t in new_templates if t.startswith("onboarding.payment.")}
     assert payment_templates_after == set()
+    # UAT 2026-06-17 RCA: SME MUST get the waiver-qualified message.
+    assert "onboarding.qualified.waived" in harness.messenger.templates()
 
     harness.identity.journey_status = "ACCEPTED"
     harness.identity._users_by_phone[identity] = "user-wv-docs"  # type: ignore[union-attr]

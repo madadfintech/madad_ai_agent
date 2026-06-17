@@ -70,6 +70,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import io
 import os
 import re
@@ -139,6 +140,7 @@ TEMPLATE_KEYS = [
     "onboarding.status.pending",
     "onboarding.payment.awaiting",
     "onboarding.payment.confirmed",
+    "onboarding.qualified.waived",
     "onboarding.not_qualified",
     "onboarding.payment.request",
     "onboarding.payment.request.button",
@@ -1329,6 +1331,11 @@ def _parse_shareholder_text(text: str, fallback_phone: str | None) -> list[dict[
 # messages in 3 seconds. 30s covers a typical multi-file burst plus a small
 # buffer; anything older is treated as a fresh batch and re-fires the ack.
 DOCS_PROCESSING_ACK_TTL_SECONDS = 30.0
+# UAT 2026-06-17: invoice attachment dedupe window. If the SAME content
+# fingerprint arrives again within this window, treat it as a delivery
+# retry (Meta/WhatsApp or our bridge fanning out) and silently drop —
+# no second ack, no second extract call, no second failure message.
+INVOICE_ATTEMPT_DEDUPE_SECONDS = 300.0
 # Single isolated file → prompt inline immediately (like a ZIP), no 45s sweep
 # wait (user 2026-06-13). A wave counts as isolated when it carries one
 # attachment AND the previous upload was either the first ever or this far in
@@ -1603,6 +1610,42 @@ def _extract_credit_line_from_me(info: Any) -> dict[str, Any]:
             if isinstance(first, dict):
                 return first
     return {}
+
+
+def _invoice_attempt_sig(attachments: list[dict[str, Any]]) -> str:
+    """Stable fingerprint of the attachment SET so a retried delivery is
+    recognised without re-running extract. We hash a compact descriptor —
+    filename + content-prefix per attachment — rather than full bytes, so
+    a 5MB upload doesn't add 5MB to state on every receipt."""
+    parts: list[str] = []
+    for a in attachments or []:
+        if not isinstance(a, dict):
+            continue
+        fn = (a.get("filename") or "").strip().lower()
+        # Sample the first 4KB of the content — enough to make collisions
+        # functionally impossible across distinct uploads while staying small.
+        content = (a.get("content_base64") or "")[:4096]
+        parts.append(f"{fn}|{content}")
+    payload = "\n".join(sorted(parts))
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()[:32]
+
+
+def _is_recent_invoice_retry(
+    state: OnboardingState, sig: str, now: datetime
+) -> bool:
+    """True iff the same invoice fingerprint was just processed within the
+    dedupe window. Survives a checkpoint replay so a poller-driven re-resume
+    after the original send STILL recognises the duplicate."""
+    if not sig or sig != (state.last_invoice_attempt_sig or ""):
+        return False
+    raw = state.last_invoice_attempt_at
+    if not raw:
+        return False
+    try:
+        prev = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return (now - prev).total_seconds() < INVOICE_ATTEMPT_DEDUPE_SECONDS
 
 
 def _offers_sig(offers: list[dict[str, Any]]) -> str:
@@ -3545,11 +3588,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "documents"})
-        # UAT 2026-06-16 (afternoon): ``qualified.waived`` can land here
-        # if the admin waived the fee while the SME was still in the
-        # docs loop. Backend already sent its own waiver message, so
-        # advance silently with paid=True + documents_received=True
-        # (skips the rest of the checklist + the payment chain).
+        # UAT 2026-06-17 (RCA on +919497191690): ``qualified.waived`` can
+        # land here if the admin waived the fee while the SME was still in
+        # the docs loop. We previously advanced silently on the assumption
+        # backend would send its own waiver message — it doesn't. Send the
+        # waiver-qualified message ourselves so the SME doesn't stare at
+        # the coffee message forever, then advance with paid=True.
         if (
             isinstance(reply, dict)
             and reply.get("type") == "payment"
@@ -3558,6 +3602,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
+            await self._send(ctx, state, "onboarding.qualified.waived")
             progress_step = await self._update_progress(state, ctx, step=5)
             fields: dict[str, Any] = {
                 "missing_documents": list(state.missing_documents),
@@ -4342,17 +4387,17 @@ class OnboardingWorkflow(WorkflowDefinition):
         # PARK after the coffee message until the payment step is triggered
         # (Postman in the demo). Capture the Madad score from the trigger payload.
         payload = await_input({"waiting_for": "payment_ready", "step": "payment_wait"})
-        # UAT 2026-06-16 (afternoon): ``qualified.waived`` lands here
-        # as the dispatcher-translated ``{type: payment, paid: True,
-        # event: qualified.waived, ...}`` payload (same shape as
-        # ``payment.completed``). Mark the fee satisfied + jump to the
-        # lender phase via the route. NO SME-facing message — backend
-        # already sent its own waiver WhatsApp.
+        # UAT 2026-06-17 (RCA on +919497191690): ``qualified.waived`` lands
+        # here as ``{type: payment, paid: True, event: qualified.waived}``.
+        # Previously we advanced silently on the assumption backend would
+        # send its own waiver WhatsApp — it doesn't. Send the waiver-
+        # qualified message ourselves before jumping to the lender phase.
         if (
             isinstance(payload, dict)
             and payload.get("type") == "payment"
             and bool(payload.get("paid"))
         ):
+            await self._send(ctx, state, "onboarding.qualified.waived")
             return self._step(
                 "payment_wait_await", ctx,
                 paid=True, payment_ready=True,
@@ -4843,17 +4888,18 @@ class OnboardingWorkflow(WorkflowDefinition):
                 paid=True,
                 last_status_source="poll",
             )
-        # UAT 2026-06-16 (afternoon, Madad note): ``qualified.waived``
+        # UAT 2026-06-17 (RCA on +919497191690): ``qualified.waived``
         # comes in as ``{type: payment, paid: True, event:
         # qualified.waived}`` — same paid=True signal as payment.completed
-        # but the SME hasn't actually paid anything. Backend sends its
-        # own waiver WhatsApp; the agent must NOT also fire
-        # ``onboarding.payment.confirmed`` (which would say "Thank you
-        # — payment received!"). Advance silently, same end-state.
+        # but the SME hasn't actually paid anything. We must NOT send
+        # ``onboarding.payment.confirmed`` (which would falsely say
+        # "Thank you — payment received!"). Send the dedicated waiver
+        # template so the SME isn't left in silence, then advance.
         event_marker = (
             str(result.get("event")) if isinstance(result, dict) else ""
         )
         if paid and event_marker == "qualified.waived":
+            await self._send(ctx, state, "onboarding.qualified.waived")
             return self._step(
                 "payment_await", ctx,
                 paid=True,
@@ -4863,6 +4909,13 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
+            # UAT 2026-06-17 (+919497191690 screenshot 2:55 PM): the SME saw
+            # TWO "🎉 Payment received" messages 1.3s apart — the status
+            # poller re-entered ``payment_await`` while paid was already
+            # True. Idempotency guard: only send the confirmed template
+            # ONCE per run; later wakes still set state but stay silent.
+            if state.payment_confirmed_sent:
+                return self._step("payment_await", ctx, paid=paid)
             # Step 7 — payment received, application forwarded to banks.
             await self._update_progress(state, ctx, step=7)
             # A8a: PDF Step 6 — "Thank you — payment received! Forwarded to
@@ -4901,6 +4954,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             return self._step(
                 "payment_await", ctx,
                 paid=paid,
+                payment_confirmed_sent=True,
                 application_ref=ref or state.application_ref,
             )
         return self._step("payment_await", ctx, paid=paid)
@@ -5075,7 +5129,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         # Re-send only when the offer SET changed (a new lender made an offer) —
         # the fast status poller re-enters this route ~every minute while the SME
         # is deciding, and we must not re-spam the same cards each tick.
-        if _offers_sig(state.offers) == state.offers_shown_sig:
+        # UAT 2026-06-17 (+919497191690 screenshot 9:26/9:27): the offer
+        # cards re-fired 40s apart because ``offers_shown_sig`` was only
+        # recorded by ``offer_handoff_to_madad`` AFTER the cards went out
+        # — a second poll wake re-entered ``offer_view_send`` before sig
+        # persisted, so the cards re-rendered. Use a SEPARATE sig field
+        # for this node so its idempotency doesn't preempt the handoff
+        # node's one-shot send.
+        if _offers_sig(state.offers) == state.offers_preview_shown_sig:
             return self._step("offer_view_send", ctx)
         await self._send(
             ctx,
@@ -5086,7 +5147,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "offer_cards": _format_offer_cards(state.offers),
             },
         )
-        return self._step("offer_view_send", ctx)
+        return self._step(
+            "offer_view_send", ctx,
+            offers_preview_shown_sig=_offers_sig(state.offers),
+        )
 
     async def _offer_handoff_to_madad(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -5357,6 +5421,18 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             return self._step("invoice_collect_await", ctx)
 
+        # UAT 2026-06-17 (+919497191690 screenshot 2:58/2:59 PM): dedupe
+        # a retried delivery of the SAME attachment(s). The bridge / Meta
+        # sometimes fan one upload out as two inbounds; without this the
+        # SME saw "Got your invoice…" + "We couldn't read the file" twice.
+        sig = _invoice_attempt_sig(attachments)
+        if _is_recent_invoice_retry(state, sig, ctx.clock.now()):
+            ctx.logger.info(
+                "invoice_attempt.deduped", sig=sig,
+                note="silently dropping duplicate inbound within dedupe window",
+            )
+            return self._step("invoice_collect_await", ctx)
+
         # Mint a live token from the verified identity (a long-active user can
         # resume with an empty/expired cached token — same fix as doc uploads).
         token, refresh, expires = await self._live_token(state, ctx)
@@ -5371,12 +5447,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         if non_zip and not has_zip and len(non_zip) == 1:
             return await self._invoice_extract_for_confirm(
                 state, ctx, non_zip[0], token, refresh, expires,
+                attempt_sig=sig,
             )
 
         # Bulk / multi-file / ZIP batch — extract-only per member, render
         # a CSV-style preview, park awaiting APPROVE ALL / EDIT / REMOVE.
         return await self._invoice_bulk_preview(
             state, ctx, attachments, token, refresh, expires,
+            attempt_sig=sig,
         )
 
     async def _invoice_extract_for_confirm(
@@ -5387,6 +5465,8 @@ class OnboardingWorkflow(WorkflowDefinition):
         token: str | None,
         refresh: str | None,
         expires: int | None,
+        *,
+        attempt_sig: str | None = None,
     ) -> dict[str, Any]:
         """UAT 2026-06-16 #3 — single PDF flow.
 
@@ -5397,6 +5477,16 @@ class OnboardingWorkflow(WorkflowDefinition):
         filename = attachment.get("filename") or "invoice.pdf"
         mime = attachment.get("mime_type")
 
+        # UAT 2026-06-17 dedupe: record the attempt timestamp + fingerprint
+        # on every return path so a poll-driven re-resume that re-delivers
+        # the same attachment hits the dedupe check above.
+        attempt_fields: dict[str, Any] = {}
+        if attempt_sig:
+            attempt_fields["last_invoice_attempt_sig"] = attempt_sig
+            attempt_fields["last_invoice_attempt_at"] = (
+                ctx.clock.now().isoformat()
+            )
+
         if not content or not token:
             await self._send(
                 ctx, state, "onboarding.invoice.failed",
@@ -5405,6 +5495,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             return self._step(
                 "invoice_collect_await", ctx,
                 access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
             )
 
         # UAT 2026-06-16 (PM): immediate ack BEFORE the cluster call.
@@ -5443,6 +5534,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             return self._step(
                 "invoice_collect_await", ctx,
                 access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
             )
 
         # UAT 2026-06-16 (PM): guard the empty-extract case. When the
@@ -5471,6 +5563,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             return self._step(
                 "invoice_collect_await", ctx,
                 access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
             )
 
         # Render the confirm card with 3 buttons. Title strings on the
@@ -5487,6 +5580,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             pending_invoice_mime=mime,
             pending_invoice_edit_field=None,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
+            **attempt_fields,
         )
 
     async def _send_invoice_confirm_card(
@@ -5687,6 +5781,8 @@ class OnboardingWorkflow(WorkflowDefinition):
         token: str | None,
         refresh: str | None,
         expires: int | None,
+        *,
+        attempt_sig: str | None = None,
     ) -> dict[str, Any]:
         """UAT 2026-06-16 #4 — bulk ZIP / multi-file preview path.
 
@@ -5696,6 +5792,17 @@ class OnboardingWorkflow(WorkflowDefinition):
         Rows are flagged when extraction is unreliable OR when batch
         total > available credit limit (priority-order note follows).
         """
+        # UAT 2026-06-17 dedupe: record the attempt sig + timestamp on
+        # state via the first ``self._step`` return path so the routing
+        # fork recognises a redelivered ZIP within the dedupe window. The
+        # remaining return paths inherit the marker via state merge.
+        attempt_fields: dict[str, Any] = {}
+        if attempt_sig:
+            attempt_fields["last_invoice_attempt_sig"] = attempt_sig
+            attempt_fields["last_invoice_attempt_at"] = (
+                ctx.clock.now().isoformat()
+            )
+
         members, saw_zip = _expand_zip_attachments(attachments)
         if not members:
             await self._send(
@@ -5705,6 +5812,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             return self._step(
                 "invoice_collect_await", ctx,
                 access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
             )
 
         batch: list[dict[str, Any]] = []

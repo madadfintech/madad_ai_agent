@@ -208,6 +208,15 @@ class OnboardingState(WorkflowState):
     # audited report) and the payment step (after the coffee message) are each
     # released by an external trigger rather than auto-advancing.
     prequalified: bool = False
+    # UAT 2026-06-17 gap fix: when the admin marks the SME as not
+    # pre-qualified the dispatcher sets this flag on the resume payload
+    # and ``_route_prequalify_wait`` jumps to the not-pre-qualified
+    # terminal (silent dead-end otherwise).
+    prequalification_rejected: bool = False
+    # Set True when the CR processing reports the business is registered
+    # outside Qatar. ``cr_upload_base64`` reads is_qatar_based from the
+    # backend response; the next routing tick fires the not-Qatar terminal.
+    not_qatar_based: bool = False
     payment_ready: bool = False
     madad_score: int | None = None
     # Per Ishan (2026-06-07): backend tracks the conversational onboarding

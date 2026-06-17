@@ -142,6 +142,8 @@ TEMPLATE_KEYS = [
     "onboarding.payment.confirmed",
     "onboarding.qualified.waived",
     "onboarding.not_qualified",
+    "onboarding.not_pre_qualified",
+    "onboarding.not_qatar",
     "onboarding.payment.request",
     "onboarding.payment.request.button",
     "onboarding.offers.preview",
@@ -1926,6 +1928,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             "status_poll_on_demand": self._status_poll_on_demand,
             "journey_wait_await": self._journey_wait_await,
             "not_qualified": self._not_qualified,
+            "not_pre_qualified": self._not_pre_qualified,
+            "not_qatar_based": self._not_qatar_based,
             "business_details_fetch": self._business_details_fetch,
             "products_list_fetch": self._products_list_fetch,
             "payment_create": self._payment_create,
@@ -2087,8 +2091,16 @@ class OnboardingWorkflow(WorkflowDefinition):
         graph.add_conditional_edges(
             "prequalify_wait_await",
             self._route_prequalify_wait,
-            {"go": "documents_list_fetch", "wait": "prequalify_wait_await"},
+            {
+                "go": "documents_list_fetch",
+                "wait": "prequalify_wait_await",
+                # UAT 2026-06-17: admin marks SME as not pre-qualified
+                # → fire the dedicated terminal instead of staying parked.
+                "rejected": "not_pre_qualified",
+            },
         )
+        graph.add_edge("not_pre_qualified", "__end__")
+        graph.add_edge("not_qatar_based", "__end__")
         # Buyer + shareholder ASK steps are intentionally skipped — they are not
         # in the spec PDF (shareholders come from the CR; buyers are collected
         # later at invoice submission). Go straight to the document checklist.
@@ -4342,6 +4354,18 @@ class OnboardingWorkflow(WorkflowDefinition):
         # triggered (Postman in the demo). Any user chat meanwhile is answered,
         # not ignored — we never re-send or stall on it.
         payload = await_input({"waiting_for": "prequalification", "step": "prequalify_wait"})
+        # UAT 2026-06-17: pre-qualification REJECTION (admin marks SME as
+        # not pre-qualified) → route to the not-pre-qualified terminal so
+        # the SME gets a clear next-steps message instead of silence.
+        if isinstance(payload, dict) and payload.get("prequalification_rejected"):
+            await self._reminders.suppress(
+                target_ref=state.madad_user_id or ctx.session_id
+            )
+            return self._step(
+                "prequalify_wait_await",
+                ctx,
+                prequalification_rejected=True,
+            )
         if self._is_prequalify_trigger(payload):
             # Step 4 — pre-qualified, full-doc checklist about to be sent.
             progress_step = await self._update_progress(state, ctx, step=4)
@@ -4553,6 +4577,30 @@ class OnboardingWorkflow(WorkflowDefinition):
     ) -> dict[str, Any]:
         await self._send(ctx, state, "onboarding.not_qualified")
         return self._step("not_qualified", ctx, outcome="not_qualified")
+
+    async def _not_pre_qualified(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        # UAT 2026-06-17 gap fix: the SME was parked at prequalify_wait_await
+        # forever when the admin marked the business as not pre-qualified.
+        # Dedicated terminal so they receive a clear next-steps message and
+        # the run completes cleanly (vs a silent dead-end).
+        await self._send(ctx, state, "onboarding.not_pre_qualified")
+        return self._step(
+            "not_pre_qualified", ctx, outcome="not_pre_qualified",
+        )
+
+    async def _not_qatar_based(
+        self, state: OnboardingState, ctx: WorkflowContext
+    ) -> dict[str, Any]:
+        # UAT 2026-06-17 gap fix: terminal for SMEs whose CR shows the
+        # business is registered outside Qatar. Madad's financing is
+        # Qatar-only; we communicate that cleanly instead of dragging the
+        # SME through financials + docs they can never use.
+        await self._send(ctx, state, "onboarding.not_qatar")
+        return self._step(
+            "not_qatar_based", ctx, outcome="not_qatar_based",
+        )
 
     async def _business_details_fetch(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -6496,6 +6544,8 @@ class OnboardingWorkflow(WorkflowDefinition):
         return "await_again"
 
     def _route_prequalify_wait(self, state: OnboardingState) -> str:
+        if state.prequalification_rejected:
+            return "rejected"
         return "go" if state.prequalified else "wait"
 
     def _route_payment_wait(self, state: OnboardingState) -> str:

@@ -301,6 +301,26 @@ _TEMPLATE_BODIES = {
         "Unfortunately your application wasn't accepted by our lender "
         "partners this time. Please reach out to our team."
     ),
+    # UAT 2026-06-17 gap fix: SME parked at prequalify_wait_await when the
+    # admin marked them as not pre-qualified. Send a clear next-steps
+    # message instead of leaving them in silence.
+    "onboarding.not_pre_qualified": (
+        "Thank you for your interest in Madad. After reviewing your "
+        "business profile, we are unable to pre-qualify your application "
+        "for financing at this time.\n\n"
+        "If your situation changes (new financials, new clients, business "
+        "growth), please reach out to us — we're happy to take another look.\n\n"
+        "For any query, call +974 3017 3888."
+    ),
+    # UAT 2026-06-17: terminal for SMEs whose CR shows the business is
+    # registered outside Qatar. Madad's financing is Qatar-only.
+    "onboarding.not_qatar": (
+        "Thank you for reaching out! Unfortunately, Madad's financing is "
+        "available only to businesses registered in Qatar.\n\n"
+        "If your business is currently registered elsewhere, please feel "
+        "free to come back when you have a Qatar entity.\n\n"
+        "For any query, call +974 3017 3888."
+    ),
     # Body shown ABOVE the "Pay QAR … →" CTA button (no raw link — the button
     # carries it). Used for the interactive WhatsApp send.
     "onboarding.payment.request.button": (

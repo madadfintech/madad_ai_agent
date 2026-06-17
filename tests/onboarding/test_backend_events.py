@@ -23,16 +23,21 @@ IDENTITY = "+97455500900"
 # -- Static contract: event taxonomy ----------------------------------------
 
 
-def test_phase1a_event_set_has_ten_canonical_events() -> None:
+def test_phase1a_event_set_has_eleven_canonical_events() -> None:
     # UAT 2026-06-16:
     #   Bug #8 added ``offer.selected`` alongside ``offer.accepted``.
     #   Afternoon: added ``qualified.waived`` — the dispatcher used to
     #   400 it, so a waived SME never advanced into the lender phase.
+    # UAT 2026-06-17:
+    #   Added ``prequalification.rejected`` so the SME doesn't stay
+    #   parked at prequalify_wait_await forever when admin marks them
+    #   as not pre-qualified.
     assert PHASE1A_BACKEND_EVENTS == frozenset(
         {
             "eligibility.updated",
             "documents.completed",
             "prequalification.completed",
+            "prequalification.rejected",
             "madad_score.ready",
             "payment.completed",
             "qualified.waived",
@@ -79,7 +84,7 @@ def test_phase1b_event_set_has_six_canonical_events() -> None:
 
 def test_all_backend_events_is_union_of_phase1a_and_phase1b() -> None:
     assert ALL_BACKEND_EVENTS == PHASE1A_BACKEND_EVENTS | PHASE1B_BACKEND_EVENTS
-    assert len(ALL_BACKEND_EVENTS) == 16  # 10 + 6 (Phase 1.a now includes qualified.waived)
+    assert len(ALL_BACKEND_EVENTS) == 17  # 11 + 6 (Phase 1.a adds prequalification.rejected)
 
 
 # -- Payload translation ----------------------------------------------------

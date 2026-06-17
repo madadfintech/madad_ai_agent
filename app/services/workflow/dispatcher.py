@@ -51,6 +51,12 @@ PHASE1A_BACKEND_EVENTS: frozenset[str] = frozenset(
         "eligibility.updated",
         "documents.completed",
         "prequalification.completed",
+        # UAT 2026-06-17: pre-qualification REJECTION path. Without this
+        # the SME parked at ``prequalify_wait_await`` forever when the
+        # admin marked the business as not pre-qualified. Translated to
+        # ``{type: status_update, prequalification_rejected: True}`` so
+        # ``_prequalify_wait_await`` can route to the terminal node.
+        "prequalification.rejected",
         "madad_score.ready",
         "payment.completed",
         # UAT 2026-06-16 (afternoon): backend fires ``qualified.waived``
@@ -127,6 +133,14 @@ def translate_backend_event(
     """
 
     base: dict[str, Any] = {"last_status_source": "webhook"}
+    if event_type == "prequalification.rejected":
+        # Tag the resume payload so ``_prequalify_wait_await`` routes
+        # to the not-pre-qualified terminal instead of staying parked.
+        return {
+            "type": "status_update", "event": event_type,
+            "prequalification_rejected": True,
+            **base, **payload,
+        }
     if event_type in {"payment.completed", "qualified.waived"}:
         # Both produce the same effect: paid=True so ``_route_payment``
         # (and the new ``_route_payment_wait`` lender-jump) advance the

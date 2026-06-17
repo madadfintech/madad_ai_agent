@@ -36,9 +36,18 @@ WA = Channel.WHATSAPP
 
 # ---- 1. campaign/start idempotency --------------------------------------
 
-def test_campaign_start_cancels_previous_runs_for_same_identity() -> None:
-    """Two successive ``/workflow/campaign/start`` calls leave only ONE
-    waiting run for the identity — the second one cancels the first."""
+def test_campaign_start_dedupes_rapid_duplicates_for_same_identity() -> None:
+    """UAT 2026-06-17 (+919497191690 RCA): a second ``campaign/start``
+    within the dedupe window for the SAME identity must NOT create a
+    parallel run. It returns the FIRST run's id idempotently.
+
+    Backend's WhatsApp bridge fires campaign/start more than once for the
+    same number within seconds. Before this fix, the second call raced
+    the first run's state save in ``_cancel_active_runs_for`` and a
+    parallel run survived, which then ran through ``entry_registration_check``
+    → registered → resume → "Welcome back" terminal and SHIPPED a duplicate
+    message to the SME. With the Redis NX EX dedupe, the second call
+    returns the first run's status; no parallel run."""
     client = TestClient(app)
     identity = "+97455500C01"
 
@@ -49,21 +58,21 @@ def test_campaign_start_cancels_previous_runs_for_same_identity() -> None:
     assert first.status_code == 200
     first_id = first.json()["run_id"]
 
+    # Second call within the dedupe window returns the SAME run id.
     second = client.post(
         "/workflow/campaign/start",
         json={"channel": "whatsapp", "identity": identity},
     )
     assert second.status_code == 200
-    second_id = second.json()["run_id"]
-    assert first_id != second_id
+    assert second.json()["run_id"] == first_id, (
+        "second campaign/start within dedupe window must return the "
+        "existing run; got a new id which means a parallel run was spawned"
+    )
 
-    # First run is now CANCELLED.
+    # Original run is still the active one.
     platform = get_onboarding_platform()
     first_run = await_helper(platform.runtime.run_store.get(first_id))
-    assert first_run.status == RunStatus.CANCELLED
-    # Second is still active.
-    second_run = await_helper(platform.runtime.run_store.get(second_id))
-    assert second_run.status == RunStatus.WAITING_FOR_INPUT
+    assert first_run.status == RunStatus.WAITING_FOR_INPUT
 
 
 def await_helper(coro):

@@ -4745,6 +4745,36 @@ class OnboardingWorkflow(WorkflowDefinition):
         provider_ref = (
             result.get("providerOrderNumber") if isinstance(result, dict) else None
         )
+        # UAT 2026-06-18 (Ishan diagnosis on +919497191690): admin can set
+        # a CUSTOM payable amount per application (e.g. 100 vs catalog
+        # 3,500). Backend's CREATE response carries the AUTHORITATIVE
+        # amount — read it and override the catalog-derived
+        # state.payment_amount_qar so the WhatsApp "Pay QAR X" message
+        # and Tess link both reflect the backend's actual decision.
+        actual_amount: int | None = None
+        if isinstance(result, dict):
+            raw_amount = (
+                result.get("payableAmount")
+                or result.get("payable_amount")
+                or result.get("amount")
+                or result.get("amount_qar")
+            )
+            try:
+                actual_amount = (
+                    int(float(raw_amount)) if raw_amount is not None else None
+                )
+            except (TypeError, ValueError):
+                actual_amount = None
+        if actual_amount is not None and actual_amount > 0:
+            ctx.logger.info(
+                "payment_create.amount_resolved",
+                catalog_amount=state.payment_amount_qar,
+                actual_amount=actual_amount,
+                note=(
+                    "using backend's payableAmount (admin may have "
+                    "overridden the catalog)"
+                ),
+            )
         return self._step(
             "payment_create",
             ctx,
@@ -4752,6 +4782,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             payment_status=payment_status,
             payment_link=payment_link,
             payment_provider_ref=provider_ref,
+            payment_amount_qar=actual_amount or state.payment_amount_qar,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
             idempotency_keys={
                 **state.idempotency_keys,
@@ -5585,33 +5616,19 @@ class OnboardingWorkflow(WorkflowDefinition):
                 **attempt_fields,
             )
 
-        # UAT 2026-06-16 (PM): guard the empty-extract case. When the
-        # cluster's OCR returns a draft with no usable fields, the SME
-        # used to see "Extracted — · QAR — · Due — / Supplier: —" and
-        # the Approve→submit then failed with a generic error because
-        # the backend rejects empty data. Treat the empty draft as a
-        # read-failure and ask the SME to resend instead.
+        # UAT 2026-06-18 (Ishan diagnosis): the backend's invoice create
+        # already accepts partial / empty data (defaults invoiceNumber to
+        # 'N/A', totalAmount to '0', customerName to 'N/A') — ops fills
+        # the rest manually. Render the confirm card REGARDLESS so the
+        # SME can always Approve; em-dashes show where OCR fell short.
+        # Only "no file bytes" still hard-fails (handled at line 5538).
+        # Empty drafts are still logged so we can see where OCR struggled.
         if _draft_is_empty(draft):
             ctx.logger.warning(
                 "invoice_extract.empty_draft",
                 filename=filename,
                 draft_keys=sorted(draft.keys()),
-            )
-            await self._send(
-                ctx, state, "onboarding.invoice.failed",
-                {
-                    "reason": (
-                        "We couldn't read the key details from this file. "
-                        "Please resend it as a clear, full-page PDF or photo "
-                        "where the invoice number, amount, and due date are "
-                        "all visible."
-                    ),
-                },
-            )
-            return self._step(
-                "invoice_collect_await", ctx,
-                access_token=token, refresh_token=refresh, token_expires_at=expires,
-                **attempt_fields,
+                note="rendering confirm card anyway per product call",
             )
 
         # Render the confirm card with 3 buttons. Title strings on the

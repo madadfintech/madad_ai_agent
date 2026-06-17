@@ -342,14 +342,16 @@ async def test_invoice_approve_fires_submitting_ack_before_submit(harness) -> No
     )
 
 
-async def test_empty_extract_draft_triggers_resend_instead_of_empty_card(
+async def test_empty_extract_draft_renders_confirm_card_anyway(
     make_harness,
 ) -> None:
-    """UAT 2026-06-16 PM (+919497191690 screenshot): when the cluster
-    extract returns a draft with no usable fields ("Extracted —, QAR —,
-    Due —, Supplier: —"), DON'T render an em-dash confirm card the SME
-    might approve only to hit a generic submit failure. Send a clear
-    resend message instead."""
+    """UAT 2026-06-18 (Ishan diagnosis): the backend's invoice create
+    accepts partial / empty data (defaults invoiceNumber='N/A',
+    totalAmount=0, customerName='N/A'). Per product, the SME must
+    ALWAYS be able to submit — even with missing fields — so ops can
+    fill the rest manually. Render the confirm card with em-dashes
+    for the blanks; do NOT block the user with a 'couldn't read'
+    resend prompt unless the file bytes themselves are missing."""
     from app.services.workflow import InMemoryInvoiceClient
 
     class _EmptyExtractClient(InMemoryInvoiceClient):
@@ -373,16 +375,17 @@ async def test_empty_extract_draft_triggers_resend_instead_of_empty_card(
         message={"attachments": [{"filename": "blurry.pdf", "content_base64": DOC}]},
     )
 
-    # No confirm card was rendered.
-    assert "onboarding.invoice.confirm" not in harness.messenger.templates()
-    # Resend message fired with the new copy.
+    # The confirm card IS rendered so the SME can still tap Approve.
+    assert "onboarding.invoice.confirm" in harness.messenger.templates()
+    # No "couldn't read" resend prompt — empty draft is acceptable.
     failed_sends = [
         s for s in harness.messenger.sent
         if s["template_key"] == "onboarding.invoice.failed"
     ]
-    assert failed_sends, "expected the resend prompt"
-    reason = failed_sends[-1]["variables"]["reason"]
-    assert "couldn't read the key details" in reason
+    assert not failed_sends, (
+        "agent must NOT block on partial OCR — backend accepts blanks "
+        "and ops fills the rest manually"
+    )
 
 
 async def test_extract_failure_falls_back_to_invoice_failed_template(

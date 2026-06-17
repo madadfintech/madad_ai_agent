@@ -37,28 +37,76 @@ def _infer_mime_type(filename: str) -> str:
     return guess or "application/pdf"
 
 
+# UAT 2026-06-18 (Ishan diagnosis): extract-only path returns a deeper
+# envelope shape than submit; ``fields`` uses sme_name/buyer_name vs the
+# agent's supplier_name/customer_name. Map both so the agent can read one
+# canonical shape regardless of the underlying tool.
+_EXTRACT_FIELD_ALIASES: dict[str, str] = {
+    "sme_name": "supplier_name",
+    "buyer_name": "customer_name",
+    # The rest stay 1:1; included so the aliasing pass is explicit and any
+    # future extractor rename has one obvious place to land.
+    "total_amount": "total_amount",
+    "currency": "currency",
+    "invoice_number": "invoice_number",
+    "invoice_date": "invoice_date",
+    "due_date": "due_date",
+}
+
+
 def _normalise_invoice_envelope(
     response: Any, filename: str
 ) -> dict[str, Any]:
     """Flatten the cluster's response envelopes into one dict shape.
 
-    The cluster may return ``{invoice: {...}}``, ``{body: {...}}``, or the
-    invoice dict directly. We also alias ``id`` to ``invoice_id`` and
-    inject the filename when missing — so every InvoiceClient path
-    returns the same shape regardless of which underlying tool ran.
+    Submit returns ``{invoice: {...}}`` / ``{body: {...}}`` / a flat dict.
+    Extract-only returns the deeper extract envelope::
+
+        {success, message, data: {gcsUri, signedUrl, extractionOnly,
+                                  extractionSuccess,
+                                  extractedData: {document_type,
+                                                  fields: {sme_name, ...}}}}
+
+    Both paths converge on the same agent-readable dict (``supplier_name``,
+    ``customer_name``, ``total_amount``, ``currency``, ``invoice_number``,
+    ``invoice_date``, ``due_date``, plus ``filename``).
     """
-    if isinstance(response, dict):
-        if isinstance(response.get("invoice"), dict):
-            normalised = dict(response["invoice"])
-        elif isinstance(response.get("body"), dict):
-            normalised = dict(response["body"])
-        else:
-            normalised = dict(response)
-        if "invoice_id" not in normalised and "id" in normalised:
-            normalised["invoice_id"] = normalised["id"]
-        normalised.setdefault("filename", filename)
-        return normalised
-    return {"filename": filename, "raw": response}
+    if not isinstance(response, dict):
+        return {"filename": filename, "raw": response}
+
+    # Extract-only envelope detection: prefer the nested ``fields`` if
+    # present so ``_draft_is_empty`` sees real OCR'd values instead of
+    # the four top-level housekeeping keys.
+    data = response.get("data")
+    if isinstance(data, dict):
+        extracted = data.get("extractedData") or data.get("extracted_data")
+        if isinstance(extracted, dict):
+            fields = extracted.get("fields") or {}
+            if isinstance(fields, dict):
+                draft: dict[str, Any] = {}
+                for raw_key, canonical in _EXTRACT_FIELD_ALIASES.items():
+                    value = fields.get(raw_key)
+                    if value not in (None, ""):
+                        draft[canonical] = value
+                # Carry the document_type signal for any downstream
+                # checks; not required by the confirm card.
+                doc_type = extracted.get("document_type")
+                if doc_type:
+                    draft["document_type"] = doc_type
+                draft.setdefault("filename", filename)
+                return draft
+
+    # Submit-style envelopes (legacy path — keep working).
+    if isinstance(response.get("invoice"), dict):
+        normalised = dict(response["invoice"])
+    elif isinstance(response.get("body"), dict):
+        normalised = dict(response["body"])
+    else:
+        normalised = dict(response)
+    if "invoice_id" not in normalised and "id" in normalised:
+        normalised["invoice_id"] = normalised["id"]
+    normalised.setdefault("filename", filename)
+    return normalised
 
 
 class McpInvoiceClient:

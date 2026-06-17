@@ -125,22 +125,68 @@ class RunStatusDTO(BaseModel):
 async def start_campaign(req: CampaignStartRequest, platform: Platform) -> RunStatusDTO:
     """Start a fresh onboarding campaign for (channel, identity).
 
-    UAT 2026-06-16 (nudge-spam RCA): the previous behaviour was to call
-    ``runtime.start`` unconditionally — every retrigger created another
-    workflow run for the same identity. The poller iterates by
-    (status, step) so stacked runs each took their next poll tick, and
-    the runtime's ``resume`` resolves to the session's active_run_id
-    (the LATEST run). Result: a poll meant for the SME's old
-    payment_await run woke their newest campaign_await run, and
-    ``_campaign_await`` fired its "Are you interested in financing"
-    answer every minute.
+    UAT 2026-06-17 RCA on +919497191690 — duplicate "Welcome back"
+    messages tracked to TWO/THREE parallel ``campaign/start`` calls
+    landing for the same number within seconds (the Madad bridge / WA
+    broadcast retry pattern). The earlier ``_cancel_active_runs_for``
+    did a SELECT-then-UPDATE which LOSES the race against the in-flight
+    run's own state save — the predecessor "cancel" got overwritten
+    and a second run ended up live. That second run independently went
+    through ``entry_registration_check`` → registered → resume → fell
+    through to ``_registered_route_send`` (the "Welcome back" terminal)
+    and SHIPPED a duplicate message to the SME.
 
-    Fix: BEFORE starting a new run, cancel every still-waiting run for
-    the same (channel, identity). The session is reset and the new
-    run takes over as active. Madad's "campaign/start must not stack"
-    is the same code path — one explicit, one as a side-effect of
-    a forget-session that 401'd.
+    Fix: ATOMIC idempotency lock via the same Redis ``SET NX EX``
+    primitive the webhook dedupe uses. A second campaign/start within
+    the lock window for the SAME ``(channel, identity)`` is absorbed:
+    it returns the existing active run's status WITHOUT creating a
+    parallel run. After the lock TTL expires, a legitimate user-
+    initiated restart still cancels and creates a new run.
+
+    UAT 2026-06-16 (prior fix retained): cancel predecessors before
+    starting a new run, so a true restart still flushes the old session.
     """
+    # ATOMIC dedupe: 30s lock keyed on (channel, identity). Reuses the
+    # Webhook dedupe primitive (``SET NX EX``) we already deploy.
+    lock_key = f"campaign_start:{str(getattr(req.channel, 'value', req.channel)).lower()}:{req.identity}"
+    # Reuse the dispatcher's existing dedupe primitive (Redis SET NX EX
+    # in prod / in-memory in tests). It's the same client the webhook
+    # dedupe uses, so no new dependency.
+    dedupe = platform.dispatcher._dedupe  # noqa: SLF001
+    claimed = await dedupe.claim(lock_key, ttl_seconds=30)
+    if not claimed:
+        # Duplicate within the dedupe window — return the existing run's
+        # status instead of spinning up a parallel one. The session's
+        # active_run_id is the source of truth for subsequent inbounds.
+        from app.core.logging import get_logger
+        existing_run = await _find_active_run(
+            platform, req.channel, req.identity,
+        )
+        if existing_run is not None:
+            get_logger("workflow.campaign").info(
+                "campaign_start.deduped",
+                identity=req.identity,
+                channel=str(req.channel),
+                existing_run=existing_run.run_id,
+            )
+            return RunStatusDTO(
+                run_id=existing_run.run_id,
+                status=str(existing_run.status),
+                waiting=str(existing_run.status) == "waiting_for_input",
+                completed=str(existing_run.status) == "completed",
+                current_step=getattr(existing_run, "current_step", None),
+                prompt=None,
+                outcome=None,
+            )
+        # Lock present but no active run — race window, treat as a
+        # fresh start by clearing the dedupe assertion below.
+        get_logger("workflow.campaign").warning(
+            "campaign_start.deduped_no_existing_run",
+            identity=req.identity,
+            channel=str(req.channel),
+            note="lock claimed but no active run found; proceeding as fresh",
+        )
+
     cancelled_runs = await _cancel_active_runs_for(
         platform, req.channel, req.identity,
     )
@@ -160,6 +206,31 @@ async def start_campaign(req: CampaignStartRequest, platform: Platform) -> RunSt
             cancelled=cancelled_runs,
         )
     return RunStatusDTO.from_result(result)
+
+
+async def _find_active_run(
+    platform: OnboardingPlatform, channel: Channel, identity: str,
+) -> Any | None:
+    """Return the most recently updated in-flight run for ``(channel, identity)``,
+    or None when there are none. Mirrors ``_cancel_active_runs_for``'s match logic."""
+    from app.shared.workflow import RunStatus
+
+    waiting = await platform.runtime.run_store.list_by_status(
+        RunStatus.WAITING_FOR_INPUT, RunStatus.RUNNING, RunStatus.PENDING,
+    )
+    ch_str = str(getattr(channel, "value", channel)).lower()
+    matches = [
+        run
+        for run in waiting
+        if str(getattr(run, "channel", "") or "").lower() == ch_str
+        and (getattr(run, "identity", "") or "") == identity
+    ]
+    if not matches:
+        return None
+    # Most recently updated wins — the latest active run is the one the
+    # session's active_run_id points at.
+    matches.sort(key=lambda r: getattr(r, "updated_at", ""), reverse=True)
+    return matches[0]
 
 
 async def _cancel_active_runs_for(

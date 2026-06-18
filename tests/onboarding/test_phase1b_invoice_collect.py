@@ -128,16 +128,13 @@ async def test_invoice_no_resend_prompt_on_partial_ocr(
     )
 
 
-async def test_zip_invoice_routes_through_bulk_preview(harness) -> None:
-    """UAT 2026-06-16 #4: ZIP attachments now route through the local-
-    unzip + per-member ``extract_base64`` preview path. ``submit_zip_base64``
-    is no longer used for SME-WhatsApp uploads (kept on the port for
-    completeness)."""
+async def test_zip_invoice_submits_every_member_no_preview(harness) -> None:
+    """UAT 2026-06-18 (Ishan QA) — bulk SUBMIT-FIRST. ZIP attachments
+    now route directly through ``extract_and_submit_base64`` per member.
+    No CSV preview, no APPROVE ALL handshake. Every member submits."""
     await _drive_to_activated(harness)
     runtime = harness.platform.runtime
 
-    # Build a real ZIP archive so `_is_zip_attachment` + the local
-    # unzip helper recognise it.
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("inv1.pdf", b"dummy invoice 1")
@@ -158,23 +155,57 @@ async def test_zip_invoice_routes_through_bulk_preview(harness) -> None:
     )
 
     inv_calls = [name for name, _ in harness.invoices.calls]
-    # Local-unzip then one extract_base64 per member (2 here).
-    assert inv_calls.count("extract_base64") == 2
+    # Submit-first: extract_and_submit_base64 fires once per member.
+    assert inv_calls.count("extract_and_submit_base64") == 2
+    # The old extract-only / submit_zip paths are NOT used.
+    assert "extract_base64" not in inv_calls
     assert "submit_zip_base64" not in inv_calls
-    # The preview template fired.
-    assert "onboarding.invoice.batch.preview" in harness.messenger.templates()
+    # No CSV preview / APPROVE ALL UX any more — one consolidated receipt.
+    templates = harness.messenger.templates()
+    assert "onboarding.invoice.batch.preview" not in templates
+    assert "onboarding.invoice.bulk.submitted" in templates
 
 
-async def test_zip_batch_approve_all_submits_every_row(harness) -> None:
-    """APPROVE ALL on a 2-row batch calls submit_base64 twice and
-    appends both records to the ledger."""
+async def test_zip_invoice_never_drops_member_on_failure(make_harness) -> None:
+    """UAT 2026-06-18 (Ishan QA) RCA: the old bulk_preview DROPPED any
+    member whose extract_base64 raised. With submit-first the SME's
+    invoice must NEVER vanish silently — failed members are surfaced in
+    the consolidated receipt's failure_block so they can resend only the
+    affected ones."""
+    from app.services.workflow import InMemoryInvoiceClient
+
+    # Client that succeeds on the first member, fails on the second.
+    call_count = {"n": 0}
+
+    class _PartiallyFailingClient(InMemoryInvoiceClient):
+        async def extract_and_submit_base64(  # type: ignore[override]
+            self, *, access_token, filename, content_base64, mime_type=None,
+            user_id=None, status="UNVERIFIED",
+        ):
+            call_count["n"] += 1
+            self._record(
+                "extract_and_submit_base64", access_token=access_token,
+                filename=filename, mime_type=mime_type,
+                user_id=user_id, status=status,
+            )
+            if call_count["n"] == 2:
+                raise RuntimeError("backend hiccup on member 2")
+            return {
+                "invoice_id": f"inv-bulk-{call_count['n']}",
+                "filename": filename,
+                "status": status,
+            }
+
+    harness = make_harness()
     await _drive_to_activated(harness)
+    harness.platform.workflow._invoices = _PartiallyFailingClient()  # type: ignore[union-attr]
+    harness.invoices = harness.platform.workflow._invoices  # type: ignore[union-attr]
     runtime = harness.platform.runtime
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("inv1.pdf", b"x")
-        zf.writestr("inv2.pdf", b"y")
+        zf.writestr("good.pdf", b"x")
+        zf.writestr("bad.pdf", b"y")
     zip_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
     await runtime.resume(WA, IDENTITY, message={
@@ -184,38 +215,20 @@ async def test_zip_batch_approve_all_submits_every_row(harness) -> None:
             "mime_type": "application/zip",
         }],
     })
-    # Now park at preview — SME taps "APPROVE ALL".
-    await runtime.resume(WA, IDENTITY, message={"text": "APPROVE ALL"})
 
+    # Both members were ATTEMPTED — second failure must NOT cause silent drop.
     inv_calls = [name for name, _ in harness.invoices.calls]
-    assert inv_calls.count("submit_base64") == 2
-    assert "onboarding.invoice.batch.submitted" in harness.messenger.templates()
+    assert inv_calls.count("extract_and_submit_base64") == 2
 
-
-async def test_zip_batch_remove_row_drops_one(harness) -> None:
-    """REMOVE 1 drops the first row + re-renders the preview with 1 left."""
-    await _drive_to_activated(harness)
-    runtime = harness.platform.runtime
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("inv1.pdf", b"x")
-        zf.writestr("inv2.pdf", b"y")
-    zip_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
-    await runtime.resume(WA, IDENTITY, message={
-        "attachments": [{
-            "filename": "invoices.zip",
-            "content_base64": zip_b64,
-            "mime_type": "application/zip",
-        }],
-    })
-    await runtime.resume(WA, IDENTITY, message={"text": "remove 1"})
-    await runtime.resume(WA, IDENTITY, message={"text": "APPROVE ALL"})
-
-    inv_calls = [name for name, _ in harness.invoices.calls]
-    # Only one row left → only one submit.
-    assert inv_calls.count("submit_base64") == 1
+    # Receipt fired AND mentions the failure (so SME can resend bad.pdf only).
+    sent = [s for s in harness.messenger.sent
+            if s["template_key"] == "onboarding.invoice.bulk.submitted"]
+    assert sent, "expected onboarding.invoice.bulk.submitted to fire"
+    failure_block = sent[-1]["variables"].get("failure_block") or ""
+    assert "bad.pdf" in failure_block, (
+        "the failed member must be surfaced to the SME; got: "
+        + repr(failure_block)
+    )
 
 
 async def test_status_query_dispatches_get_my_invoices(harness) -> None:

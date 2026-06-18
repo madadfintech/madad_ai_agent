@@ -161,6 +161,10 @@ TEMPLATE_KEYS = [
     # right after the backend creates the invoice (instant) and before OCR
     # enrichment completes asynchronously.
     "onboarding.invoice.submitted",
+    # UAT 2026-06-18 (Ishan QA): bulk SUBMIT-FIRST consolidated receipt —
+    # replaces the old CSV preview + APPROVE ALL UX. Renders the count +
+    # any failures inline so the SME never has to wonder which ones made it.
+    "onboarding.invoice.bulk.submitted",
     # UAT 2026-06-16 #3: single-PDF confirm card + Approve/Edit/Reject UX.
     "onboarding.invoice.confirm",
     "onboarding.invoice.edit.prompt",
@@ -5618,9 +5622,12 @@ class OnboardingWorkflow(WorkflowDefinition):
                 attempt_sig=sig,
             )
 
-        # Bulk / multi-file / ZIP batch — extract-only per member, render
-        # a CSV-style preview, park awaiting APPROVE ALL / EDIT / REMOVE.
-        return await self._invoice_bulk_preview(
+        # UAT 2026-06-18 (Ishan QA): bulk ZIP / multi-file batch goes
+        # through the SUBMIT-FIRST path same as single uploads. The
+        # legacy ``_invoice_bulk_preview`` is retained below as dead
+        # code for one cycle in case we need to roll back; it's no
+        # longer reachable from this router.
+        return await self._invoice_bulk_submit_first(
             state, ctx, attachments, token, refresh, expires,
             attempt_sig=sig,
         )
@@ -6094,6 +6101,186 @@ class OnboardingWorkflow(WorkflowDefinition):
             pending_invoice_mime=None,
             pending_invoice_edit_field=None,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
+        )
+
+    async def _invoice_bulk_submit_first(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        attachments: list[dict[str, Any]],
+        token: str | None,
+        refresh: str | None,
+        expires: int | None,
+        *,
+        attempt_sig: str | None = None,
+    ) -> dict[str, Any]:
+        """UAT 2026-06-18 (Ishan QA): bulk ZIP submit-first.
+
+        Mirrors the single-file ``_invoice_submit_first`` contract for
+        each ZIP member. The old ``_invoice_bulk_preview`` flow used
+        ``extract_base64`` and DROPPED any member whose OCR failed
+        (3 skip sites: nested-ZIP, no-bytes, extract-exception) — the
+        SME lost invoices silently. This method never drops:
+
+        * For each member, call ``extract_and_submit_base64`` (the
+          submit path). Backend creates the invoice instantly with
+          blank defaults (invoiceNumber='N/A', totalAmount='0',
+          customerName='N/A') and enriches via OCR in the background.
+        * Backend-side exception → the member counts as a failure but
+          the SME is told about it in the consolidated receipt; we do
+          NOT silently discard.
+        * One consolidated "📦 Got your N invoices — all submitted ✅"
+          receipt at the end. No CSV preview / APPROVE ALL handshake.
+
+        Truly degenerate cases (no file bytes at all, no auth token,
+        nested ZIP we couldn't unpack) are surfaced in the receipt so
+        the SME isn't lied to.
+        """
+        attempt_fields: dict[str, Any] = {}
+        if attempt_sig:
+            attempt_fields["last_invoice_attempt_sig"] = attempt_sig
+            attempt_fields["last_invoice_attempt_at"] = (
+                ctx.clock.now().isoformat()
+            )
+
+        members, saw_zip = _expand_zip_attachments(attachments)
+        # [TEMP-DBG] To find exact bug - Temp Logs
+        self._dbg(
+            ctx, "invoice.bulk.received",
+            attachment_count=len(attachments),
+            member_count=len(members),
+            saw_zip=saw_zip,
+        )
+        if not members:
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {"reason": "We didn't see any invoice files in that batch. Please resend."},
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
+            )
+
+        # Immediate ack so the SME never sits in silence during the
+        # submit fan-out. Best-effort — never blocks the submit chain.
+        try:
+            await self._send(ctx, state, "onboarding.invoice.processing")
+        except Exception as exc:  # noqa: BLE001
+            ctx.logger.warning(
+                "invoice_bulk.processing_ack_failed", error=str(exc)[:200],
+            )
+
+        submitted: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        new_ledger: list[dict[str, Any]] = []
+
+        for idx, att in enumerate(members, 1):
+            if _is_zip_attachment(att):
+                # Nested ZIP we couldn't unpack — surface it; never silently drop.
+                failed.append({
+                    "filename": att.get("filename") or f"nested-zip-{idx}",
+                    "reason": "nested ZIP could not be unpacked",
+                })
+                continue
+            content = att.get("content_base64") or ""
+            filename = att.get("filename") or f"invoice_{idx}.pdf"
+            mime = att.get("mime_type")
+            if not content:
+                failed.append({
+                    "filename": filename,
+                    "reason": "empty file bytes",
+                })
+                continue
+            if not token:
+                failed.append({
+                    "filename": filename,
+                    "reason": "lost auth session — please try again",
+                })
+                continue
+            # [TEMP-DBG]
+            self._dbg(
+                ctx, "invoice.bulk.member.submit",
+                idx=idx, filename=filename, content_b64_len=len(content),
+            )
+            try:
+                response = await self._invoices.extract_and_submit_base64(
+                    access_token=token,
+                    filename=filename,
+                    content_base64=content,
+                    mime_type=mime,
+                )
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "invoice_bulk.submit_failed",
+                    idx=idx, filename=filename, error=str(exc)[:300],
+                    error_type=type(exc).__name__,
+                )
+                failed.append({
+                    "filename": filename,
+                    "reason": "submit failed — please retry",
+                })
+                continue
+
+            invoice_id = (
+                response.get("invoice_id") or response.get("id")
+                if isinstance(response, dict)
+                else None
+            )
+            submitted.append({
+                "invoice_id": invoice_id,
+                "filename": filename,
+            })
+            new_ledger.append({
+                "invoice_id": invoice_id,
+                "filename": filename,
+                "submitted_at": ctx.clock.now().isoformat(),
+                "status": "SUBMITTED",
+            })
+            # [TEMP-DBG]
+            self._dbg(
+                ctx, "invoice.bulk.member.ok",
+                idx=idx, filename=filename, invoice_id=invoice_id,
+            )
+
+        # Receipt. Send a consolidated receipt regardless of mixed
+        # outcomes — we never go silent. Failures are listed so the SME
+        # can retry only what didn't make it.
+        if submitted:
+            failure_block = (
+                "\n\n⚠️ A few didn't go through this time — please resend "
+                "just those:\n" + "\n".join(
+                    f"• {f['filename']}" for f in failed[:10]
+                )
+                if failed
+                else ""
+            )
+            noun = "invoice" if len(submitted) == 1 else "invoices"
+            await self._send(
+                ctx, state, "onboarding.invoice.bulk.submitted",
+                {
+                    "count": str(len(submitted)),
+                    "noun": noun,
+                    "failure_block": failure_block,
+                },
+            )
+        else:
+            # Everything failed — be honest and ask for a retry.
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {
+                    "reason": (
+                        "We had a brief issue submitting your invoices — "
+                        "please try once more in a minute."
+                    ),
+                },
+            )
+
+        return self._step(
+            "invoice_collect_await", ctx,
+            invoices_submitted=[*state.invoices_submitted, *new_ledger],
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+            **attempt_fields,
         )
 
     async def _invoice_bulk_preview(

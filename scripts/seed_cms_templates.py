@@ -135,14 +135,22 @@ _TEMPLATE_BODIES = {
         "Based on our review, we can't proceed at this time. Please contact "
         "our team for more information."
     ),
+    # UAT 2026-06-18 (Ishan WhatsApp #62): the CR upload used to fire two
+    # back-to-back messages — ``cr.received`` ("📄 Got your CR — processing")
+    # then this ``financials.request`` opened with "Awesome, thanks for
+    # sharing!" + "To further assess your eligibility we need…". The
+    # "thanks/eligibility" preamble was redundant with the cr.received
+    # ack and a recursive reference to a step that no longer runs (the
+    # eligibility questionnaire was removed in 62d7560). Trimmed to be
+    # PURELY about asking for financials — the cr.received ack handles
+    # the immediate feedback.
     "onboarding.financials.request": (
-        "Awesome, thanks for sharing! 🙌\n\n"
         # {{ cr_affirmation }} is the "registered in Qatar — all good" line, sent
-        # ONLY when the CR step's upload classified as a real CR (else empty, so a
-        # random/non-CR upload doesn't get a false Qatar-registration claim).
+        # ONLY when the CR step's upload classified as a real CR (else empty, so
+        # a random/non-CR upload doesn't get a false Qatar-registration claim).
         "{{ cr_affirmation }}"
-        "To further assess your eligibility we need to know your financials. "
-        "Please share your last Audited Financial Statement.\n\n"
+        "Please share your last Audited Financial Statement to complete "
+        "your application.\n\n"
         "For any query call us on +974 3017 3888."
     ),
     "onboarding.buyers.request": (
@@ -419,6 +427,15 @@ _TEMPLATE_BODIES = {
         "We'll confirm the details shortly. Our team will review and "
         "you'll get an update here once it's disbursed. 💸\n\n"
         "Send another invoice anytime — single file or a ZIP both work."
+    ),
+    # UAT 2026-06-18 (Ishan QA): bulk submit-first receipt — one message
+    # for the whole batch. ``failure_block`` is empty on full success and
+    # carries a short bullet list of the (rare) per-member failures otherwise.
+    "onboarding.invoice.bulk.submitted": (
+        "📦 Got your {{ count }} {{ noun }} — all submitted ✅\n\n"
+        "We'll confirm the details shortly. Our team will review each "
+        "and you'll get an update here once they're disbursed. 💸{{ failure_block }}\n\n"
+        "Send more invoices anytime — single file or a ZIP both work."
     ),
     # Fires AFTER the SME taps Approve on the confirm card — the
     # cluster's submit step can take a few seconds and the SME used

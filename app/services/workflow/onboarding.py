@@ -1945,8 +1945,13 @@ class OnboardingWorkflow(WorkflowDefinition):
             "activated": self._activated,
             "invoice_collect_await": self._invoice_collect_await,
         }
+        # [TEMP-DBG] To find exact bug - Temp Logs:
+        # Wrap every node with entry / exit / exception logging so the
+        # workflow logs reveal the exact node where a request landed,
+        # the next node it transitioned to, and any unexpected error.
+        # Remove this block when the pipeline is stable.
         for node_name, fn in nodes.items():
-            graph.add_node(node_name, fn)
+            graph.add_node(node_name, self._dbg_wrap_node(node_name, fn))
 
         graph.set_entry("entry_registration_check")
         graph.add_conditional_edges(
@@ -2373,9 +2378,13 @@ class OnboardingWorkflow(WorkflowDefinition):
     def _route_entry_registration_check(self, state: OnboardingState) -> str:
         """Branch from cold-start entry: registered → RESUME, else
         SIGN_UP / campaign intro."""
-        if state.registration_payload:
-            return "registered"
-        return "fresh"
+        decision = "registered" if state.registration_payload else "fresh"
+        # [TEMP-DBG] To find exact bug - Temp Logs
+        return self._dbg_route(
+            "_route_entry_registration_check", state, decision,
+            registration_route=state.registration_route,
+            has_registration_payload=bool(state.registration_payload),
+        )
 
     async def _check_contact_send(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -2587,33 +2596,40 @@ class OnboardingWorkflow(WorkflowDefinition):
         triggered at QUALIFIED, not before."""
         s = state.journey_status
         JS = JourneyStatus
+        decision: str
         if s is None:
-            return "welcome"
-        if s in (JS.SIGN_UP, JS.ONBOARDED):
-            return "consent" if state.account_has_email else "email"
-        if s == JS.ELIGIBLE:
-            return "financials"
-        if s in (JS.INCOMPLETE, JS.UNVERIFIED, JS.VERIFIED, JS.PRE_QUALIFIED):
-            return "documents"
-        if s == JS.QUALIFIED:
-            return "payment"
-        if s == JS.ACCEPTED:
-            return "offers"
-        if s == JS.OFFER_ACCEPTED:
-            return "offer_confirmed"
-        if s == JS.OFFER_EXPIRED:
-            return "offer_expired"
-        if s == JS.ACTIVATED:
-            return "activated"
-        if s == JS.NOT_ACCEPTED:
-            return "rejected"
-        if s == JS.OPEN:
-            return "application_open"
-        if s == JS.IN_ELIGIBLE:
-            return "ineligible"
-        if s == JS.UNQUALIFIED:
-            return "unqualified"
-        return "welcome"
+            decision = "welcome"
+        elif s in (JS.SIGN_UP, JS.ONBOARDED):
+            decision = "consent" if state.account_has_email else "email"
+        elif s == JS.ELIGIBLE:
+            decision = "financials"
+        elif s in (JS.INCOMPLETE, JS.UNVERIFIED, JS.VERIFIED, JS.PRE_QUALIFIED):
+            decision = "documents"
+        elif s == JS.QUALIFIED:
+            decision = "payment"
+        elif s == JS.ACCEPTED:
+            decision = "offers"
+        elif s == JS.OFFER_ACCEPTED:
+            decision = "offer_confirmed"
+        elif s == JS.OFFER_EXPIRED:
+            decision = "offer_expired"
+        elif s == JS.ACTIVATED:
+            decision = "activated"
+        elif s == JS.NOT_ACCEPTED:
+            decision = "rejected"
+        elif s == JS.OPEN:
+            decision = "application_open"
+        elif s == JS.IN_ELIGIBLE:
+            decision = "ineligible"
+        elif s == JS.UNQUALIFIED:
+            decision = "unqualified"
+        else:
+            decision = "welcome"
+        # [TEMP-DBG] To find exact bug - Temp Logs
+        return self._dbg_route(
+            "_route_resume_by_status", state, decision,
+            account_has_email=state.account_has_email,
+        )
 
     async def _resume_rejected(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -4706,6 +4722,23 @@ class OnboardingWorkflow(WorkflowDefinition):
             picked_charged_party=product.get("chargedParty"),
             total_products=len(products),
         )
+        # [TEMP-DBG] To find exact bug - Temp Logs: dump every product the
+        # backend returned so we can see WHY a particular one was picked.
+        self._dbg(
+            ctx, "products_list_fetch.full",
+            total_products=len(products),
+            products=[
+                {
+                    "id": p.get("product_id") or p.get("productId") or p.get("id"),
+                    "code": p.get("code"),
+                    "name": p.get("name"),
+                    "status": p.get("status"),
+                    "chargedParty": p.get("chargedParty"),
+                    "amount": p.get("amount"),
+                }
+                for p in products
+            ][:10],
+        )
         return self._step(
             "products_list_fetch",
             ctx,
@@ -4724,12 +4757,34 @@ class OnboardingWorkflow(WorkflowDefinition):
                 access_token=token, refresh_token=refresh, token_expires_at=expires,
             )
         key = f"{ctx.run_id}:create_monetization_payment"
+        # [TEMP-DBG] To find exact bug - Temp Logs
+        self._dbg(
+            ctx, "payment_create.request",
+            business_details_id=state.business_details_id,
+            product_id=state.payment_product_id,
+            amount_qar_requested=state.payment_amount_qar or ONBOARDING_FEE_QAR,
+            idempotency_key=key,
+        )
         result = await self._pay.create_monetization_payment(
             access_token=token,
             business_details_id=state.business_details_id,
             product_id=state.payment_product_id,
             amount_qar=state.payment_amount_qar or ONBOARDING_FEE_QAR,
             idempotency_key=key,
+        )
+        # [TEMP-DBG]
+        self._dbg(
+            ctx, "payment_create.response",
+            response_keys=sorted(result.keys()) if isinstance(result, dict) else None,
+            payment_id=result.get("payment_id") or result.get("id")
+            if isinstance(result, dict) else None,
+            payable_amount=result.get("payableAmount") or result.get("payable_amount")
+            if isinstance(result, dict) else None,
+            has_payment_link=bool(isinstance(result, dict) and (
+                result.get("paymentLink") or result.get("payment_link")
+            )),
+            internal_status=result.get("internalStatus") or result.get("status")
+            if isinstance(result, dict) else None,
         )
         payment_id = result.get("payment_id") if isinstance(result, dict) else None
         payment_status = result.get("status") if isinstance(result, dict) else None
@@ -4807,6 +4862,15 @@ class OnboardingWorkflow(WorkflowDefinition):
             "payment_link":   state.payment_link or "",
             "provider_ref":   state.payment_provider_ref or "",
         }
+        # [TEMP-DBG] To find exact bug - Temp Logs
+        self._dbg(
+            ctx, "payment_send_link.render",
+            amount_rendered=amount,
+            amount_qar_state=state.payment_amount_qar,
+            amount_qar_default=ONBOARDING_FEE_QAR,
+            score=score,
+            has_payment_link=bool(state.payment_link),
+        )
         # Spec Step 5: a tappable "Pay QAR 6,000 →" button (interactive CTA-URL)
         # instead of a raw link. Falls back to the plain-text message (with the
         # link inline) if the interactive path isn't available.
@@ -5588,6 +5652,14 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "invoice_processing_ack.failed", error=str(exc)[:200],
             )
 
+        # [TEMP-DBG] To find exact bug - Temp Logs
+        self._dbg(
+            ctx, "invoice.extract.request",
+            filename=filename,
+            mime=mime,
+            content_b64_len=len(content),
+            access_token_len=len(token),
+        )
         try:
             draft = await self._invoices.extract_base64(
                 access_token=token,
@@ -5598,6 +5670,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         except Exception as exc:  # noqa: BLE001
             ctx.logger.warning(
                 "invoice_extract.failed", filename=filename, error=str(exc)[:200],
+            )
+            # [TEMP-DBG]
+            self._dbg(
+                ctx, "invoice.extract.exception",
+                filename=filename,
+                error=str(exc)[:300],
+                error_type=type(exc).__name__,
             )
             reason = (
                 "Our invoice processor is taking longer than usual — please "
@@ -5616,6 +5695,20 @@ class OnboardingWorkflow(WorkflowDefinition):
                 **attempt_fields,
             )
 
+        # [TEMP-DBG] To find exact bug - Temp Logs: log the draft fingerprint
+        # so we can see EXACTLY which OCR fields landed (or didn't) without
+        # logging the full PII payload.
+        self._dbg(
+            ctx, "invoice.extract.draft",
+            filename=filename,
+            draft_keys=sorted(draft.keys()) if isinstance(draft, dict) else None,
+            has_supplier=bool(isinstance(draft, dict) and draft.get("supplier_name")),
+            has_customer=bool(isinstance(draft, dict) and draft.get("customer_name")),
+            has_total=bool(isinstance(draft, dict) and draft.get("total_amount")),
+            has_invoice_number=bool(isinstance(draft, dict) and draft.get("invoice_number")),
+            has_due_date=bool(isinstance(draft, dict) and draft.get("due_date")),
+            document_type=(draft.get("document_type") if isinstance(draft, dict) else None),
+        )
         # UAT 2026-06-18 (Ishan diagnosis): the backend's invoice create
         # already accepts partial / empty data (defaults invoiceNumber to
         # 'N/A', totalAmount to '0', customerName to 'N/A') — ops fills
@@ -6526,7 +6619,10 @@ class OnboardingWorkflow(WorkflowDefinition):
             JourneyStatus.OFFER_ACCEPTED,
             JourneyStatus.ACTIVATED,
         }:
-            return "lender"
+            return self._dbg_route(
+                "_route_documents", state, "lender",
+                reason="paid_or_post_payment_status",
+            )
         # Refinement per Ishan (UAT 2026-06-09): when admin QUALIFIES
         # mid-docs-loop, jump STRAIGHT to the payment chain. The
         # ``documents_complete`` coffee message ("🎊 all documents
@@ -6537,20 +6633,35 @@ class OnboardingWorkflow(WorkflowDefinition):
         # override and bypasses both ``documents_complete`` and the
         # short-circuited ``payment_wait_await`` stop.
         if state.payment_ready or state.journey_status == JourneyStatus.QUALIFIED:
-            return "payment"
+            return self._dbg_route(
+                "_route_documents", state, "payment",
+                reason="payment_ready_or_qualified",
+            )
         # Frustrated-user escape hatch: the SME replied NO to "any more
         # documents?" while some required docs were still undetected — proceed
         # to the next step (the payment-wait park) without the coffee.
         if state.docs_proceed:
-            return "proceed"
+            return self._dbg_route(
+                "_route_documents", state, "proceed",
+                reason="docs_proceed=true",
+            )
         # TRUE completion: every required doc detected. Show the coffee /
         # "all documents received" message exactly ONCE (user 2026-06-12),
         # then re-park silently. A classifier hang that leaves a required slot
         # pending does NOT auto-complete here — instead the in-loop "any more
         # documents?" prompt fires and the SME replies NO to proceed.
         if not state.missing_documents:
-            return "complete" if not state.documents_complete_sent else "await_again"
-        return "await_again"
+            decision = "complete" if not state.documents_complete_sent else "await_again"
+            return self._dbg_route(
+                "_route_documents", state, decision,
+                reason="no_missing_docs",
+                documents_complete_sent=state.documents_complete_sent,
+            )
+        return self._dbg_route(
+            "_route_documents", state, "await_again",
+            reason="missing_docs_remaining",
+            missing_count=len(state.missing_documents),
+        )
 
     def _route_more_docs(self, state: OnboardingState) -> str:
         decision = (state.more_docs_decision or "").lower()
@@ -6573,7 +6684,10 @@ class OnboardingWorkflow(WorkflowDefinition):
         # payment_send_link (which would create a TESS link the SME
         # doesn't need on the waived path).
         if state.paid:
-            return "lender"
+            return self._dbg_route(
+                "_route_payment_wait", state, "lender",
+                reason="paid=True_waiver_path",
+            )
         # Bug #12 (UAT 2026-06-09): the payment trigger is the same
         # ``madad_score.ready`` event that exits the docs loop. When it
         # arrives mid-docs-loop, the docs-loop handler consumes it,
@@ -6584,18 +6698,28 @@ class OnboardingWorkflow(WorkflowDefinition):
         # other arrival path that advanced the journey past pre-qual
         # without explicitly toggling payment_ready.
         if state.payment_ready:
-            return "go"
+            return self._dbg_route(
+                "_route_payment_wait", state, "go",
+                reason="payment_ready=True",
+            )
         if state.journey_status in {
             JourneyStatus.QUALIFIED,
             JourneyStatus.ACCEPTED,
             JourneyStatus.OFFER_ACCEPTED,
             JourneyStatus.ACTIVATED,
         }:
-            return "go"
-        return "wait"
+            return self._dbg_route(
+                "_route_payment_wait", state, "go",
+                reason="journey_status_post_qualify",
+            )
+        return self._dbg_route(
+            "_route_payment_wait", state, "wait",
+            reason="not_paid_not_ready",
+        )
 
     def _route_payment(self, state: OnboardingState) -> str:
-        return "paid" if state.paid else "unpaid"
+        decision = "paid" if state.paid else "unpaid"
+        return self._dbg_route("_route_payment", state, decision)
 
     def _route_journey_status(self, state: OnboardingState) -> str:
         s = state.journey_status
@@ -6975,6 +7099,104 @@ class OnboardingWorkflow(WorkflowDefinition):
     def _step(name: str, ctx: WorkflowContext, **fields: Any) -> dict[str, Any]:
         entry = HistoryEntry(step=name, at=ctx.clock.now().isoformat())
         return {"history": [entry], **fields}
+
+    # -- [TEMP-DBG] To find exact bug - Temp Logs -----------------------------
+    # The helpers below wrap every node + add structured tracing at the
+    # key seams (entry, exit, exception, routing decisions). They're
+    # intentionally chatty — remove this block when the pipeline is stable.
+
+    def _dbg_wrap_node(
+        self, node_name: str, fn: Any,
+    ) -> Any:
+        """[TEMP-DBG] Wrap a node so every call logs entry / exit / exception
+        with the relevant state fingerprint. Lets ops see exactly which node
+        produced a given log line + where execution diverged."""
+        import time
+
+        async def wrapper(state: OnboardingState, ctx: WorkflowContext) -> Any:
+            ctx.logger.info(
+                "[TEMP-DBG] node.enter",
+                node=node_name,
+                run_id=ctx.run_id,
+                channel=str(ctx.channel),
+                identity=ctx.identity,
+                journey_status=str(state.journey_status)
+                if state.journey_status is not None else None,
+                paid=state.paid,
+                payment_confirmed_sent=state.payment_confirmed_sent,
+                docs_uploaded_count=state.docs_uploaded_count,
+                missing_documents_count=len(state.missing_documents),
+                has_access_token=bool(state.access_token),
+                offers_count=len(state.offers or []),
+                pending_invoice=bool(state.pending_invoice_draft),
+                last_status_source=state.last_status_source,
+            )
+            t0 = time.monotonic()
+            try:
+                result = await fn(state, ctx)
+            except Exception as exc:  # noqa: BLE001 — instrumentation, not handling
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                ctx.logger.exception(
+                    "[TEMP-DBG] node.exception",
+                    node=node_name,
+                    elapsed_ms=elapsed_ms,
+                    error=str(exc)[:300],
+                    error_type=type(exc).__name__,
+                )
+                raise
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            result_keys: list[str] = []
+            if isinstance(result, dict):
+                result_keys = sorted(
+                    k for k in result.keys() if k != "history"
+                )
+            ctx.logger.info(
+                "[TEMP-DBG] node.exit",
+                node=node_name,
+                elapsed_ms=elapsed_ms,
+                result_keys=result_keys,
+            )
+            return result
+
+        return wrapper
+
+    def _dbg(
+        self, ctx: WorkflowContext, event: str, **fields: Any,
+    ) -> None:
+        """[TEMP-DBG] Structured ad-hoc debug log keyed by event name."""
+        ctx.logger.info(
+            f"[TEMP-DBG] {event}",
+            run_id=ctx.run_id,
+            channel=str(ctx.channel),
+            identity=ctx.identity,
+            **fields,
+        )
+
+    def _dbg_route(
+        self, route_name: str, state: OnboardingState, decision: str,
+        **extra: Any,
+    ) -> str:
+        """[TEMP-DBG] Log a routing decision (no ctx — routes are sync
+        and don't receive the WorkflowContext). Returns ``decision`` so
+        the routing function can be wrapped inline."""
+        from app.core.logging import get_logger
+        get_logger("workflow.routing").info(
+            "[TEMP-DBG] route.decision",
+            route=route_name,
+            decision=decision,
+            journey_status=str(state.journey_status)
+            if state.journey_status is not None else None,
+            paid=state.paid,
+            prequalified=state.prequalified,
+            prequalification_rejected=getattr(
+                state, "prequalification_rejected", False,
+            ),
+            payment_ready=state.payment_ready,
+            documents_received=state.documents_received,
+            offers_count=len(state.offers or []),
+            **extra,
+        )
+        return decision
 
 
 def _channel(ctx: WorkflowContext) -> Channel:

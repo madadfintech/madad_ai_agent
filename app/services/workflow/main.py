@@ -146,6 +146,17 @@ async def start_campaign(req: CampaignStartRequest, platform: Platform) -> RunSt
     UAT 2026-06-16 (prior fix retained): cancel predecessors before
     starting a new run, so a true restart still flushes the old session.
     """
+    # [TEMP-DBG] To find exact bug - Temp Logs: every campaign/start hit is
+    # logged with channel + identity + locale so we can correlate WhatsApp
+    # button presses / bridge retries with the runs they spawn. Remove when
+    # the pipeline is stable.
+    from app.core.logging import get_logger as _dbg_get_logger
+    _dbg_get_logger("workflow.campaign").info(
+        "[TEMP-DBG] endpoint.campaign_start",
+        channel=str(req.channel),
+        identity=req.identity,
+        locale=getattr(req, "locale", None),
+    )
     # ATOMIC dedupe: 30s lock keyed on (channel, identity). Reuses the
     # Webhook dedupe primitive (``SET NX EX``) we already deploy.
     lock_key = f"campaign_start:{str(getattr(req.channel, 'value', req.channel)).lower()}:{req.identity}"
@@ -277,6 +288,23 @@ async def inbound(
     """
 
     message_id = x_madad_message_id or req.message_id
+    # [TEMP-DBG] To find exact bug - Temp Logs: log every inbound with a
+    # compact fingerprint so we can trace exactly what the bridge posted.
+    from app.core.logging import get_logger as _dbg_get_logger
+    _dbg_get_logger("workflow.inbound").info(
+        "[TEMP-DBG] endpoint.inbound",
+        channel=str(req.channel),
+        identity=req.identity,
+        text=(req.text[:200] if req.text else None),
+        text_len=(len(req.text) if req.text else 0),
+        attachments_count=len(req.attachments or []),
+        attachment_filenames=[
+            (a.get("filename") if isinstance(a, dict) else None)
+            for a in (req.attachments or [])
+        ][:5],
+        data_keys=sorted(req.data.keys()) if isinstance(req.data, dict) else None,
+        message_id=message_id,
+    )
     result = await platform.dispatcher.inbound(
         req.channel,
         req.identity,
@@ -286,7 +314,21 @@ async def inbound(
         message_id=message_id,
     )
     if result is None:
+        # [TEMP-DBG]
+        _dbg_get_logger("workflow.inbound").info(
+            "[TEMP-DBG] endpoint.inbound.deduped",
+            identity=req.identity, message_id=message_id,
+        )
         return JSONResponse(status_code=200, content={"deduped": True})
+    # [TEMP-DBG]
+    _dbg_get_logger("workflow.inbound").info(
+        "[TEMP-DBG] endpoint.inbound.result",
+        identity=req.identity,
+        status=str(result.status),
+        current_step=result.run.current_step,
+        waiting=result.waiting,
+        completed=result.completed,
+    )
     return RunStatusDTO.from_result(result)
 
 
@@ -330,21 +372,50 @@ async def madad_event(
     """
 
     event_id = x_madad_event_id or req.event_id
+    canon_identity = _canon_event_identity(req.channel, req.identity)
+    # [TEMP-DBG] To find exact bug - Temp Logs
+    from app.core.logging import get_logger as _dbg_get_logger
+    _dbg_get_logger("workflow.event").info(
+        "[TEMP-DBG] endpoint.backend_event",
+        event_type=event_type,
+        event_id=event_id,
+        channel=str(req.channel),
+        identity_raw=req.identity,
+        identity_canonical=canon_identity,
+        payload_keys=sorted(req.payload.keys())
+        if isinstance(req.payload, dict) else None,
+        journey_status=req.payload.get("journey_status") or req.payload.get("journeyStatus")
+        if isinstance(req.payload, dict) else None,
+    )
     try:
         result = await platform.dispatcher.on_backend_event(
             event_type=event_type,
             event_id=event_id,
             channel=req.channel,
-            identity=_canon_event_identity(req.channel, req.identity),
+            identity=canon_identity,
             payload=req.payload,
         )
     except UnknownEventTypeError as exc:
+        _dbg_get_logger("workflow.event").warning(
+            "[TEMP-DBG] endpoint.backend_event.unknown_type",
+            event_type=event_type,
+        )
         return JSONResponse(
             status_code=400,
             content={"code": "unknown_event_type", "message": exc.event_type},
         )
     if result is None:
+        _dbg_get_logger("workflow.event").info(
+            "[TEMP-DBG] endpoint.backend_event.deduped",
+            event_type=event_type, event_id=event_id,
+        )
         return JSONResponse(status_code=200, content={"deduped": True})
+    _dbg_get_logger("workflow.event").info(
+        "[TEMP-DBG] endpoint.backend_event.result",
+        event_type=event_type,
+        status=str(result.status),
+        current_step=result.run.current_step,
+    )
     return RunStatusDTO.from_result(result)
 
 

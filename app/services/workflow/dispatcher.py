@@ -301,6 +301,20 @@ class OnboardingDispatcher:
         if event_id is not None and not await self._dedupe.claim(event_id):
             return None
         resume_payload = translate_backend_event(event_type, payload)
+        # [TEMP-DBG] To find exact bug - Temp Logs
+        from app.core.logging import get_logger as _dbg_get_logger
+        _dbg_get_logger("workflow.dispatcher").info(
+            "[TEMP-DBG] dispatcher.event_translated",
+            event_type=event_type,
+            event_id=event_id,
+            channel=str(channel),
+            identity=identity,
+            resume_type=resume_payload.get("type"),
+            resume_event=resume_payload.get("event"),
+            resume_paid=resume_payload.get("paid"),
+            resume_journey_status=resume_payload.get("journey_status"),
+            resume_keys=sorted(resume_payload.keys()),
+        )
         return await self.resume_external(channel, identity, resume_payload)
 
     async def _dispatch(

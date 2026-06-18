@@ -189,6 +189,74 @@ class MCPClient(ABC):
 
         return name in self._settings.idempotent_tools
 
+    # [TEMP-DBG] To find exact bug - Temp Logs ------------------------------
+    @staticmethod
+    def _dbg_summarize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """[TEMP-DBG] Compact request descriptor — never logs full base64
+        bytes or access tokens, captures only field names, types, lengths."""
+        summary: dict[str, Any] = {}
+        for k, v in (payload or {}).items():
+            if k in {"access_token", "refresh_token", "onboarding_token"}:
+                summary[k] = f"<{type(v).__name__}:len={len(str(v))}>"
+            elif k in {"file_base64", "content_base64", "file_content_base64"}:
+                summary[k] = f"<base64:len={len(str(v))}>"
+            elif isinstance(v, (str, bytes)) and len(v) > 200:
+                summary[k] = f"<{type(v).__name__}:len={len(v)}>"
+            elif isinstance(v, (dict, list)):
+                summary[k] = f"<{type(v).__name__}:len={len(v)}>"
+            else:
+                summary[k] = v
+        return summary
+
+    @staticmethod
+    def _dbg_summarize_response(response: Any) -> dict[str, Any]:
+        """[TEMP-DBG] Compact response descriptor — captures top-level keys
+        + nested ``data``/``invoice`` shapes so we can see whether the
+        envelope unwrap will succeed without dumping the whole payload."""
+        if not isinstance(response, dict):
+            return {"type": type(response).__name__, "preview": str(response)[:120]}
+        out: dict[str, Any] = {"keys": sorted(response.keys())}
+        if "data" in response and isinstance(response["data"], dict):
+            out["data_keys"] = sorted(response["data"].keys())
+            extracted = response["data"].get("extractedData") or response["data"].get(
+                "extracted_data"
+            )
+            if isinstance(extracted, dict):
+                out["extractedData_keys"] = sorted(extracted.keys())
+                fields = extracted.get("fields")
+                if isinstance(fields, dict):
+                    out["extractedData.fields_keys"] = sorted(fields.keys())
+        if "invoice" in response and isinstance(response["invoice"], dict):
+            out["invoice_keys"] = sorted(response["invoice"].keys())
+        if "body" in response and isinstance(response["body"], dict):
+            out["body_keys"] = sorted(response["body"].keys())
+        if "products" in response and isinstance(response["products"], list):
+            out["products_count"] = len(response["products"])
+        # Useful flags for the most-used tools.
+        for k in (
+            "id",
+            "payment_id",
+            "payment_link",
+            "paymentLink",
+            "payableAmount",
+            "payable_amount",
+            "amount",
+            "status",
+            "internalStatus",
+            "providerOrderNumber",
+            "registered",
+            "route",
+            "journeyStatus",
+            "journey_status",
+        ):
+            if k in response:
+                v = response[k]
+                if isinstance(v, str) and len(v) > 100:
+                    out[k] = f"<str:len={len(v)}>"
+                else:
+                    out[k] = v
+        return out
+
     async def call_tool(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         # Writes that are NOT idempotency-key-honoured run single-shot regardless
         # of the configured retry budget — protects against duplicate uploads,
@@ -203,12 +271,36 @@ class MCPClient(ABC):
         tool_timeout = self._settings.tool_timeouts.get(
             name, self._settings.timeout_seconds
         )
+        # [TEMP-DBG] To find exact bug - Temp Logs: every MCP call gets its
+        # request shape, response shape, duration + outcome traced. Lets us
+        # see exactly which tool was called, what we sent, what came back,
+        # and how long it took — without needing to guess from the upstream
+        # node logs. Remove this block when the pipeline is stable.
+        import time
+        dbg_t0 = time.monotonic()
+        dbg_payload_summary = self._dbg_summarize_payload(payload)
+        self._log.info(
+            "[TEMP-DBG] mcp.call.request",
+            tool=name,
+            timeout_seconds=tool_timeout,
+            attempts_budget=attempts,
+            payload=dbg_payload_summary,
+        )
         for attempt in range(1, attempts + 1):
             try:
                 raw = await asyncio.wait_for(
                     self._invoke(name, payload), timeout=tool_timeout
                 )
-                return _unwrap_madad_envelope(raw)
+                unwrapped = _unwrap_madad_envelope(raw)
+                # [TEMP-DBG] success log with response signature
+                self._log.info(
+                    "[TEMP-DBG] mcp.call.success",
+                    tool=name,
+                    attempt=attempt,
+                    elapsed_ms=int((time.monotonic() - dbg_t0) * 1000),
+                    response_shape=self._dbg_summarize_response(unwrapped),
+                )
+                return unwrapped
             except Exception as exc:  # noqa: BLE001 - normalise + (optionally) retry
                 last_error = exc
                 self._log.warning(
@@ -218,10 +310,29 @@ class MCPClient(ABC):
                     attempts=attempts,
                     error=str(exc),
                 )
+                # [TEMP-DBG] detailed per-attempt failure
+                self._log.warning(
+                    "[TEMP-DBG] mcp.call.attempt_failed",
+                    tool=name,
+                    attempt=attempt,
+                    attempts=attempts,
+                    elapsed_ms=int((time.monotonic() - dbg_t0) * 1000),
+                    error=str(exc)[:300],
+                    error_type=type(exc).__name__,
+                )
                 if attempt >= attempts:
                     break
                 await self._sleep(delay)
                 delay = min(delay * 2, self._settings.retry_max_delay_seconds)
+        # [TEMP-DBG] terminal failure
+        self._log.warning(
+            "[TEMP-DBG] mcp.call.terminal_failure",
+            tool=name,
+            attempts=attempts,
+            elapsed_ms=int((time.monotonic() - dbg_t0) * 1000),
+            error=str(last_error)[:300] if last_error else None,
+            error_type=type(last_error).__name__ if last_error else None,
+        )
         # Classify the underlying exception into the most specific
         # MCPError subclass we can determine. Falls back to plain
         # MCPError when nothing matches so callers using

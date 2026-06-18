@@ -1,0 +1,122 @@
+# Madad log monitor — issue detection rules
+#
+# Each rule has:
+#   name        — short slug, shown in /monitor/stats grouping
+#   pattern     — Python regex; matched against each log line
+#   severity    — error | warning | info (free-form; used for filtering only)
+#   description — context for ops + future docs
+#
+# Edit this file + restart the log_monitor container (or POST /monitor/reload
+# once we add it) to change what counts as an issue. Order matters: the FIRST
+# rule that matches wins, so put the most specific patterns first.
+
+rules:
+  # -- High-signal: typed exceptions in our code paths --------------------
+
+  - name: workflow_node_exception
+    pattern: '\[TEMP-DBG\] node\.exception'
+    severity: error
+    description: A workflow node raised — the run will retry or fail.
+
+  - name: mcp_call_terminal_failure
+    pattern: '\[TEMP-DBG\] mcp\.call\.terminal_failure'
+    severity: error
+    description: An MCP tool call failed after all retries (timeout/auth/backend).
+
+  - name: mcp_typed_error
+    pattern: '\b(MCPError|MCPTimeoutError|MCPAuthError|MCPConflictError|MCPNotFoundError|MCPBackendError)\b'
+    severity: error
+    description: A typed MCP error surfaced.
+
+  - name: traceback
+    pattern: 'Traceback \(most recent call last\)'
+    severity: error
+    description: A Python traceback hit stderr — uncaught exception somewhere.
+
+  # -- Domain-specific failures we care about ----------------------------
+
+  - name: invoice_submit_failed
+    pattern: 'invoice_submit_first\.failed|invoice_bulk\.submit_failed'
+    severity: error
+    description: An invoice submission failed at the backend round-trip.
+
+  - name: invoice_extract_failed
+    pattern: 'invoice_extract\.failed'
+    severity: warning
+    description: OCR extract failed (legacy path or single-flow fallback).
+
+  - name: invoice_empty_draft
+    pattern: 'invoice_extract\.empty_draft'
+    severity: info
+    description: OCR returned a sparse draft — confirm card renders anyway now.
+
+  - name: payment_ref_fetch_failed
+    pattern: 'payment_confirmed\.ref_fetch_failed'
+    severity: warning
+    description: Couldn't read application_ref from /me when rendering payment.confirmed.
+
+  - name: payment_send_link_cta_failed
+    pattern: 'payment_send_link\.cta_failed'
+    severity: warning
+    description: CTA-URL button send failed; fell back to plain-text payment link.
+
+  - name: campaign_start_no_existing
+    pattern: 'campaign_start\.deduped_no_existing_run'
+    severity: warning
+    description: Dedupe locked the start but no active run found — race window.
+
+  - name: status_template_failed
+    pattern: 'status_template\.failed'
+    severity: warning
+    description: A Meta-approved status template send failed; fell back to free text.
+
+  - name: documents_processing_ack_failed
+    pattern: 'documents_processing_ack\.failed'
+    severity: info
+    description: The "Got it — please wait" docs ack send failed.
+
+  - name: orphan_run_skip
+    pattern: 'status_poller\.orphan_run_skip|invoice_attempt\.deduped'
+    severity: info
+    description: Poller / inbound dedupe noticed an orphan / duplicate and skipped.
+
+  - name: forget_session
+    pattern: 'forget_session\.cleared|forget_session\.failed'
+    severity: info
+    description: Admin /workflow/admin/forget-session executed.
+
+  # -- HTTP / transport-level -------------------------------------------
+  # Match both shapes our services emit:
+  #   * structlog: ``... status=5xx`` or ``status_code=5xx``
+  #   * uvicorn:   ``"POST /path HTTP/1.1" 5xx Server Error``
+
+  - name: http_5xx
+    pattern: '(\bstatus(_code)?=5[0-9]{2}\b)|("[A-Z]+ [^"]+ HTTP/[\d.]+" 5[0-9]{2})'
+    severity: error
+    description: A 5xx response surfaced (backend, MCP cluster, or our own service).
+
+  - name: http_4xx_non_auth
+    pattern: '(\bstatus(_code)?=4(00|02|04|05|06|08|09|22|29)\b)|("[A-Z]+ [^"]+ HTTP/[\d.]+" 4(00|02|04|05|06|08|09|22|29))'
+    severity: warning
+    description: A non-auth 4xx (400, 404, 409, etc.).
+
+  - name: http_401_403
+    pattern: '(\bstatus(_code)?=40[13]\b)|("[A-Z]+ [^"]+ HTTP/[\d.]+" 40[13])'
+    severity: warning
+    description: 401/403 — auth issues (token expiry, missing bearer).
+
+  # -- Structured log levels --------------------------------------------
+
+  - name: structlog_error
+    pattern: '\blevel=error\b'
+    severity: error
+    description: Any structlog-level error event we haven't classified above.
+
+  - name: critical_or_fatal
+    pattern: '\b(CRITICAL|FATAL)\b'
+    severity: error
+    description: Python logging CRITICAL/FATAL — almost certainly bad.
+
+  # NOTE: we intentionally do NOT alert on every level=warning — staging
+  # logs tens of warnings/min. The rules above pick the high-signal
+  # warnings; everything else stays in the raw container log.

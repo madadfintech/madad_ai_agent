@@ -182,6 +182,35 @@ services:
     command: ["python", "-m", "app.services.visibility.consumer"]
     ports: []
 
+  # -- log monitor (UAT diagnostic sidecar) ---------------------------------
+  # Tails docker logs for every madad_* container, filters lines through
+  # tools/log_monitor/rules.yml, and writes matches to ${HOME}/madad-monitor/
+  # issues.log on the host. Exposes a small admin API on 127.0.0.1:8090 for
+  # tail/clear/stats. See tools/log_monitor/README.md for usage.
+  log_monitor:
+    build:
+      context: ../tools/log_monitor
+      dockerfile: Dockerfile
+    image: madad/log-monitor:0.1.0
+    container_name: madad_log_monitor
+    restart: unless-stopped
+    environment:
+      WATCH_CONTAINERS: "${LOG_MONITOR_CONTAINERS:-madad_workflow,madad_celery_worker,madad_cms,madad_communication,madad_document,madad_nudge,madad_visibility}"
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
+      NOTIFY_WEBHOOK_URL: ${LOG_MONITOR_NOTIFY_WEBHOOK:-}
+      ISSUES_LOG_PATH: /data/issues.log
+      RULES_PATH: /app/rules.yml
+    volumes:
+      # docker.sock — read-only is sufficient since we only ``docker logs``.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Host mount so ops can ``tail -f`` the issues log from SSH directly.
+      - ${LOG_MONITOR_HOST_DIR:-/home/jathish/madad-monitor}:/data
+    ports:
+      # Bind to loopback only — admin-token gated, never expose publicly.
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      - workflow
+
   # -- edge + observability --------------------------------------------------
   nginx:
     image: nginx:1.27-alpine

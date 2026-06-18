@@ -50,88 +50,82 @@ async def _drive_to_activated(harness) -> None:
     await resume({"type": "status_update", "lenderName": "Qatar Islamic Bank"})
 
 
-async def test_single_invoice_extract_then_confirm_then_submit(harness) -> None:
-    """UAT 2026-06-16 #3: single-PDF flow is now extract-only → confirm
-    card → submit on Approve. ``extract_and_submit_base64`` is reserved
-    for the bulk/legacy paths."""
+async def test_single_invoice_submits_immediately_no_confirm_card(
+    harness,
+) -> None:
+    """UAT 2026-06-18 (Ishan Bug 1) — SUBMIT-FIRST. Single PDF goes
+    straight to ``extract_and_submit_base64`` (backend creates instantly,
+    enriches via OCR async). NO confirm card, NO Approve/Edit/Reject UX.
+    SME sees one "processing" ack then the "submitted ✅" ack."""
     await _drive_to_activated(harness)
     runtime = harness.platform.runtime
 
-    # Step 1: SME sends the PDF — agent extracts only and shows confirm card.
     result = await runtime.resume(
         WA, IDENTITY,
         message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
     )
     assert result.status == RunStatus.WAITING_FOR_INPUT
-    assert result.prompt == {"waiting_for": "invoice", "step": "invoice_collect"}
-
-    inv_calls_after_upload = [name for name, _ in harness.invoices.calls]
-    assert inv_calls_after_upload == ["extract_base64"]
-    assert "onboarding.invoice.confirm" in harness.messenger.templates()
-
-    # Step 2: SME taps Approve — agent submits with the extracted fields.
-    await runtime.resume(WA, IDENTITY, message={"text": "Approve"})
-
-    inv_calls_after_approve = [name for name, _ in harness.invoices.calls]
-    assert "submit_base64" in inv_calls_after_approve
-    # ``onboarding.invoice.received`` confirms the submission to the SME.
-    assert "onboarding.invoice.received" in harness.messenger.templates()
-    # ZIP path didn't fire.
-    assert "submit_zip_base64" not in inv_calls_after_approve
-
-
-async def test_invoice_reject_discards_without_submitting(harness) -> None:
-    """Reject button drops the draft — no submit_base64 call, no
-    invoice_id appended to the ledger."""
-    await _drive_to_activated(harness)
-    runtime = harness.platform.runtime
-
-    await runtime.resume(
-        WA, IDENTITY,
-        message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
-    )
-    await runtime.resume(WA, IDENTITY, message={"text": "Reject"})
 
     inv_calls = [name for name, _ in harness.invoices.calls]
+    # The new flow calls extract_and_submit_base64 directly (no
+    # extract_base64 + Approve handshake any more).
+    assert "extract_and_submit_base64" in inv_calls
+    assert "extract_base64" not in inv_calls
     assert "submit_base64" not in inv_calls
-    assert "onboarding.invoice.rejected" in harness.messenger.templates()
+
+    templates = harness.messenger.templates()
+    # New "submitted ✅" ack confirms the submission to the SME.
+    assert "onboarding.invoice.submitted" in templates
+    # No confirm card / Approve handshake on the new flow.
+    assert "onboarding.invoice.confirm" not in templates
 
 
-async def test_invoice_edit_inline_updates_draft_and_reshows_card(harness) -> None:
-    """``edit amount: 32000`` updates the draft and re-renders the
-    confirm card with the new value."""
+async def test_invoice_no_resend_prompt_on_partial_ocr(
+    make_harness,
+) -> None:
+    """UAT 2026-06-18 (Ishan Bug 1): the "We couldn't read the file"
+    resend prompt is GONE. Backend accepts blanks (invoiceNumber='N/A',
+    totalAmount=0); ops fills the rest. Even if the backend response
+    is sparse, the SME sees the "submitted ✅" ack — never a resend
+    blocker."""
+    from app.services.workflow import InMemoryInvoiceClient
+
+    class _SparseClient(InMemoryInvoiceClient):
+        async def extract_and_submit_base64(  # type: ignore[override]
+            self, *, access_token, filename, content_base64, mime_type=None,
+            user_id=None, status="UNVERIFIED",
+        ):
+            self._record(
+                "extract_and_submit_base64", access_token=access_token,
+                filename=filename, mime_type=mime_type, user_id=user_id,
+                status=status,
+            )
+            # Backend creates with blanks — no supplier, no amount.
+            return {
+                "invoice_id": "inv-sparse-1", "filename": filename,
+                "status": "SUBMITTED",
+            }
+
+    harness = make_harness()
     await _drive_to_activated(harness)
-    runtime = harness.platform.runtime
+    harness.platform.workflow._invoices = _SparseClient()  # type: ignore[union-attr]
+    harness.invoices = harness.platform.workflow._invoices  # type: ignore[union-attr]
 
+    runtime = harness.platform.runtime
     await runtime.resume(
         WA, IDENTITY,
-        message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
+        message={"attachments": [{"filename": "blurry.pdf", "content_base64": DOC}]},
     )
-    confirm_count_before = harness.messenger.templates().count(
-        "onboarding.invoice.confirm"
-    )
-    await runtime.resume(WA, IDENTITY, message={"text": "edit amount: 32000"})
 
-    # Confirm card re-rendered (or its fallback content fired).
-    assert (
-        harness.messenger.templates().count("onboarding.invoice.confirm")
-        > confirm_count_before
-    )
-    # And the new amount made it into the variables of the latest send.
-    last_confirm = [
+    assert "onboarding.invoice.submitted" in harness.messenger.templates()
+    failed_sends = [
         s for s in harness.messenger.sent
-        if s["template_key"] == "onboarding.invoice.confirm"
-    ][-1]
-    assert "32,000" in last_confirm["variables"]["amount"]
-
-    # Approve now submits the EDITED amount.
-    await runtime.resume(WA, IDENTITY, message={"text": "Approve"})
-    submit_payloads = [
-        payload for name, payload in harness.invoices.calls
-        if name == "submit_base64"
+        if s["template_key"] == "onboarding.invoice.failed"
     ]
-    assert submit_payloads, "expected a submit_base64 call after Approve"
-    assert str(submit_payloads[-1]["total_amount"]) == "32000"
+    assert not failed_sends, (
+        "agent must NEVER block on partial OCR — backend accepts blanks "
+        "and ops fills the rest manually"
+    )
 
 
 async def test_zip_invoice_routes_through_bulk_preview(harness) -> None:
@@ -257,24 +251,23 @@ async def test_off_script_chat_does_not_call_client(harness) -> None:
 
 
 async def test_invoice_state_appends_per_submission(harness) -> None:
-    """Each Approve adds one record to ``state.invoices_submitted`` —
-    requires the new extract → confirm → Approve flow per #3."""
+    """UAT 2026-06-18 (Ishan Bug 1) — SUBMIT-FIRST: each upload appends
+    one record to ``state.invoices_submitted`` directly (no Approve
+    handshake)."""
     await _drive_to_activated(harness)
     runtime = harness.platform.runtime
 
-    # 1st invoice: extract → approve.
+    # 1st invoice: one inbound, one submit, one ledger entry.
     await runtime.resume(
         WA, IDENTITY,
         message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
     )
-    await runtime.resume(WA, IDENTITY, message={"text": "Approve"})
 
-    # 2nd invoice: extract → approve.
+    # 2nd invoice: same.
     await runtime.resume(
         WA, IDENTITY,
         message={"attachments": [{"filename": "INV-2.pdf", "content_base64": DOC}]},
     )
-    await runtime.resume(WA, IDENTITY, message={"text": "Approve"})
 
     # Read state via the LangGraph checkpoint snapshot.
     session = await runtime.sessions.get(WA, IDENTITY)
@@ -286,25 +279,18 @@ async def test_invoice_state_appends_per_submission(harness) -> None:
     )
     invoices = snap.values.get("invoices_submitted") or []
     assert len(invoices) == 2
-    # Records carry the normalized shape — invoice_id, supplier, amount,
-    # status — so downstream messages have a stable contract.
+    # Records carry the minimal submit-first contract: id, filename,
+    # status. OCR-enriched fields land later via the webhook path.
     record = invoices[0]
-    for field in (
-        "invoice_id",
-        "supplier_name",
-        "total_amount",
-        "currency",
-        "status",
-        "filename",
-    ):
+    for field in ("invoice_id", "filename", "status"):
         assert field in record
 
 
-async def test_invoice_upload_fires_processing_ack_before_extract(harness) -> None:
-    """UAT 2026-06-16 (PM): the SME should see an immediate "got your
-    invoice, please wait" ack BEFORE the cluster's extract call (which
-    can take 60-90s). Without this the chat was silent between the
-    upload and the confirm card."""
+async def test_invoice_upload_fires_processing_ack_before_submit(harness) -> None:
+    """UAT 2026-06-18 (Ishan Bug 1) — SUBMIT-FIRST: the "Got your
+    invoice — reading it now" ack fires BEFORE the backend submit
+    round-trip (which now returns in <5s but still benefits from an
+    immediate ack)."""
     await _drive_to_activated(harness)
     runtime = harness.platform.runtime
 
@@ -315,88 +301,21 @@ async def test_invoice_upload_fires_processing_ack_before_extract(harness) -> No
 
     templates = harness.messenger.templates()
     assert "onboarding.invoice.processing" in templates
-    # And the processing ack came BEFORE the confirm card.
+    assert "onboarding.invoice.submitted" in templates
+    # Processing ack precedes the submitted ack.
     assert templates.index("onboarding.invoice.processing") < templates.index(
-        "onboarding.invoice.confirm"
+        "onboarding.invoice.submitted"
     )
 
 
-async def test_invoice_approve_fires_submitting_ack_before_submit(harness) -> None:
-    """UAT 2026-06-16 (PM): the SME should see a "submitting your
-    invoice…" ack when they tap Approve, before the cluster's submit
-    round-trip lands."""
-    await _drive_to_activated(harness)
-    runtime = harness.platform.runtime
-
-    await runtime.resume(
-        WA, IDENTITY,
-        message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
-    )
-    await runtime.resume(WA, IDENTITY, message={"text": "Approve"})
-
-    templates = harness.messenger.templates()
-    assert "onboarding.invoice.submitting" in templates
-    # Submitting ack fires BEFORE the receipt.
-    assert templates.index("onboarding.invoice.submitting") < templates.index(
-        "onboarding.invoice.received"
-    )
-
-
-async def test_empty_extract_draft_renders_confirm_card_anyway(
-    make_harness,
-) -> None:
-    """UAT 2026-06-18 (Ishan diagnosis): the backend's invoice create
-    accepts partial / empty data (defaults invoiceNumber='N/A',
-    totalAmount=0, customerName='N/A'). Per product, the SME must
-    ALWAYS be able to submit — even with missing fields — so ops can
-    fill the rest manually. Render the confirm card with em-dashes
-    for the blanks; do NOT block the user with a 'couldn't read'
-    resend prompt unless the file bytes themselves are missing."""
-    from app.services.workflow import InMemoryInvoiceClient
-
-    class _EmptyExtractClient(InMemoryInvoiceClient):
-        async def extract_base64(  # type: ignore[override]
-            self, *, access_token, filename, content_base64, mime_type=None,
-        ):
-            self._record(
-                "extract_base64", access_token=access_token,
-                filename=filename, mime_type=mime_type,
-            )
-            return {"filename": filename, "currency": "QAR"}
-
-    harness = make_harness()
-    await _drive_to_activated(harness)
-    harness.platform.workflow._invoices = _EmptyExtractClient()  # type: ignore[union-attr]
-    harness.invoices = harness.platform.workflow._invoices  # type: ignore[union-attr]
-
-    runtime = harness.platform.runtime
-    await runtime.resume(
-        WA, IDENTITY,
-        message={"attachments": [{"filename": "blurry.pdf", "content_base64": DOC}]},
-    )
-
-    # The confirm card IS rendered so the SME can still tap Approve.
-    assert "onboarding.invoice.confirm" in harness.messenger.templates()
-    # No "couldn't read" resend prompt — empty draft is acceptable.
-    failed_sends = [
-        s for s in harness.messenger.sent
-        if s["template_key"] == "onboarding.invoice.failed"
-    ]
-    assert not failed_sends, (
-        "agent must NOT block on partial OCR — backend accepts blanks "
-        "and ops fills the rest manually"
-    )
-
-
-async def test_extract_failure_falls_back_to_invoice_failed_template(
-    harness, monkeypatch
-) -> None:
-    """If the backend extraction raises (e.g. unreadable PDF), the SME
-    sees the ``onboarding.invoice.failed`` template — not a silent run."""
+async def test_invoice_submit_failure_uses_retry_message(harness) -> None:
+    """UAT 2026-06-18 (Ishan Bug 1): on a transient backend hiccup
+    (extract_and_submit raises), the SME gets a polite retry message —
+    NOT the old "we couldn't read the file" blame. Per Ishan: only the
+    "no file bytes" path still asks the SME to resend."""
     await _drive_to_activated(harness)
 
-    # Swap in a client whose extract raises.
-    failing = InMemoryInvoiceClient(extract_error=RuntimeError("backend unhappy"))
+    failing = InMemoryInvoiceClient(extract_error=RuntimeError("backend hiccup"))
     harness.platform.workflow._invoices = failing  # type: ignore[union-attr]
     harness.invoices = failing
 
@@ -406,46 +325,15 @@ async def test_extract_failure_falls_back_to_invoice_failed_template(
         message={"attachments": [{"filename": "INV-bad.pdf", "content_base64": DOC}]},
     )
 
-    assert "onboarding.invoice.failed" in harness.messenger.templates()
-    # Backend-style error means "blame the file" copy — not a transport
-    # timeout, so the SME is told to resend.
     sent_failures = [
         s for s in harness.messenger.sent
         if s["template_key"] == "onboarding.invoice.failed"
     ]
-    assert sent_failures
-    assert "couldn't read the file" in sent_failures[-1]["variables"]["reason"]
-
-
-async def test_invoice_extract_timeout_uses_transport_message(harness) -> None:
-    """UAT 2026-06-16: when the MCP cluster times out on
-    extract_and_submit (NOT a real "unreadable" backend error), the SME
-    must NOT be told the file is bad. They get the honest "our processor
-    is slow, try again" copy so they don't waste time resending a
-    perfectly valid PDF."""
-    await _drive_to_activated(harness)
-
-    timeout_client = InMemoryInvoiceClient(
-        extract_error=TimeoutError("Timed out while waiting for response"),
-    )
-    harness.platform.workflow._invoices = timeout_client  # type: ignore[union-attr]
-    harness.invoices = timeout_client
-
-    runtime = harness.platform.runtime
-    await runtime.resume(
-        WA, IDENTITY,
-        message={"attachments": [
-            {"filename": "8044-invoice.pdf", "content_base64": DOC}
-        ]},
-    )
-
-    sent_failures = [
-        s for s in harness.messenger.sent
-        if s["template_key"] == "onboarding.invoice.failed"
-    ]
-    assert sent_failures, "expected onboarding.invoice.failed to fire"
+    assert sent_failures, "expected the polite retry message on submit failure"
     reason = sent_failures[-1]["variables"]["reason"]
-    assert "taking longer than usual" in reason
+    # New message blames the backend, not the SME's file.
+    assert "couldn't read the file" not in reason
+    assert "try once more" in reason or "issue submitting" in reason
     # And critically: the SME is NOT told the file is corrupt.
     assert "couldn't read" not in reason
 

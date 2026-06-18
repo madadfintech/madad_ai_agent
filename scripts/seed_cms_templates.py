@@ -409,6 +409,17 @@ _TEMPLATE_BODIES = {
         "Please wait a moment while we extract the details. ⏳\n\n"
         "Thank you for being with us. 🙏"
     ),
+    # UAT 2026-06-18 (Ishan Bug 1) — SUBMIT-FIRST ack. Replaces the old
+    # confirm-card → Approve → submit flow with one immediate confirmation.
+    # Backend creates the invoice instantly (blank defaults, ops fills the
+    # rest) and enriches via OCR in the background; the SME just needs to
+    # know it landed.
+    "onboarding.invoice.submitted": (
+        "📄 Got your invoice — submitted ✅\n\n"
+        "We'll confirm the details shortly. Our team will review and "
+        "you'll get an update here once it's disbursed. 💸\n\n"
+        "Send another invoice anytime — single file or a ZIP both work."
+    ),
     # Fires AFTER the SME taps Approve on the confirm card — the
     # cluster's submit step can take a few seconds and the SME used
     # to see a silent chat between Approve and the receipt. UAT

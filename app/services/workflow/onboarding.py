@@ -157,6 +157,10 @@ TEMPLATE_KEYS = [
     "onboarding.invoice.received",
     "onboarding.invoice.failed",
     "onboarding.invoice.status",
+    # UAT 2026-06-18 (Ishan Bug 1): SUBMIT-FIRST single-message ack — fires
+    # right after the backend creates the invoice (instant) and before OCR
+    # enrichment completes asynchronously.
+    "onboarding.invoice.submitted",
     # UAT 2026-06-16 #3: single-PDF confirm card + Approve/Edit/Reject UX.
     "onboarding.invoice.confirm",
     "onboarding.invoice.edit.prompt",
@@ -1332,7 +1336,12 @@ def _parse_shareholder_text(text: str, fallback_phone: str | None) -> list[dict[
 # the debounce we sent 8 "📦 Got it — processing your documents now…"
 # messages in 3 seconds. 30s covers a typical multi-file burst plus a small
 # buffer; anything older is treated as a fresh batch and re-fires the ack.
-DOCS_PROCESSING_ACK_TTL_SECONDS = 30.0
+DOCS_PROCESSING_ACK_TTL_SECONDS = 120.0
+# UAT 2026-06-18 (screenshot): Madad's bridge spaces ZIP-member POSTs
+# across ~2 minutes for an 8-doc burst. With the old 30s window the
+# SME saw the "Got it — please wait" ack THREE times in 90s. 120s
+# covers the observed bridge tail; truly new upload sessions (5+ min
+# later) still re-fire the ack as expected.
 # UAT 2026-06-17: invoice attachment dedupe window. If the SAME content
 # fingerprint arrives again within this window, treat it as a delivery
 # retry (Meta/WhatsApp or our bridge fanning out) and silently drop —
@@ -3630,7 +3639,11 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._reminders.suppress(
                 target_ref=state.madad_user_id or ctx.session_id
             )
-            await self._send(ctx, state, "onboarding.qualified.waived")
+            # UAT 2026-06-18 (Ishan): backend is the single owner of the
+            # waiver message — it sends ONE consolidated "fee waived →
+            # forwarded to banks" notice. Agent stays silent here and at
+            # the other two waiver entry points (payment_wait_await,
+            # payment_await) so the SME never gets a duplicate.
             progress_step = await self._update_progress(state, ctx, step=5)
             fields: dict[str, Any] = {
                 "missing_documents": list(state.missing_documents),
@@ -4427,17 +4440,16 @@ class OnboardingWorkflow(WorkflowDefinition):
         # PARK after the coffee message until the payment step is triggered
         # (Postman in the demo). Capture the Madad score from the trigger payload.
         payload = await_input({"waiting_for": "payment_ready", "step": "payment_wait"})
-        # UAT 2026-06-17 (RCA on +919497191690): ``qualified.waived`` lands
-        # here as ``{type: payment, paid: True, event: qualified.waived}``.
-        # Previously we advanced silently on the assumption backend would
-        # send its own waiver WhatsApp — it doesn't. Send the waiver-
-        # qualified message ourselves before jumping to the lender phase.
+        # UAT 2026-06-18 (Ishan): ``qualified.waived`` lands here as
+        # ``{type: payment, paid: True, event: qualified.waived}``.
+        # Backend now owns the waiver message — it sends ONE consolidated
+        # notice. Agent stays silent and just advances state into the
+        # lender phase.
         if (
             isinstance(payload, dict)
             and payload.get("type") == "payment"
             and bool(payload.get("paid"))
         ):
-            await self._send(ctx, state, "onboarding.qualified.waived")
             return self._step(
                 "payment_wait_await", ctx,
                 paid=True, payment_ready=True,
@@ -5031,18 +5043,16 @@ class OnboardingWorkflow(WorkflowDefinition):
                 paid=True,
                 last_status_source="poll",
             )
-        # UAT 2026-06-17 (RCA on +919497191690): ``qualified.waived``
-        # comes in as ``{type: payment, paid: True, event:
-        # qualified.waived}`` — same paid=True signal as payment.completed
-        # but the SME hasn't actually paid anything. We must NOT send
-        # ``onboarding.payment.confirmed`` (which would falsely say
-        # "Thank you — payment received!"). Send the dedicated waiver
-        # template so the SME isn't left in silence, then advance.
+        # UAT 2026-06-18 (Ishan): ``qualified.waived`` comes in as
+        # ``{type: payment, paid: True, event: qualified.waived}`` —
+        # same paid=True signal as payment.completed but the SME hasn't
+        # actually paid anything. Backend now owns the waiver message;
+        # the agent stays silent (must NOT send onboarding.payment.confirmed
+        # which would falsely say "Payment received!").
         event_marker = (
             str(result.get("event")) if isinstance(result, dict) else ""
         )
         if paid and event_marker == "qualified.waived":
-            await self._send(ctx, state, "onboarding.qualified.waived")
             return self._step(
                 "payment_await", ctx,
                 paid=True,
@@ -5325,8 +5335,16 @@ class OnboardingWorkflow(WorkflowDefinition):
                     error=str(exc)[:200],
                     note="falling back to plain-text handoff message",
                 )
+        # UAT 2026-06-18 (Ishan Bug 2): both ``offers.preview`` and
+        # ``offer.handoff`` now map to the same approved Meta template.
+        # If ``offer_view_send`` just delivered the offers via the
+        # template (preview sig matches current offers), skip this
+        # second template send so the SME doesn't get the same offers
+        # block twice. The CTA-URL button above is a session message
+        # and is independent — fine to keep when it succeeds.
         if not sent_as_button:
-            await self._send(ctx, state, "onboarding.offer.handoff")
+            if _offers_sig(state.offers) != state.offers_preview_shown_sig:
+                await self._send(ctx, state, "onboarding.offer.handoff")
         # Record the shown offer set so routine polls don't re-send these cards.
         return self._step(
             "offer_handoff_to_madad", ctx, outcome="offer_handoff",
@@ -5580,15 +5598,22 @@ class OnboardingWorkflow(WorkflowDefinition):
         # resume with an empty/expired cached token — same fix as doc uploads).
         token, refresh, expires = await self._live_token(state, ctx)
 
-        # Single non-ZIP attachment: EXTRACT-ONLY → confirm card → submit on
-        # Approve (UAT 2026-06-16 #3). We carry the bytes in state for
-        # one turn so we can re-call submit_base64 with the SME-confirmed
-        # fields. ZIP attachments and multi-file batches take the bulk
-        # CSV-preview path (UAT 2026-06-16 #4).
+        # UAT 2026-06-18 (Ishan Bug 1): SUBMIT-FIRST. The backend now
+        # creates the invoice instantly with blank defaults and enriches
+        # via OCR in the background (in <5s). The agent must NOT block
+        # on synchronous OCR — that produced the "We couldn't read the
+        # file" failure on every multi-page invoice. New flow:
+        #   1. Call ``extract_and_submit_base64`` (the submit path —
+        #      backend creates immediately + extracts async).
+        #   2. Reply "📄 Got your invoice — submitted ✅. We'll confirm
+        #      the details shortly."
+        #   3. Backend's webhook later confirms with the OCR'd details.
+        # No more confirm card / Approve / Edit / Reject path; no more
+        # "couldn't read" resend prompt (only "no file bytes" remains).
         non_zip = [a for a in attachments if not _is_zip_attachment(a)]
         has_zip = any(_is_zip_attachment(a) for a in attachments)
         if non_zip and not has_zip and len(non_zip) == 1:
-            return await self._invoice_extract_for_confirm(
+            return await self._invoice_submit_first(
                 state, ctx, non_zip[0], token, refresh, expires,
                 attempt_sig=sig,
             )
@@ -5598,6 +5623,146 @@ class OnboardingWorkflow(WorkflowDefinition):
         return await self._invoice_bulk_preview(
             state, ctx, attachments, token, refresh, expires,
             attempt_sig=sig,
+        )
+
+    async def _invoice_submit_first(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        attachment: dict[str, Any],
+        token: str | None,
+        refresh: str | None,
+        expires: int | None,
+        *,
+        attempt_sig: str | None = None,
+    ) -> dict[str, Any]:
+        """UAT 2026-06-18 (Ishan Bug 1) — SUBMIT-FIRST single PDF flow.
+
+        Backend's ``extract_and_submit_base64`` creates the invoice
+        instantly (blank defaults that ops fills) and enriches via OCR
+        in the background within ~5s. The agent must NOT block on
+        synchronous OCR — that produced the "We couldn't read the file"
+        failure on every multi-page invoice (scanned multi-page PDFs
+        OCR in 90s+).
+
+        Send the SME a simple "submitted ✅" ack. Backend's later webhook
+        confirms the details once OCR completes; no resend / no confirm
+        card / no Approve-Edit-Reject UX. Only a true "no file bytes"
+        case still asks for a resend.
+        """
+        content = attachment.get("content_base64") or ""
+        filename = attachment.get("filename") or "invoice.pdf"
+        mime = attachment.get("mime_type")
+
+        attempt_fields: dict[str, Any] = {}
+        if attempt_sig:
+            attempt_fields["last_invoice_attempt_sig"] = attempt_sig
+            attempt_fields["last_invoice_attempt_at"] = (
+                ctx.clock.now().isoformat()
+            )
+
+        if not content or not token:
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {"reason": "We didn't receive the file bytes — please resend."},
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
+            )
+
+        # [TEMP-DBG] To find exact bug - Temp Logs
+        self._dbg(
+            ctx, "invoice.submit_first.request",
+            filename=filename,
+            mime=mime,
+            content_b64_len=len(content),
+        )
+
+        # Immediate ack — the SME sees acknowledgement before the (fast)
+        # submit completes. Backend confirms via webhook later.
+        try:
+            await self._send(ctx, state, "onboarding.invoice.processing")
+        except Exception as exc:  # noqa: BLE001 — never block submit on the ack
+            ctx.logger.warning(
+                "invoice_processing_ack.failed", error=str(exc)[:200],
+            )
+
+        # Submit-first: backend creates the invoice immediately with
+        # blank defaults (invoiceNumber='N/A', totalAmount=0,
+        # customerName='N/A'); the OCR enrichment runs in the background
+        # and lands as a later webhook. No synchronous OCR blocking here.
+        try:
+            response = await self._invoices.extract_and_submit_base64(
+                access_token=token,
+                filename=filename,
+                content_base64=content,
+                mime_type=mime,
+            )
+        except Exception as exc:  # noqa: BLE001
+            ctx.logger.warning(
+                "invoice_submit_first.failed",
+                filename=filename, error=str(exc)[:300],
+                error_type=type(exc).__name__,
+            )
+            # Per Ishan: NEVER block on OCR failures. The only resend
+            # case is "no file bytes" (handled above). Anything else is
+            # a transient backend hiccup — ask the SME to retry shortly.
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {
+                    "reason": (
+                        "We had a brief issue submitting your invoice — "
+                        "please try once more in a minute. Your file is "
+                        "fine; we just need another moment."
+                    ),
+                },
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
+            )
+
+        # [TEMP-DBG]
+        self._dbg(
+            ctx, "invoice.submit_first.response",
+            response_keys=sorted(response.keys()) if isinstance(response, dict) else None,
+            invoice_id=(
+                response.get("invoice_id") or response.get("id")
+                if isinstance(response, dict) else None
+            ),
+            backend_status=(
+                response.get("status") or response.get("internalStatus")
+                if isinstance(response, dict) else None
+            ),
+        )
+
+        invoice_id = (
+            response.get("invoice_id") or response.get("id")
+            if isinstance(response, dict)
+            else None
+        )
+
+        # Send the "submitted ✅" ack. OCR runs server-side; backend
+        # webhook later carries the enriched details.
+        await self._send(ctx, state, "onboarding.invoice.submitted")
+
+        # Local ledger — record the submission so QA/status queries
+        # can answer "what did I just send?" without waiting on the
+        # enrichment webhook.
+        ledger_entry = {
+            "invoice_id": invoice_id,
+            "filename": filename,
+            "submitted_at": ctx.clock.now().isoformat(),
+            "status": "SUBMITTED",
+        }
+        return self._step(
+            "invoice_collect_await", ctx,
+            invoices_submitted=[*state.invoices_submitted, ledger_entry],
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+            **attempt_fields,
         )
 
     async def _invoice_extract_for_confirm(
@@ -7213,6 +7378,13 @@ _STATUS_TEMPLATES: dict[str, str] = {
     "onboarding.documents.checklist":   "onboarding_documents_checklist",
     "onboarding.payment.request":       "onboarding_payment_request",
     "onboarding.payment.confirmed":     "onboarding_payment_confirmed",
+    # UAT 2026-06-18 (Ishan Bug 2): offer cards arrive days after the
+    # SME left the chat — free-text was being silently dropped outside
+    # the 24h Meta window. Both ``offers.preview`` (the cards list) and
+    # ``offer.handoff`` (the CTA fallback) now use the same approved
+    # ``onboarding_offers_available`` template so every offer notice
+    # reliably delivers regardless of conversation age.
+    "onboarding.offers.preview":        "onboarding_offers_available",
     "onboarding.offer.handoff":         "onboarding_offers_available",
     "onboarding.offer.confirmed":       "onboarding_offer_confirmed",
     "onboarding.activated":             "onboarding_activated",
@@ -7303,7 +7475,9 @@ def _status_components(
         return body(v.get("ref"), _strip_qar(v.get("amount")), v.get("due_date"))
     if key == "onboarding.repayment.overdue":
         return body(v.get("ref"), _strip_qar(v.get("amount")), v.get("due_date") or "—")
-    if key == "onboarding.offer.handoff":
+    if key in ("onboarding.offer.handoff", "onboarding.offers.preview"):
+        # Both map to the same approved ``onboarding_offers_available``
+        # Meta template with a single {{1}} variable for the offer block.
         return body(_offers_block(state))
     if key == "onboarding.payment.request":
         pid = getattr(state, "payment_id", None)

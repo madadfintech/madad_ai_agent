@@ -155,9 +155,12 @@ async def test_mcp_tool_calls_happen_in_order(harness):
     # longer in the graph.
     assert "upload_audited_financial_report" in kyc_calls
     assert "classify_and_upload_document_base64" in kyc_calls
-    # A5 retired ``upload_commercial_registration`` from the WA path —
-    # guard so it doesn't sneak back in.
-    assert "upload_commercial_registration" not in kyc_calls
+    # UAT 2026-06-19 QA #8: the forced ``upload_commercial_registration``
+    # was RESTORED — classify-and-trust dumped real CRs into "Additional
+    # Documents" when the classifier blipped, stalling onboarding. The
+    # forced upload always lands the doc in the CR slot; the classifier
+    # still runs but ONLY to gate the "registered in Qatar ✅" line.
+    assert "upload_commercial_registration" in kyc_calls
 
 
 async def test_reminders_scheduled_and_suppressed_at_wait_points(harness):

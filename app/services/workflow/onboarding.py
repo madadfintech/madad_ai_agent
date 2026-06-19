@@ -165,6 +165,9 @@ TEMPLATE_KEYS = [
     # replaces the old CSV preview + APPROVE ALL UX. Renders the count +
     # any failures inline so the SME never has to wonder which ones made it.
     "onboarding.invoice.bulk.submitted",
+    # UAT 2026-06-19 QA #1: ONE consolidated "received N invoices —
+    # processing" ack up front so the SME doesn't get per-file spam.
+    "onboarding.invoice.bulk.processing",
     # UAT 2026-06-16 #3: single-PDF confirm card + Approve/Edit/Reject UX.
     "onboarding.invoice.confirm",
     "onboarding.invoice.edit.prompt",
@@ -3058,8 +3061,35 @@ class OnboardingWorkflow(WorkflowDefinition):
         # timeout/error all leave it False → no false Qatar claim. A genuine CR
         # that fails to classify just misses the affirmation line (the financials
         # request still goes out) — far better than asserting Qatar for a non-CR.
+        # UAT 2026-06-19 QA #8 regression fix: the classifier-and-trust
+        # approach (classify_and_upload_document_base64) dumps the CR
+        # into "Additional Documents" when the classifier blips, stalling
+        # onboarding. Revert to the FORCED CR upload — the SME has
+        # explicitly sent us their CR at this point and the OCR validates
+        # it Qatar-side; we always put it in the CR slot. The classifier
+        # still runs separately, but ONLY to gate the
+        # "registered in Qatar ✅" affirmation line — it never affects
+        # which slot the document lands in.
         cr_verified = False
         if token and state.cr_ref:
+            # 1) Force-upload as CR (never depends on classifier success).
+            try:
+                await self._kyc.upload_commercial_registration(
+                    access_token=token,
+                    content_base64=state.cr_content_base64 or "",
+                    filename=state.cr_ref,
+                    mime_type=state.cr_mime_type,
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade in staging
+                ctx.logger.warning(
+                    "cr_upload.forced_failed", error=str(exc)[:200],
+                    note=(
+                        "forced CR upload failed; flow continues but the SME's "
+                        "CR isn't recorded — surface to ops via the issue monitor"
+                    ),
+                )
+            # 2) Classifier purely informational — gates the Qatar
+            #    affirmation line only. Never affects routing or storage.
             try:
                 resp = await self._kyc.classify_and_upload_document_base64(
                     access_token=token,
@@ -3079,8 +3109,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                 cr_verified = detected == "commercial_registration"
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
-                    "cr_upload.failed", error=str(exc)[:200],
-                    note="staging-tolerant: continuing without CR uploaded",
+                    "cr_classify.failed", error=str(exc)[:200],
+                    note=(
+                        "classifier informational only; CR already uploaded "
+                        "via the forced path above"
+                    ),
                 )
         # Step 2 — CR uploaded (backend journey_status: INCOMPLETE).
         progress_step = await self._update_progress(state, ctx, step=2)
@@ -5295,6 +5328,33 @@ class OnboardingWorkflow(WorkflowDefinition):
         # node's one-shot send.
         if _offers_sig(state.offers) == state.offers_preview_shown_sig:
             return self._step("offer_view_send", ctx)
+        # UAT 2026-06-19 QA #6b: backend fires one ``offers.available``
+        # event per lender; a 2-lender app produces 2 events seconds
+        # apart and the SME used to see the "offers ready" message
+        # twice. Debounce 30s on first arrival: the next status-poll
+        # tick (60s cadence) re-enters here past the window and sends
+        # ONE consolidated message with the full offer set.
+        now = ctx.clock.now()
+        first_seen_iso = state.offers_first_seen_at
+        if not first_seen_iso:
+            # First time we see ANY offer for this run → start the
+            # debounce timer; re-park silently. Poll/webhook within
+            # the next 30s won't send; the poll AFTER 30s will.
+            return self._step(
+                "offer_view_send", ctx,
+                offers_first_seen_at=now.isoformat(),
+            )
+        try:
+            first_seen = datetime.fromisoformat(first_seen_iso)
+            elapsed = (now - first_seen).total_seconds()
+        except (TypeError, ValueError):
+            elapsed = 1e9  # corrupt timestamp — treat as elapsed
+        if elapsed < 30.0:
+            # Still inside the debounce window; new offers may yet
+            # arrive. Re-park silently — state.offers is updated so
+            # the next render will reflect every lender.
+            return self._step("offer_view_send", ctx)
+
         await self._send(
             ctx,
             state,
@@ -5598,38 +5658,405 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             return self._step("invoice_collect_await", ctx)
 
+        # UAT 2026-06-19 QA #2: PERMANENT submitted-sig dedupe — refuse
+        # to re-process anything we've already submitted in this run,
+        # even after the 5min retry window expires. Status_poll / event
+        # resumes (qualified.waived, offers.available, offer.selected,
+        # credit_line.activated, status_poll_on_demand, transaction.*,
+        # repayment.*) were re-entering ``_invoice_collect_await`` with
+        # the same attachment payload from stale state, and 9 uploads
+        # became 47 backend submits = 22+ portal rows. The set in state
+        # is bounded to 200 sigs so it stays tiny.
+        if sig and sig in (state.invoice_submitted_sigs or []):
+            ctx.logger.info(
+                "invoice.submitted_sig.dedupe_skip", sig=sig,
+                note="run already submitted this attachment set; refusing re-submit",
+            )
+            return self._step("invoice_collect_await", ctx)
+
         # Mint a live token from the verified identity (a long-active user can
         # resume with an empty/expired cached token — same fix as doc uploads).
         token, refresh, expires = await self._live_token(state, ctx)
 
-        # UAT 2026-06-18 (Ishan Bug 1): SUBMIT-FIRST. The backend now
-        # creates the invoice instantly with blank defaults and enriches
-        # via OCR in the background (in <5s). The agent must NOT block
-        # on synchronous OCR — that produced the "We couldn't read the
-        # file" failure on every multi-page invoice. New flow:
-        #   1. Call ``extract_and_submit_base64`` (the submit path —
-        #      backend creates immediately + extracts async).
-        #   2. Reply "📄 Got your invoice — submitted ✅. We'll confirm
-        #      the details shortly."
-        #   3. Backend's webhook later confirms with the OCR'd details.
-        # No more confirm card / Approve / Edit / Reject path; no more
-        # "couldn't read" resend prompt (only "no file bytes" remains).
+        # UAT 2026-06-19 QA #3/#4: route to the EXTRACT-FIRST handlers
+        # which check what OCR found and decide:
+        #   * single + extract success + has fields → Approve/Edit card
+        #   * single + extract fail / empty       → auto-submit blank
+        #   * bulk   + extract success per row    → CSV preview + APPROVE ALL
+        #   * bulk   + member extract fail        → auto-submit that one
+        # See the docstrings on _invoice_extract_then_route_single /
+        # _invoice_extract_then_route_bulk for the exact contract.
         non_zip = [a for a in attachments if not _is_zip_attachment(a)]
         has_zip = any(_is_zip_attachment(a) for a in attachments)
         if non_zip and not has_zip and len(non_zip) == 1:
-            return await self._invoice_submit_first(
+            return await self._invoice_extract_then_route_single(
                 state, ctx, non_zip[0], token, refresh, expires,
                 attempt_sig=sig,
             )
 
-        # UAT 2026-06-18 (Ishan QA): bulk ZIP / multi-file batch goes
-        # through the SUBMIT-FIRST path same as single uploads. The
-        # legacy ``_invoice_bulk_preview`` is retained below as dead
+        # UAT 2026-06-19 QA #4/#5: bulk takes the extract-first +
+        # parallel + CSV review path. The submit-first legacy paths
+        # remain below as dead code for one cycle, in case rollback is
+        # needed. The legacy ``_invoice_bulk_preview`` is retained as dead
         # code for one cycle in case we need to roll back; it's no
         # longer reachable from this router.
-        return await self._invoice_bulk_submit_first(
+        return await self._invoice_extract_then_route_bulk(
             state, ctx, attachments, token, refresh, expires,
             attempt_sig=sig,
+        )
+
+    async def _invoice_extract_then_route_single(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        attachment: dict[str, Any],
+        token: str | None,
+        refresh: str | None,
+        expires: int | None,
+        *,
+        attempt_sig: str | None = None,
+    ) -> dict[str, Any]:
+        """UAT 2026-06-19 QA #3 — extract-first conditional single-PDF flow.
+
+        Per Madad PDF Step 10 + QA confirmation:
+          * Extract succeeds with usable fields → render the Approve/Edit
+            confirm card (SME can verify or correct OCR before submission).
+          * Extract fails OR returns an empty draft → fall back to
+            ``_invoice_submit_first`` (auto-submit blank; backend fills
+            blank defaults and ops cleans up later).
+
+        Only the "no file bytes" case still asks the SME to resend.
+        """
+        content = attachment.get("content_base64") or ""
+        filename = attachment.get("filename") or "invoice.pdf"
+        mime = attachment.get("mime_type")
+
+        attempt_fields: dict[str, Any] = {}
+        if attempt_sig:
+            attempt_fields["last_invoice_attempt_sig"] = attempt_sig
+            attempt_fields["last_invoice_attempt_at"] = (
+                ctx.clock.now().isoformat()
+            )
+
+        if not content or not token:
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {"reason": "We didn't receive the file bytes — please resend."},
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
+            )
+
+        # Immediate ack — extract may take a few seconds.
+        try:
+            await self._send(ctx, state, "onboarding.invoice.processing")
+        except Exception as exc:  # noqa: BLE001
+            ctx.logger.warning(
+                "invoice_processing_ack.failed", error=str(exc)[:200],
+            )
+
+        # [TEMP-DBG]
+        self._dbg(
+            ctx, "invoice.extract_then_route_single.request",
+            filename=filename, content_b64_len=len(content),
+        )
+
+        try:
+            draft = await self._invoices.extract_base64(
+                access_token=token,
+                filename=filename,
+                content_base64=content,
+                mime_type=mime,
+            )
+        except Exception as exc:  # noqa: BLE001 — fall through to auto-submit
+            ctx.logger.warning(
+                "invoice_extract.failed_falling_back_to_auto_submit",
+                filename=filename, error=str(exc)[:200],
+                error_type=type(exc).__name__,
+            )
+            return await self._invoice_submit_first(
+                state, ctx, attachment, token, refresh, expires,
+                attempt_sig=attempt_sig,
+            )
+
+        # [TEMP-DBG]
+        self._dbg(
+            ctx, "invoice.extract_then_route_single.draft",
+            filename=filename,
+            draft_keys=sorted(draft.keys()) if isinstance(draft, dict) else None,
+            empty=_draft_is_empty(draft),
+        )
+
+        if _draft_is_empty(draft):
+            # Extraction came back blank → auto-submit per QA: never
+            # block the SME. Backend defaults fill in N/A.
+            return await self._invoice_submit_first(
+                state, ctx, attachment, token, refresh, expires,
+                attempt_sig=attempt_sig,
+            )
+
+        # Extraction succeeded with usable fields → render the confirm
+        # card and park awaiting Approve / Edit / Reject.
+        await self._send_invoice_confirm_card(ctx, state, draft)
+        return self._step(
+            "invoice_collect_await", ctx,
+            pending_invoice_draft=draft,
+            pending_invoice_filename=filename,
+            pending_invoice_content_b64=content,
+            pending_invoice_mime=mime,
+            pending_invoice_edit_field=None,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+            **attempt_fields,
+        )
+
+    async def _invoice_extract_then_route_bulk(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        attachments: list[dict[str, Any]],
+        token: str | None,
+        refresh: str | None,
+        expires: int | None,
+        *,
+        attempt_sig: str | None = None,
+    ) -> dict[str, Any]:
+        """UAT 2026-06-19 QA #1+#4+#5 — bulk parallel extract + CSV review.
+
+        Replaces the per-member submit spam (1 "reading it now" + 1
+        "submitted ✅" per file = 20+ messages for 9 invoices) and the
+        sequential ~90s-per-file extract bottleneck.
+
+        Flow:
+          1. ONE "📦 Received N invoices — processing" ack up front.
+          2. Extract all members in PARALLEL (semaphore-capped at 5 to
+             match the cluster's concurrency budget). 8 invoices land
+             in ~10–15s instead of ~12 minutes.
+          3. Triage each result:
+             * Extract succeeded + has fields → goes to the CSV review
+               batch (SME can Approve all / Edit / Remove).
+             * Extract failed OR empty draft → auto-submit blank (ops
+               fills it later). Counted in the receipt as "auto-submitted".
+          4. If batch has reviewable rows → send the CSV preview + park
+             awaiting APPROVE ALL / EDIT [row]: change / REMOVE [row].
+          5. If all auto-submitted → send ONE consolidated receipt.
+        """
+        import asyncio as _asyncio
+
+        attempt_fields: dict[str, Any] = {}
+        if attempt_sig:
+            attempt_fields["last_invoice_attempt_sig"] = attempt_sig
+            attempt_fields["last_invoice_attempt_at"] = (
+                ctx.clock.now().isoformat()
+            )
+
+        members, saw_zip = _expand_zip_attachments(attachments)
+        # [TEMP-DBG]
+        self._dbg(
+            ctx, "invoice.bulk_extract_then_route.start",
+            attachment_count=len(attachments),
+            member_count=len(members),
+            saw_zip=saw_zip,
+        )
+        if not members:
+            await self._send(
+                ctx, state, "onboarding.invoice.failed",
+                {"reason": "We didn't see any invoice files in that batch. Please resend."},
+            )
+            return self._step(
+                "invoice_collect_await", ctx,
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
+            )
+
+        # ONE consolidated processing ack — replaces the per-member
+        # "reading it now" spam (QA #1).
+        try:
+            await self._send(
+                ctx, state, "onboarding.invoice.bulk.processing",
+                {"count": str(len(members))},
+            )
+        except Exception as exc:  # noqa: BLE001
+            ctx.logger.warning(
+                "invoice_bulk.processing_ack_failed", error=str(exc)[:200],
+            )
+
+        # Parallel extract — semaphore caps concurrency at 5 to match
+        # the cluster's documented OCR concurrency=1 → 5 in-flight at
+        # the agent gives the backend a healthy queue without
+        # overwhelming it. Each extract has its own per-call timeout
+        # (180s in mcp.provider) so the slowest member doesn't gate
+        # the others.
+        sem = _asyncio.Semaphore(5)
+
+        async def _extract_one(
+            idx: int, att: dict[str, Any],
+        ) -> tuple[int, dict[str, Any], dict[str, Any] | None]:
+            content = att.get("content_base64") or ""
+            filename = att.get("filename") or f"invoice_{idx}.pdf"
+            mime = att.get("mime_type")
+            if not content or _is_zip_attachment(att):
+                return idx, att, None
+            async with sem:
+                try:
+                    return idx, att, await self._invoices.extract_base64(
+                        access_token=token,
+                        filename=filename,
+                        content_base64=content,
+                        mime_type=mime,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning(
+                        "invoice_bulk.extract_failed",
+                        idx=idx, filename=filename,
+                        error=str(exc)[:200],
+                        error_type=type(exc).__name__,
+                    )
+                    return idx, att, None
+
+        triage = await _asyncio.gather(
+            *(_extract_one(i, att) for i, att in enumerate(members, 1))
+        )
+
+        batch: list[dict[str, Any]] = []
+        auto_submit_atts: list[dict[str, Any]] = []
+        total_qar = 0
+        currency = "QAR"
+        row_num = 1
+        for _idx, att, draft in triage:
+            if isinstance(draft, dict) and not _draft_is_empty(draft):
+                # Reviewable row — landed in the CSV preview.
+                amount = draft.get("total_amount")
+                try:
+                    amount_int = int(float(amount)) if amount is not None else 0
+                except (TypeError, ValueError):
+                    amount_int = 0
+                total_qar += amount_int
+                if isinstance(draft.get("currency"), str):
+                    currency = draft["currency"]
+                batch.append({
+                    "row":          row_num,
+                    "draft":        draft,
+                    "filename":     att.get("filename") or f"invoice_{row_num}.pdf",
+                    "content_b64":  att.get("content_base64") or "",
+                    "mime":         att.get("mime_type"),
+                    "flag":         _flag_for_row(draft),
+                })
+                row_num += 1
+            else:
+                # Extraction failed or empty → auto-submit blank.
+                auto_submit_atts.append(att)
+
+        # Auto-submit the blanks in PARALLEL — they all share the same
+        # backend create path so they bench like the extracts.
+        async def _submit_blank(att: dict[str, Any]) -> dict[str, Any] | None:
+            content = att.get("content_base64") or ""
+            filename = att.get("filename") or "invoice.pdf"
+            mime = att.get("mime_type")
+            if not content or not token:
+                return None
+            async with sem:
+                try:
+                    response = await self._invoices.extract_and_submit_base64(
+                        access_token=token,
+                        filename=filename,
+                        content_base64=content,
+                        mime_type=mime,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning(
+                        "invoice_bulk.auto_submit_failed",
+                        filename=filename, error=str(exc)[:200],
+                    )
+                    return None
+            invoice_id = (
+                response.get("invoice_id") or response.get("id")
+                if isinstance(response, dict) else None
+            )
+            return {
+                "invoice_id": invoice_id,
+                "filename":   filename,
+                "submitted_at": ctx.clock.now().isoformat(),
+                "status":     "SUBMITTED",
+            }
+
+        auto_results = (
+            await _asyncio.gather(*(_submit_blank(a) for a in auto_submit_atts))
+            if auto_submit_atts else []
+        )
+        auto_ledger = [r for r in auto_results if r is not None]
+        auto_failed = len(auto_submit_atts) - len(auto_ledger)
+
+        # Path A — reviewable CSV preview (one or more rows extracted OK)
+        if batch:
+            table = _render_invoice_batch_table(batch, currency, total_qar)
+            await self._send(
+                ctx, state, "onboarding.invoice.batch.preview",
+                {
+                    "table":   table,
+                    "count":   str(len(batch)),
+                    "total":   _fmt_qar(total_qar, currency),
+                    "saw_zip": "yes" if saw_zip else "no",
+                    "failed":  str(auto_failed),
+                },
+            )
+            new_sigs = list(state.invoice_submitted_sigs or [])
+            # Note: we DON'T record attempt_sig in submitted_sigs yet
+            # — the SME hasn't approved the batch yet. The sig is
+            # recorded when APPROVE ALL fires (handle_invoice_batch_action).
+            return self._step(
+                "invoice_collect_await", ctx,
+                pending_invoice_batch=batch,
+                pending_invoice_batch_total_qar=total_qar,
+                pending_invoice_batch_currency=currency,
+                invoices_submitted=[*state.invoices_submitted, *auto_ledger],
+                invoice_submitted_sigs=new_sigs[-200:],
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
+            )
+
+        # Path B — everything auto-submitted (no extract succeeded) →
+        # ONE consolidated receipt.
+        if auto_ledger:
+            failure_block = (
+                f"\n\n⚠️ {auto_failed} didn't submit cleanly — please resend those."
+                if auto_failed else ""
+            )
+            noun = "invoice" if len(auto_ledger) == 1 else "invoices"
+            await self._send(
+                ctx, state, "onboarding.invoice.bulk.submitted",
+                {
+                    "count": str(len(auto_ledger)),
+                    "noun":  noun,
+                    "failure_block": failure_block,
+                },
+            )
+            new_sigs = list(state.invoice_submitted_sigs or [])
+            if attempt_sig:
+                new_sigs.append(attempt_sig)
+            return self._step(
+                "invoice_collect_await", ctx,
+                invoices_submitted=[*state.invoices_submitted, *auto_ledger],
+                invoice_submitted_sigs=new_sigs[-200:],
+                access_token=token, refresh_token=refresh, token_expires_at=expires,
+                **attempt_fields,
+            )
+
+        # Path C — nothing got through. Be honest, ask for a retry.
+        await self._send(
+            ctx, state, "onboarding.invoice.failed",
+            {
+                "reason": (
+                    "We had a brief issue submitting your invoices — "
+                    "please try once more in a minute."
+                ),
+            },
+        )
+        return self._step(
+            "invoice_collect_await", ctx,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
+            **attempt_fields,
         )
 
     async def _invoice_submit_first(
@@ -5765,9 +6192,15 @@ class OnboardingWorkflow(WorkflowDefinition):
             "submitted_at": ctx.clock.now().isoformat(),
             "status": "SUBMITTED",
         }
+        # UAT 2026-06-19 QA #2: record the sig so later resumes silently
+        # drop this attachment payload (re-submission guard).
+        new_sigs = list(state.invoice_submitted_sigs or [])
+        if attempt_sig:
+            new_sigs.append(attempt_sig)
         return self._step(
             "invoice_collect_await", ctx,
             invoices_submitted=[*state.invoices_submitted, ledger_entry],
+            invoice_submitted_sigs=new_sigs[-200:],
             access_token=token, refresh_token=refresh, token_expires_at=expires,
             **attempt_fields,
         )
@@ -6092,9 +6525,17 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "failed":  0,
             },
         )
+        # UAT 2026-06-19 QA #2: record the attempt sig in the run-
+        # lifetime submitted-sigs tracker so any later resume
+        # (status_poll / phase1b webhook) that re-delivers the same
+        # attachment payload silently drops at the routing fork.
+        new_sigs = list(state.invoice_submitted_sigs or [])
+        if state.last_invoice_attempt_sig:
+            new_sigs.append(state.last_invoice_attempt_sig)
         return self._step(
             "invoice_collect_await", ctx,
             invoices_submitted=[*state.invoices_submitted, *accepted],
+            invoice_submitted_sigs=new_sigs[-200:],
             pending_invoice_draft=None,
             pending_invoice_filename=None,
             pending_invoice_content_b64=None,
@@ -6564,41 +7005,77 @@ class OnboardingWorkflow(WorkflowDefinition):
             v = d.get(key)
             return None if v in (None, "") else str(v)
 
-        for row in state.pending_invoice_batch:
+        # UAT 2026-06-19 QA #5: PARALLEL submit. Sequential submits made
+        # 8 invoices take >10 minutes. Cap at 5 in-flight (matches the
+        # cluster's documented concurrency budget). Each row goes through
+        # submit_base64 independently so a single transient failure
+        # doesn't drag the rest down.
+        import asyncio as _asyncio
+        sem = _asyncio.Semaphore(5)
+
+        async def _submit_one(row: dict[str, Any]) -> dict[str, Any] | None:
             draft = row.get("draft") or {}
             content = row.get("content_b64") or ""
-            try:
-                record = await self._invoices.submit_base64(
-                    access_token=token,
-                    filename=row.get("filename") or "invoice.pdf",
-                    content_base64=content,
-                    mime_type=row.get("mime"),
-                    invoice_number=_opt_field(draft, "invoice_number"),
-                    invoice_date=_opt_field(draft, "invoice_date"),
-                    due_date=_opt_field(draft, "due_date"),
-                    total_amount=_opt_field(draft, "total_amount"),
-                    supplier_name=_opt_field(draft, "supplier_name"),
-                    customer_name=_opt_field(draft, "customer_name"),
-                )
-            except Exception as exc:  # noqa: BLE001
-                ctx.logger.warning(
-                    "invoice_batch_submit.failed",
-                    row=row.get("row"), error=str(exc)[:200],
-                )
-                failed += 1
-                continue
-            accepted.append(_normalize_invoice_record(record, now_iso))
+            async with sem:
+                try:
+                    return await self._invoices.submit_base64(
+                        access_token=token,
+                        filename=row.get("filename") or "invoice.pdf",
+                        content_base64=content,
+                        mime_type=row.get("mime"),
+                        invoice_number=_opt_field(draft, "invoice_number"),
+                        invoice_date=_opt_field(draft, "invoice_date"),
+                        due_date=_opt_field(draft, "due_date"),
+                        total_amount=_opt_field(draft, "total_amount"),
+                        supplier_name=_opt_field(draft, "supplier_name"),
+                        customer_name=_opt_field(draft, "customer_name"),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning(
+                        "invoice_batch_submit.failed",
+                        row=row.get("row"), error=str(exc)[:200],
+                    )
+                    return None
 
+        # [TEMP-DBG]
+        self._dbg(
+            ctx, "invoice.bulk_submit_all.start",
+            row_count=len(state.pending_invoice_batch),
+        )
+        results = await _asyncio.gather(
+            *(_submit_one(row) for row in state.pending_invoice_batch)
+        )
+        for record in results:
+            if record is None:
+                failed += 1
+            else:
+                accepted.append(_normalize_invoice_record(record, now_iso))
+
+        # UAT 2026-06-19 QA #1: ONE consolidated bulk receipt. Replaces
+        # the per-row "submitted ✅" spam — SME sees just the summary.
+        failure_block = (
+            f"\n\n⚠️ {failed} didn't submit cleanly — please resend those."
+            if failed else ""
+        )
+        noun = "invoice" if len(accepted) == 1 else "invoices"
         await self._send(
-            ctx, state, "onboarding.invoice.batch.submitted",
+            ctx, state, "onboarding.invoice.bulk.submitted",
             {
-                "count":  str(len(accepted)),
-                "failed": str(failed),
+                "count":         str(len(accepted)),
+                "noun":          noun,
+                "failure_block": failure_block,
             },
         )
+        # UAT 2026-06-19 QA #2: record the sig now that the SME has
+        # explicitly approved the batch — any later resume that carries
+        # the same attachment payload silently drops.
+        new_sigs = list(state.invoice_submitted_sigs or [])
+        if state.last_invoice_attempt_sig:
+            new_sigs.append(state.last_invoice_attempt_sig)
         return self._step(
             "invoice_collect_await", ctx,
             invoices_submitted=[*state.invoices_submitted, *accepted],
+            invoice_submitted_sigs=new_sigs[-200:],
             pending_invoice_batch=[],
             pending_invoice_batch_total_qar=None,
             pending_invoice_batch_currency=None,
@@ -6753,22 +7230,51 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             utr = _get("utr", "UTR", "transaction_id", "transactionId")
             due_date = _get("dueDate", "due_date")
+            # UAT 2026-06-19 QA #7: Meta-approved disbursement template
+            # expects 6 vars (ref, amount, lender, utr, due_date,
+            # available_limit) — the agent was only passing 4 so the
+            # SME's message rendered "🏦 Lender: —" and "Available limit
+            # remaining: QAR —". Backend payload IS carrying lenderName,
+            # availableLimit, creditLimit per Madad PR #195/#196 (QA-
+            # confirmed). Wire all of them.
+            lender = _get("lenderName", "lender_name", "lender") or "—"
+            available_limit = _get(
+                "availableLimit", "available_limit",
+                "credit_limit_available",
+            )
+            credit_limit = _get(
+                "creditLimit", "credit_limit", "total_credit_limit",
+            )
             disbursements.append({
                 "amount": disbursed,
                 "currency": currency,
                 "invoice_ref": invoice_ref,
                 "utr": utr,
                 "due_date": due_date,
+                "lender": lender,
+                "available_limit": available_limit,
+                "credit_limit": credit_limit,
                 "received_at": now_iso,
                 "payload": payload,
             })
             await self._send(
                 ctx, state, "onboarding.disbursement.received",
                 {
-                    "amount":   _fmt_money(disbursed, currency),
-                    "ref":      invoice_ref or "—",
-                    "utr":      str(utr) if utr else "—",
-                    "due_date": str(due_date) if due_date else "—",
+                    "amount":          _fmt_money(disbursed, currency),
+                    "ref":             invoice_ref or "—",
+                    "utr":             str(utr) if utr else "—",
+                    "due_date":        str(due_date) if due_date else "—",
+                    "lender":          lender,
+                    "available_limit": (
+                        _fmt_money(available_limit, currency)
+                        if available_limit is not None
+                        else "—"
+                    ),
+                    "credit_limit": (
+                        _fmt_money(credit_limit, currency)
+                        if credit_limit is not None
+                        else "—"
+                    ),
                 },
             )
         elif event in {"repayment.received", "repayment.partially_paid", "repayment.closed"}:
@@ -7488,13 +7994,19 @@ class OnboardingWorkflow(WorkflowDefinition):
                 result = await fn(state, ctx)
             except Exception as exc:  # noqa: BLE001 — instrumentation, not handling
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
-                ctx.logger.exception(
-                    "[TEMP-DBG] node.exception",
-                    node=node_name,
-                    elapsed_ms=elapsed_ms,
-                    error=str(exc)[:300],
-                    error_type=type(exc).__name__,
-                )
+                # LangGraph's ``GraphInterrupt`` is normal control flow
+                # (signals "wait for input") — NOT a real error. Skip the
+                # node.exception log so the issue monitor isn't flooded
+                # with false positives. Anything else is a real error.
+                from langgraph.errors import GraphInterrupt
+                if not isinstance(exc, GraphInterrupt):
+                    ctx.logger.exception(
+                        "[TEMP-DBG] node.exception",
+                        node=node_name,
+                        elapsed_ms=elapsed_ms,
+                        error=str(exc)[:300],
+                        error_type=type(exc).__name__,
+                    )
                 raise
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             result_keys: list[str] = []
@@ -7599,8 +8111,17 @@ def _strip_qar(v: Any) -> str:
 
 
 def _offers_block(state: OnboardingState) -> str:
-    """One line per offer ('QIB — QAR 500,000 · 1.5%/mo · 90 days') for the
-    offers_available template's single {{1}} variable (1-2 offers in practice)."""
+    """One line per offer for the offers_available Meta template's single
+    {{1}} variable.
+
+    UAT 2026-06-19 QA #6a fix: Meta WhatsApp body parameters strip plain
+    ``\\n`` in some renders, so two offers showed up as 'QIB — ...
+    Commercial Bank — ...' on a single line. Prepend each row with a
+    leading newline + bullet glyph so the visual break survives whatever
+    Meta does to the text — the glyph itself forces the eye to a new
+    row even if newlines collapse, and the leading newline kicks the
+    first row off the variable's same-line position when present.
+    """
     rows: list[str] = []
     for o in (getattr(state, "offers", None) or []):
         if not isinstance(o, dict):
@@ -7618,8 +8139,10 @@ def _offers_block(state: OnboardingState) -> str:
             tenure = f"{int(o.get('tenureDays') or o.get('tenure_days') or o.get('tenure') or 0)} days"
         except (TypeError, ValueError):
             tenure = "—"
-        rows.append(f"{lender} — {limit} · {rate} · {tenure}")
-    return "\n".join(rows) if rows else "Please log in to view your offer details."
+        rows.append(f"🏦 {lender} — {limit} · {rate} · {tenure}")
+    # Double-newline separator: most Meta renderers preserve ``\n\n``
+    # (paragraph break) even when collapsing single ``\n`` to a space.
+    return "\n\n".join(rows) if rows else "Please log in to view your offer details."
 
 
 def _status_components(

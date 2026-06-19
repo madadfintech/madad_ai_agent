@@ -437,6 +437,14 @@ _TEMPLATE_BODIES = {
         "and you'll get an update here once they're disbursed. 💸{{ failure_block }}\n\n"
         "Send more invoices anytime — single file or a ZIP both work."
     ),
+    # UAT 2026-06-19 QA #1: ONE consolidated ack fires up front when a
+    # ZIP / multi-file batch lands. Replaces the per-file "reading it
+    # now…" spam that hit the SME with 10+ messages per upload.
+    "onboarding.invoice.bulk.processing": (
+        "📦 Received {{ count }} invoices — processing.\n\n"
+        "We'll send you the review summary in a moment. ⏳\n\n"
+        "Thank you for being with us. 🙏"
+    ),
     # Fires AFTER the SME taps Approve on the confirm card — the
     # cluster's submit step can take a few seconds and the SME used
     # to see a silent chat between Approve and the receipt. UAT
@@ -518,10 +526,16 @@ _TEMPLATE_BODIES = {
     ),
     # Backend ``transaction.disbursed`` event. Payload per Madad PR #187
     # (UAT 2026-06-16): invoiceNumber, disbursedAmount, utr, dueDate.
+    # UAT 2026-06-19 QA #7: include lender + available limit so the
+    # SME sees who disbursed + how much credit they have left.
     "onboarding.disbursement.received": (
-        "💸 Disbursed: {{ amount }} for invoice {{ ref }}.\n"
-        "Due {{ due_date }}.\n"
+        "💸 Disbursed!\n\n"
+        "📄 Invoice: {{ ref }}\n"
+        "💰 Amount: {{ amount }}\n"
+        "🏦 Lender: {{ lender }}\n"
+        "📅 Due: {{ due_date }}\n"
         "UTR: {{ utr }}\n\n"
+        "🔓 Available limit: {{ available_limit }}\n\n"
         "The amount should appear in your bank account shortly. 🏦"
     ),
     # Backend ``repayment.received`` with ``closed=false``. Payload per

@@ -250,6 +250,16 @@ class OnboardingState(WorkflowState):
     # share the sig field because that would suppress the handoff node's
     # one-shot send.
     offers_preview_shown_sig: str | None = None
+    # UAT 2026-06-19 QA #6b: backend emits one ``offers.available`` event
+    # per lender, so a 2-lender application produces two events seconds
+    # apart. Without a debounce the SME got the "offers ready" message
+    # twice — first with 1 bank, then with 2. ``_offer_view_send`` now
+    # stamps this on the FIRST arrival and re-parks silently; the next
+    # status-poll re-entry (60s cadence) sees the elapsed window and
+    # sends ONE consolidated message with the full offer set. The
+    # 30s window covers the observed inter-lender gap without keeping
+    # the SME waiting more than the existing poll cadence.
+    offers_first_seen_at: str | None = None
 
     # -- Step 5: monetization payment (Phase 3 will populate) ----------------
     business_details_id: str | None = None
@@ -293,6 +303,17 @@ class OnboardingState(WorkflowState):
     # silently dropped (no ack, no extract call, no failure message).
     last_invoice_attempt_sig: str | None = None
     last_invoice_attempt_at: str | None = None
+    # UAT 2026-06-19 QA #2: even with the 5min retry window, the agent
+    # was submitting each invoice ~3× — status_poll / event resumes
+    # were re-entering ``_invoice_collect_await`` with the same
+    # attachment payload from a stale state, and the time-window dedupe
+    # missed re-entries OUTSIDE the window. PERMANENT submitted-sig
+    # tracker: every sig that was actually submitted lands here for
+    # the run's lifetime; the invoice node refuses to re-submit a
+    # sig it has already processed. Bounded to the most recent 200
+    # to keep state small (a single SME never submits 200 invoices
+    # in one onboarding run).
+    invoice_submitted_sigs: list[str] = []
 
     # UAT 2026-06-16 (#3): single-invoice confirm-card flow staging.
     # When the SME sends a PDF, we extract (no submit) → render the

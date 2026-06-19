@@ -120,3 +120,97 @@ rules:
   # NOTE: we intentionally do NOT alert on every level=warning — staging
   # logs tens of warnings/min. The rules above pick the high-signal
   # warnings; everything else stays in the raw container log.
+
+
+# Behavioral rules — match deviations from EXPECTED behavior. The line-by-
+# line regex rules above catch crashes; these catch the QA-bug class
+# (duplicate sends, re-submission loops, slow operations, template
+# variables rendering as em-dash). Each rule type is implemented in
+# tools/log_monitor/behavioral.py.
+#
+# count rule:
+#   trigger          — regex selecting the relevant log line; named or
+#                      positional capture groups become the bucket key
+#   threshold        — alert when count reaches this many in window
+#   window_seconds   — sliding-window length
+#   cooldown_seconds — don't re-alert the same bucket within this window
+#
+# value rule:
+#   trigger        — regex selecting the line
+#   value_pattern  — regex with ONE capture group, parsed as float
+#   threshold      — alert when value >= threshold
+behavioral_rules:
+
+  # QA #1 (2026-06-19): 9 invoices generated 20+ messages. Catches any
+  # template that fires 3+ times for the same identity within 5 minutes.
+  # NOTE: cooldown 5 min so a sustained breach doesn't spam the issues log.
+  - name: duplicate_outbound_send
+    type: count
+    severity: warning
+    description: Same template fired 3+ times for one identity within 5 minutes — UX spam suspect
+    trigger: '\[TEMP-DBG\] obs\.outbound\.send.*identity=(?P<identity>\S+).*template_key=(?P<template_key>\S+)'
+    threshold: 3
+    window_seconds: 300
+    cooldown_seconds: 300
+
+  # QA #2 (2026-06-19): 47 invoice tool calls for ~9 files = re-submission loop.
+  # Catches any single identity firing the invoice submit instrumentation
+  # 3+ times within 30 min. Different from QA #1 because we track the
+  # MCP-call site, not the SME-facing template.
+  - name: invoice_resubmit_loop
+    type: count
+    severity: error
+    description: Invoice submit fired 3+ times for one identity within 30 min — re-submission loop suspect
+    trigger: '\[TEMP-DBG\] obs\.invoice\.submit.*identity=(?P<identity>\S+)'
+    threshold: 3
+    window_seconds: 1800
+    cooldown_seconds: 600
+
+  # QA #5 (2026-06-19): 8 invoices took >10 minutes sequentially. Catches
+  # any single invoice extract or submit MCP call > 30s — that's the
+  # window where the SME notices the slowness. Values are recorded by
+  # mcp.call.success which the MCP client already emits.
+  - name: slow_invoice_extract
+    type: value
+    severity: warning
+    description: Invoice extract took longer than 30s — investigate OCR / network
+    trigger: '\[TEMP-DBG\] mcp\.call\.success.*tool=madad_invoices_extract'
+    value_pattern: 'elapsed_ms=(\d+)'
+    threshold: 30000
+
+  - name: slow_invoice_submit
+    type: value
+    severity: warning
+    description: Invoice submit took longer than 30s — investigate backend create
+    trigger: '\[TEMP-DBG\] mcp\.call\.success.*tool=madad_invoices_(?:submit_invoice|extract_and_submit_invoice)'
+    value_pattern: 'elapsed_ms=(\d+)'
+    threshold: 30000
+
+  # QA #7 (2026-06-19): disbursed message rendered with "🏦 Lender: —"
+  # and "Available limit: QAR —". The agent passed only 4 vars when the
+  # Meta template expected 6 → 2 placeholders rendered as em-dash.
+  # adapters.py counts em-dash vars per send; this rule fires when a
+  # template goes out with 2+ blanks.
+  - name: empty_template_variables
+    type: count
+    severity: warning
+    description: Template fired with 2+ key variables rendering as em-dash — wiring bug suspect
+    trigger: '\[TEMP-DBG\] obs\.outbound\.send.*template_key=(?P<template_key>\S+).*vars_em_dash_count=(?P<em_dash_count>[2-9])'
+    threshold: 1
+    window_seconds: 60
+    cooldown_seconds: 120
+
+  # Bonus — catches any MCP terminal failure regardless of tool. The
+  # line-by-line ``mcp_call_terminal_failure`` rule already fires on
+  # this, so the behavioral one is redundant for the regex layer; it's
+  # here to demonstrate cross-cutting "any tool failing too often"
+  # detection. Tune up the threshold once we have a baseline of normal
+  # failure noise.
+  - name: mcp_call_failures_burst
+    type: count
+    severity: error
+    description: 5+ MCP terminal failures across any tool within 5 minutes — backend hiccup or auth wedge
+    trigger: '\[TEMP-DBG\] mcp\.call\.terminal_failure'
+    threshold: 5
+    window_seconds: 300
+    cooldown_seconds: 300

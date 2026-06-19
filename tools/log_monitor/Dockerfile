@@ -22,6 +22,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py /app/main.py
+COPY behavioral.py /app/behavioral.py
 COPY rules.yml /app/rules.yml
 
 ENV PYTHONUNBUFFERED=1

@@ -9,12 +9,59 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.logging import get_logger
 from app.services.communication.schemas import OutboundMessageRequest
 from app.services.communication.service import CommunicationService
 from app.services.nudge.service import NudgeService
 from app.shared.workflow.enums import Channel
 
 from .ports import Messenger, Reminders
+
+
+# [TEMP-DBG] To find exact bug - Temp Logs (behavioral instrumentation):
+# Every outbound send logs a structured ``obs.outbound.send`` line so the
+# log monitor's behavioral rules can detect:
+#   * Duplicate template fires (same identity + template_key N+ in window)
+#   * Empty-variable canary (≥2 of the template's variables render as em-dash)
+# Remove these when the pipeline is stable.
+_OBS = get_logger("workflow.obs")
+
+
+def _count_em_dashes(variables: dict[str, Any] | None) -> int:
+    """Count how many variable values would render as a literal em-dash.
+    Templates that fire with multiple ``—`` placeholders are usually a
+    bug (template variable wiring missed a field)."""
+    if not variables:
+        return 0
+    n = 0
+    for v in variables.values():
+        if isinstance(v, str) and v.strip() in ("—", ""):
+            n += 1
+        elif v is None:
+            n += 1
+    return n
+
+
+def _emit_obs_send(
+    *, identity: str, channel: Any, template_key: str,
+    variables: dict[str, Any] | None, send_kind: str,
+) -> None:
+    """[TEMP-DBG] Emit one ``obs.outbound.send`` line per send for the
+    behavioral monitor. Best-effort; never raise into the messenger path."""
+    try:
+        em_dash = _count_em_dashes(variables)
+        total = len(variables or {})
+        _OBS.info(
+            "[TEMP-DBG] obs.outbound.send",
+            identity=identity,
+            channel=str(getattr(channel, "value", channel)).lower(),
+            template_key=template_key,
+            send_kind=send_kind,
+            vars_em_dash_count=em_dash,
+            vars_total=total,
+        )
+    except Exception:  # noqa: BLE001 — instrumentation must never fail
+        pass
 
 
 class CommunicationMessenger(Messenger):
@@ -35,6 +82,10 @@ class CommunicationMessenger(Messenger):
     ) -> None:
         from app.shared.i18n import Locale
 
+        _emit_obs_send(
+            identity=identity, channel=channel,
+            template_key=template_key, variables=variables, send_kind="text",
+        )
         await self._comms.send(
             OutboundMessageRequest(
                 channel=channel,
@@ -59,6 +110,10 @@ class CommunicationMessenger(Messenger):
         from app.services.communication.models import MessageStatus  # type: ignore[attr-defined]
         from app.shared.i18n import Locale
 
+        _emit_obs_send(
+            identity=identity, channel=channel,
+            template_key=template_key, variables=variables, send_kind="cta_url",
+        )
         message = await self._comms.send(
             OutboundMessageRequest(
                 channel=channel,
@@ -93,6 +148,11 @@ class CommunicationMessenger(Messenger):
         from app.services.communication.models import MessageStatus  # type: ignore[attr-defined]
         from app.shared.i18n import Locale
 
+        _emit_obs_send(
+            identity=identity, channel=channel,
+            template_key=template_key, variables=variables,
+            send_kind="reply_buttons",
+        )
         message = await self._comms.send(
             OutboundMessageRequest(
                 channel=channel,
@@ -125,6 +185,11 @@ class CommunicationMessenger(Messenger):
         from app.services.communication.models import MessageStatus  # type: ignore[attr-defined]
         from app.shared.i18n import Locale
 
+        _emit_obs_send(
+            identity=identity, channel=channel,
+            template_key=template_key, variables=variables,
+            send_kind="meta_template",
+        )
         message = await self._comms.send(
             OutboundMessageRequest(
                 channel=channel,

@@ -6123,6 +6123,18 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "invoice_processing_ack.failed", error=str(exc)[:200],
             )
 
+        # [TEMP-DBG] obs.invoice.submit — behavioral instrumentation. The
+        # log monitor watches for ≥3 submits per identity within 30 min
+        # (the re-submission loop QA reported on 2026-06-19).
+        ctx.logger.info(
+            "[TEMP-DBG] obs.invoice.submit",
+            identity=ctx.identity,
+            tool="extract_and_submit_base64",
+            filename=filename,
+            run_id=ctx.run_id,
+            attempt_sig=attempt_sig or "",
+            site="submit_first",
+        )
         # Submit-first: backend creates the invoice immediately with
         # blank defaults (invoiceNumber='N/A', totalAmount=0,
         # customerName='N/A'); the OCR enrichment runs in the background
@@ -6476,6 +6488,16 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "invoice_submit_ack.failed", error=str(exc)[:200],
             )
 
+        # [TEMP-DBG] obs.invoice.submit
+        ctx.logger.info(
+            "[TEMP-DBG] obs.invoice.submit",
+            identity=ctx.identity,
+            tool="submit_base64",
+            filename=state.pending_invoice_filename or "—",
+            run_id=ctx.run_id,
+            attempt_sig=state.last_invoice_attempt_sig or "",
+            site="submit_confirmed",
+        )
         try:
             record = await self._invoices.submit_base64(
                 access_token=token,
@@ -6643,6 +6665,15 @@ class OnboardingWorkflow(WorkflowDefinition):
             self._dbg(
                 ctx, "invoice.bulk.member.submit",
                 idx=idx, filename=filename, content_b64_len=len(content),
+            )
+            ctx.logger.info(
+                "[TEMP-DBG] obs.invoice.submit",
+                identity=ctx.identity,
+                tool="extract_and_submit_base64",
+                filename=filename,
+                run_id=ctx.run_id,
+                attempt_sig=attempt_sig or "",
+                site="bulk_submit_first_member",
             )
             try:
                 response = await self._invoices.extract_and_submit_base64(
@@ -7016,6 +7047,15 @@ class OnboardingWorkflow(WorkflowDefinition):
         async def _submit_one(row: dict[str, Any]) -> dict[str, Any] | None:
             draft = row.get("draft") or {}
             content = row.get("content_b64") or ""
+            ctx.logger.info(
+                "[TEMP-DBG] obs.invoice.submit",
+                identity=ctx.identity,
+                tool="submit_base64",
+                filename=row.get("filename") or "invoice.pdf",
+                run_id=ctx.run_id,
+                attempt_sig=state.last_invoice_attempt_sig or "",
+                site="bulk_approve_all_row",
+            )
             async with sem:
                 try:
                     return await self._invoices.submit_base64(

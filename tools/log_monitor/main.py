@@ -39,6 +39,8 @@ import yaml
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
+from behavioral import evaluate_all, load_behavioral_rules
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -97,6 +99,7 @@ def _load_rules() -> list[dict[str, Any]]:
 
 
 RULES: list[dict[str, Any]] = []
+BEHAVIORAL_RULES: list = []
 RING: deque[dict[str, Any]] = deque(maxlen=BUFFER_SIZE)
 LIVE_QUEUES: set[asyncio.Queue[dict[str, Any]]] = set()
 
@@ -107,6 +110,16 @@ def match_line(line: str) -> dict[str, Any] | None:
         if rule["_re"].search(line):
             return rule
     return None
+
+
+def _load_behavioral() -> list:
+    """Load behavioral rules from the same rules.yml file."""
+    try:
+        raw = yaml.safe_load(RULES_PATH.read_text(encoding="utf-8")) or {}
+    except OSError as exc:
+        log.warning("behavioral rules: failed to read %s: %s", RULES_PATH, exc)
+        return []
+    return load_behavioral_rules(raw.get("behavioral_rules") or [])
 
 
 # ---------------------------------------------------------------------------
@@ -207,18 +220,30 @@ async def _tail_container(container: str) -> None:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if not line:
                     continue
+                # 1) Line-by-line regex rules (crashes / typed errors).
                 rule = match_line(line)
-                if rule is None:
-                    continue
-                entry = {
-                    "at": datetime.now(UTC).isoformat(),
-                    "container": container,
-                    "rule": rule["name"],
-                    "severity": rule.get("severity", "warning"),
-                    "description": rule.get("description", ""),
-                    "line": line,
-                }
-                await _append_issue(entry)
+                if rule is not None:
+                    entry = {
+                        "at": datetime.now(UTC).isoformat(),
+                        "container": container,
+                        "rule": rule["name"],
+                        "severity": rule.get("severity", "warning"),
+                        "description": rule.get("description", ""),
+                        "line": line,
+                    }
+                    await _append_issue(entry)
+                # 2) Behavioral rules (stateful — track windows / counts /
+                # values across lines).
+                for alert in evaluate_all(BEHAVIORAL_RULES, line):
+                    behavioral_entry = {
+                        "at": datetime.now(UTC).isoformat(),
+                        "container": container,
+                        "rule": alert["rule"],
+                        "severity": alert.get("severity", "warning"),
+                        "description": alert.get("description", ""),
+                        "line": _format_behavioral_summary(alert),
+                    }
+                    await _append_issue(behavioral_entry)
         except asyncio.CancelledError:
             log.info("tail cancelled: %s", container)
             try:
@@ -256,17 +281,36 @@ def _require_admin(authorization: str | None) -> None:
 app = FastAPI(title="Madad Log Monitor", version="0.1.0")
 
 
+def _format_behavioral_summary(alert: dict[str, Any]) -> str:
+    """One-line summary for the issues log when a behavioral rule fires."""
+    parts = []
+    if "group_key" in alert:
+        parts.append(f"group=[{alert['group_key']}]")
+    if "count_in_window" in alert:
+        parts.append(
+            f"count={alert['count_in_window']} window={alert['window_seconds']}s"
+        )
+    if "value" in alert:
+        parts.append(f"value={alert['value']} threshold={alert['threshold']}")
+    if alert.get("matched_line"):
+        parts.append(f"line='{alert['matched_line']}'")
+    return " | ".join(parts)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
-    global RULES
+    global RULES, BEHAVIORAL_RULES
     RULES = _load_rules()
+    BEHAVIORAL_RULES = _load_behavioral()
     ISSUES_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     for container in CONTAINERS:
         asyncio.create_task(_tail_container(container))
     log.info(
-        "monitor started: watching %d containers, %d rules, log=%s",
+        "monitor started: watching %d containers, %d regex rules, "
+        "%d behavioral rules, log=%s",
         len(CONTAINERS),
         len(RULES),
+        len(BEHAVIORAL_RULES),
         ISSUES_LOG_PATH,
     )
 
@@ -290,7 +334,7 @@ async def health() -> dict[str, Any]:
 async def rules(authorization: str | None = Header(None)) -> dict[str, Any]:
     _require_admin(authorization)
     return {
-        "rules": [
+        "regex_rules": [
             {
                 "name": r["name"],
                 "pattern": r["pattern"],
@@ -298,7 +342,26 @@ async def rules(authorization: str | None = Header(None)) -> dict[str, Any]:
                 "description": r.get("description"),
             }
             for r in RULES
-        ]
+        ],
+        "behavioral_rules": [
+            {
+                "name": r.name,
+                "type": type(r).__name__,
+                "severity": r.severity,
+                "description": r.description,
+                **(
+                    {
+                        "threshold": r.threshold,
+                        "window_seconds": r.window_seconds,
+                    } if hasattr(r, "window_seconds") else {}
+                ),
+                **(
+                    {"threshold": r.threshold}
+                    if hasattr(r, "_value_pattern") else {}
+                ),
+            }
+            for r in BEHAVIORAL_RULES
+        ],
     }
 
 

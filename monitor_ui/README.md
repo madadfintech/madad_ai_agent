@@ -33,24 +33,53 @@ cp monitor_ui/.env.example monitor_ui/.env
 **Windows:**
 
 ```powershell
-.\monitor_ui\start.ps1
+.\monitor_ui\start.ps1     # start
+.\monitor_ui\status.ps1    # check status
+.\monitor_ui\stop.ps1      # stop
 ```
 
 **macOS / Linux:**
 
 ```bash
-./monitor_ui/start.sh
+./monitor_ui/start.sh      # start
+./monitor_ui/status.sh     # check status
+./monitor_ui/stop.sh       # stop
 ```
 
-Both scripts:
+`start` runs the backend + frontend as **detached background
+processes** and returns control immediately — closing the terminal is
+fine, they keep running. PIDs and logs are written to
+`monitor_ui/.run/`.
 
-1. Create a Python venv at `monitor_ui/backend/.venv` (one-time)
-2. Install backend deps (one-time)
-3. Install frontend deps via `npm install` (one-time)
-4. Launch the backend on `http://127.0.0.1:5001`
-5. Launch the Vite dev server on `http://localhost:5173`
+On first run, `start` also:
+
+1. Creates the Python venv at `monitor_ui/backend/.venv`
+2. Installs backend deps
+3. Installs frontend deps via `npm install`
+
+Then it launches:
+
+- Backend on `http://127.0.0.1:5001`
+- Vite dev server on `http://localhost:5173`
 
 Open <http://localhost:5173> in your browser.
+
+`status` shows the backend / frontend daemon state plus tunnel +
+monitor health. `stop` reads the PID files and kills the entire
+process tree (so npm's child `node`/`vite` and uvicorn's reloader
+children all get cleaned up).
+
+To tail logs while it's running:
+
+```powershell
+Get-Content -Wait monitor_ui\.run\backend.log
+Get-Content -Wait monitor_ui\.run\frontend.log
+```
+
+```bash
+tail -f monitor_ui/.run/backend.log
+tail -f monitor_ui/.run/frontend.log
+```
 
 ## Pages
 
@@ -103,7 +132,9 @@ no parallel cleanup paths.
 ```
 monitor_ui/
 ├── README.md
-├── start.sh / start.ps1     # one-command launchers
+├── start.sh / start.ps1     # detached background launch
+├── stop.sh  / stop.ps1      # graceful stop via PID files
+├── status.sh / status.ps1   # daemon + tunnel + monitor health
 ├── .env.example
 ├── backend/
 │   ├── main.py              # FastAPI app + endpoints
@@ -144,6 +175,14 @@ key path differs from the team default.
 
 ## Stopping it
 
-`Ctrl-C` in the terminal where you launched it. Both processes exit
-together (`trap cleanup EXIT` in `start.sh`; jobs are killed in
-`start.ps1`).
+```powershell
+.\monitor_ui\stop.ps1
+```
+
+```bash
+./monitor_ui/stop.sh
+```
+
+`stop` reads `monitor_ui/.run/{backend,frontend}.pid` and kills the
+whole process tree. Safe to run when nothing is running — it just
+reports `not running` per daemon.

@@ -1,0 +1,9 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+# sshtunnel 0.4.0 references paramiko.DSSKey which was removed in
+# paramiko 4.x. Pin paramiko to the last 3.x line.
+paramiko==3.5.0
+sshtunnel==0.4.0
+sqlmodel==0.0.22
+python-dotenv==1.0.1

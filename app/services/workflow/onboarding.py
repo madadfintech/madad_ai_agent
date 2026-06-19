@@ -3061,18 +3061,28 @@ class OnboardingWorkflow(WorkflowDefinition):
         # timeout/error all leave it False → no false Qatar claim. A genuine CR
         # that fails to classify just misses the affirmation line (the financials
         # request still goes out) — far better than asserting Qatar for a non-CR.
-        # UAT 2026-06-19 QA #8 regression fix: the classifier-and-trust
-        # approach (classify_and_upload_document_base64) dumps the CR
-        # into "Additional Documents" when the classifier blips, stalling
-        # onboarding. Revert to the FORCED CR upload — the SME has
-        # explicitly sent us their CR at this point and the OCR validates
-        # it Qatar-side; we always put it in the CR slot. The classifier
-        # still runs separately, but ONLY to gate the
-        # "registered in Qatar ✅" affirmation line — it never affects
-        # which slot the document lands in.
+        # UAT 2026-06-19 QA fix: previously we called BOTH
+        # ``upload_commercial_registration`` (forced) AND
+        # ``classify_and_upload_document_base64`` (informational) — but
+        # the classifier tool ALSO uploads to the backend, so each CR
+        # landed twice in the DB. Per QA: the SME was explicitly asked
+        # to upload their CR + the backend OCR validates it Qatar-side
+        # → we can trust it's a CR without re-classifying. Forced upload
+        # only; set cr_verified=True on success so the "registered in
+        # Qatar ✅" line still renders downstream.
         cr_verified = False
         if token and state.cr_ref:
-            # 1) Force-upload as CR (never depends on classifier success).
+            # [TEMP-DBG] obs.kyc.upload — behavioral instrumentation. The
+            # monitor watches for same (identity, filename) uploaded
+            # more than once within 60s.
+            ctx.logger.info(
+                "[TEMP-DBG] obs.kyc.upload",
+                identity=ctx.identity,
+                tool="upload_commercial_registration",
+                filename=state.cr_ref,
+                run_id=ctx.run_id,
+                site="cr_upload",
+            )
             try:
                 await self._kyc.upload_commercial_registration(
                     access_token=token,
@@ -3080,39 +3090,13 @@ class OnboardingWorkflow(WorkflowDefinition):
                     filename=state.cr_ref,
                     mime_type=state.cr_mime_type,
                 )
+                cr_verified = True
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
                     "cr_upload.forced_failed", error=str(exc)[:200],
                     note=(
                         "forced CR upload failed; flow continues but the SME's "
                         "CR isn't recorded — surface to ops via the issue monitor"
-                    ),
-                )
-            # 2) Classifier purely informational — gates the Qatar
-            #    affirmation line only. Never affects routing or storage.
-            try:
-                resp = await self._kyc.classify_and_upload_document_base64(
-                    access_token=token,
-                    content_base64=state.cr_content_base64 or "",
-                    filename=state.cr_ref,
-                    mime_type=state.cr_mime_type,
-                )
-                detected: str | None = None
-                if isinstance(resp, dict):
-                    raw = (
-                        resp.get("document_type")
-                        or resp.get("documentType")
-                        or resp.get("resolved_document_type")
-                    )
-                    if isinstance(raw, str) and raw:
-                        detected = _workflow_doc_type(raw)
-                cr_verified = detected == "commercial_registration"
-            except Exception as exc:  # noqa: BLE001 — degrade in staging
-                ctx.logger.warning(
-                    "cr_classify.failed", error=str(exc)[:200],
-                    note=(
-                        "classifier informational only; CR already uploaded "
-                        "via the forced path above"
                     ),
                 )
         # Step 2 — CR uploaded (backend journey_status: INCOMPLETE).
@@ -3358,6 +3342,15 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         if state.access_token and state.financials_received:
+            # [TEMP-DBG] obs.kyc.upload
+            ctx.logger.info(
+                "[TEMP-DBG] obs.kyc.upload",
+                identity=ctx.identity,
+                tool="upload_audited_financial_report",
+                filename=state.financials_filename or "audited_report.pdf",
+                run_id=ctx.run_id,
+                site="financials_upload",
+            )
             try:
                 await self._kyc.upload_audited_financial_report(
                     access_token=state.access_token,
@@ -3943,6 +3936,15 @@ class OnboardingWorkflow(WorkflowDefinition):
             if not token:
                 non_zip.append(att)
                 continue
+            # [TEMP-DBG] obs.kyc.upload
+            ctx.logger.info(
+                "[TEMP-DBG] obs.kyc.upload",
+                identity=ctx.identity,
+                tool="classify_and_upload_zip_base64",
+                filename=att.get("filename") or "",
+                run_id=ctx.run_id,
+                site="docs_classify_zip",
+            )
             try:
                 # Hard wall-clock cap so a hung Cloud-Run ZIP processor
                 # can't trap the node behind the workflow runtime's own
@@ -4013,6 +4015,15 @@ class OnboardingWorkflow(WorkflowDefinition):
             if not token:
                 return False, None
             filename = att.get("filename") or ""
+            # [TEMP-DBG] obs.kyc.upload
+            ctx.logger.info(
+                "[TEMP-DBG] obs.kyc.upload",
+                identity=ctx.identity,
+                tool="classify_and_upload_document_base64",
+                filename=filename,
+                run_id=ctx.run_id,
+                site="docs_classify_single",
+            )
             try:
                 classify_response = await asyncio.wait_for(
                     self._kyc.classify_and_upload_document_base64(

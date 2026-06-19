@@ -166,6 +166,19 @@ behavioral_rules:
     window_seconds: 1800
     cooldown_seconds: 600
 
+  # QA 2026-06-19 (CR double-upload): CR was uploaded twice — once via
+  # forced upload_commercial_registration, once via the classifier's
+  # internal upload. Same (identity, filename) hitting KYC upload 2+
+  # times within 60s is almost always a duplicate-upload bug.
+  - name: duplicate_kyc_upload
+    type: count
+    severity: error
+    description: Same (identity, filename) uploaded to KYC 2+ times within 60s — duplicate-upload suspect
+    trigger: '\[TEMP-DBG\] obs\.kyc\.upload.*identity=(?P<identity>\S+).*filename=(?P<filename>\S+)'
+    threshold: 2
+    window_seconds: 60
+    cooldown_seconds: 60
+
   # QA #5 (2026-06-19): 8 invoices took >10 minutes sequentially. Catches
   # any single invoice extract or submit MCP call > 30s — that's the
   # window where the SME notices the slowness. Values are recorded by

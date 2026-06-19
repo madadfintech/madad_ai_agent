@@ -270,17 +270,17 @@ async def test_full_new_lead_journey_through_real_mcp_adapters() -> None:
         Tools.KYC_GET_BUSINESS_DETAILS,
         Tools.PAYMENTS_LIST_MONETIZATION_PRODUCTS,
         Tools.PAYMENTS_CREATE_MONETIZATION_PAYMENT,
-        Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK,
+        # UAT 2026-06-19: PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK dropped
+        # (always 400, side-channel only — primary link goes via our own
+        # messenger as a CTA-URL).
     }
     for tool in expected:
         assert tool in call_names, f"missing tool {tool} in {call_names}"
+    assert Tools.PAYMENTS_SEND_MONETIZATION_PAYMENT_LINK not in call_names
 
-    # The idempotency keys we sent on the two payment writes are recorded in
-    # state so the polling worker / audit can correlate retries.
+    # The create-payment idempotency key is still recorded so retries
+    # collapse on the same backend record.
     assert final.values["idempotency_keys"]["create_monetization_payment"].endswith(
         ":create_monetization_payment"
     )
-    assert final.values["idempotency_keys"][
-        "send_monetization_payment_link"
-    ].endswith(":send_monetization_payment_link")
 

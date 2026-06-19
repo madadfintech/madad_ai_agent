@@ -101,6 +101,7 @@ from .ports import (
     Reminders,
 )
 from .state import JourneyStatus, OnboardingState, is_no, is_yes, reply_attachments, reply_text
+from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
 
 # QAR 6,000 is the current monetization onboarding fee (Madad ops M-5 may
 # vary it by segment later — the workflow falls back to whatever the
@@ -1863,6 +1864,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         reminders: Reminders,
         invoices: InvoiceClient | None = None,
         checklist: ChecklistProvider | None = None,
+        dedupe: WebhookDedupe | None = None,
     ) -> None:
         self._msg = messenger
         self._identity = identity
@@ -1879,6 +1881,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         # backend config must reflect in the next conversation"). None falls
         # back to ``DEFAULT_WHATSAPP_REQUIRED_DOCS`` so tests/dev keep working.
         self._checklist = checklist
+        # Shared with the dispatcher (SET NX EX over Redis in prod). Used
+        # for cross-execution inflight locks the LangGraph checkpoint can't
+        # provide — specifically the slow invoice extract path where a
+        # webhook retry races a still-running node. Optional: when None,
+        # the InMemory fallback gives correct single-process behaviour.
+        self._dedupe: WebhookDedupe = dedupe or InMemoryWebhookDedupe()
 
     # -- graph wiring ---------------------------------------------------------
 
@@ -2829,6 +2837,26 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _complete_onboarding_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
+        # The graph routes "new" → complete_onboarding_send DIRECTLY without
+        # going through _collect_onboarding_details_send (the only other site
+        # that mints the onboarding_token). If state.onboarding_token is
+        # absent, opening a session here mints one so the complete_onboarding
+        # call below has a valid bearer — without it, Madad returns 401 and
+        # this node degrades silently every time.
+        onboarding_token = state.onboarding_token
+        if not onboarding_token:
+            try:
+                bridge = await self._identity.open_session(
+                    channel=_channel(ctx),
+                    identifier=ctx.identity,
+                    create_onboarding_token=True,
+                )
+                onboarding_token = bridge.onboarding_token
+            except Exception as exc:  # noqa: BLE001 — degrade in staging
+                ctx.logger.warning(
+                    "complete_onboarding.token_mint_failed",
+                    error=str(exc)[:200],
+                )
         # BULLETPROOF account creation. The cluster's complete-onboarding REQUIRES
         # every one of email / legal_entity_name / cr_number / is_qatar_based /
         # role — and the WhatsApp free-text intake may not capture all of them.
@@ -2862,7 +2890,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             await self._identity.complete_onboarding(
                 first_name=first,
                 last_name=last,
-                onboarding_token=state.onboarding_token or "",
+                onboarding_token=onboarding_token or "",
                 email=email,
                 phone_number=phone,
                 legal_entity_name=legal,
@@ -2877,7 +2905,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                 note="staging-tolerant: continuing — second session call will "
                      "establish identity for the existing user case",
             )
-        return self._step("complete_onboarding_send", ctx)
+        return self._step(
+            "complete_onboarding_send", ctx,
+            onboarding_token=onboarding_token or state.onboarding_token,
+        )
 
     async def _channel_session_second(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -4971,36 +5002,15 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "payment_link": state.payment_link or "",
             },
         )
-        # ALSO fire the backend's notification trigger as a side-channel —
-        # if it succeeds the SME gets a Madad-branded copy of the link too,
-        # if it fails (502 in current UAT) we already sent our own.
-        # Bug #13 (UAT 2026-06-09): mint a fresh token first — the cached
-        # token may be ~15 minutes old by now.
+        # The PRIMARY payment link was already sent via our own messenger
+        # above (CTA-URL button + plain-text fallback). We previously also
+        # fired ``madad_payments_send_monetization_payment_link`` as a side
+        # channel for a Madad-branded duplicate. UAT 2026-06-19: the call
+        # returns HTTP 400 every time (recipient_phone payload-shape
+        # rejected by the backend), generating constant monitor noise with
+        # zero SME-visible benefit — the SME already has the link. Dropping
+        # the side-channel call.
         token, refresh, expires = await self._live_token(state, ctx)
-        if token and state.payment_id:
-            key = f"{ctx.run_id}:send_monetization_payment_link"
-            try:
-                await self._pay.send_monetization_payment_link(
-                    access_token=token,
-                    payment_id=state.payment_id,
-                    channel=_channel(ctx),
-                    identity=ctx.identity,
-                    idempotency_key=key,
-                )
-                return self._step(
-                    "payment_send_link", ctx,
-                    access_token=token, refresh_token=refresh, token_expires_at=expires,
-                    idempotency_keys={
-                        **state.idempotency_keys,
-                        "send_monetization_payment_link": key,
-                    },
-                )
-            except Exception as exc:  # noqa: BLE001
-                ctx.logger.warning(
-                    "payment_send_link.notification_failed",
-                    error=str(exc)[:200],
-                    note="primary link already sent via messenger — continuing",
-                )
         return self._step(
             "payment_send_link", ctx,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
@@ -5684,6 +5694,38 @@ class OnboardingWorkflow(WorkflowDefinition):
                 note="run already submitted this attachment set; refusing re-submit",
             )
             return self._step("invoice_collect_await", ctx)
+
+        # UAT 2026-06-19 QA: cross-execution inflight guard. Madad's
+        # invoice extract takes 70-100s per file (their OCR latency, not
+        # ours). The webhook caller (Meta bridge) times out at ~30s and
+        # retries the inbound; each retry triggers a concurrent workflow
+        # execution from the SAME checkpoint, so the state-level dedupe
+        # above misses (LangGraph only writes state on node return). The
+        # SME sees 3-4 ``bulk.processing`` acks and then "no response"
+        # on subsequent uploads. SET NX EX over Redis: the first runner
+        # claims the (identity, sig) key for 120s; concurrent retries
+        # see the lock and silently drop. TTL > typical extract duration
+        # so the guard outlives the slow call without permanently
+        # blocking legitimate later re-attempts.
+        if sig:
+            inflight_key = f"invoice:inflight:{ctx.identity}:{sig}"
+            try:
+                first_runner = await self._dedupe.claim(
+                    inflight_key, ttl_seconds=120
+                )
+            except Exception as exc:  # noqa: BLE001 — Redis hiccup must not block uploads
+                ctx.logger.warning(
+                    "invoice.inflight.claim_failed",
+                    error=str(exc)[:200],
+                    note="proceeding without inflight guard",
+                )
+                first_runner = True
+            if not first_runner:
+                ctx.logger.info(
+                    "invoice.inflight.dedupe_skip", sig=sig,
+                    note="concurrent extract already running for this attachment set",
+                )
+                return self._step("invoice_collect_await", ctx)
 
         # Mint a live token from the verified identity (a long-active user can
         # resume with an empty/expired cached token — same fix as doc uploads).

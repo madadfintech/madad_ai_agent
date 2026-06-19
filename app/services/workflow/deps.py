@@ -65,6 +65,11 @@ def build_onboarding_platform(
     allowed_event_types: frozenset[str] | set[str] | None = None,
 ) -> OnboardingPlatform:
     runtime = runtime or build_runtime()
+    # Shared dedupe instance: dispatcher uses it for the 24h webhook event-id
+    # window; the workflow reuses the same Redis SET NX EX primitive for the
+    # invoice inflight guard (UAT 2026-06-19: slow OCR causes webhook
+    # retries to race the still-running node).
+    shared_dedupe = dedupe or InMemoryWebhookDedupe()
     workflow = OnboardingWorkflow(
         messenger=messenger or RecordingMessenger(),
         identity=identity or InMemoryMadadIdentityClient(),
@@ -73,11 +78,12 @@ def build_onboarding_platform(
         reminders=reminders or RecordingReminders(),
         invoices=invoices or InMemoryInvoiceClient(),
         checklist=checklist,
+        dedupe=shared_dedupe,
     )
     runtime.register(workflow)
     dispatcher = OnboardingDispatcher(
         runtime,
-        dedupe=dedupe or InMemoryWebhookDedupe(),
+        dedupe=shared_dedupe,
         allowed_event_types=allowed_event_types or ALL_BACKEND_EVENTS,
     )
     return OnboardingPlatform(runtime=runtime, workflow=workflow, dispatcher=dispatcher)

@@ -448,3 +448,92 @@ async def test_format_invoice_status_handles_empty_and_populated() -> None:
     ])
     # Summary renders one line per invoice with status visible.
     assert "SUBMITTED" in summary
+
+
+async def test_invoice_inflight_guard_drops_concurrent_retry(harness) -> None:
+    """UAT 2026-06-19 (QA): Madad's invoice extract takes 70-100s. The
+    webhook caller times out at ~30s and retries, racing the still-running
+    node. The state-level dedupe misses because LangGraph only writes the
+    new sig on node return — so the retry used to also fire
+    ``bulk.processing`` and re-extract.
+
+    The new inflight guard (Redis SET NX EX, in-memory fallback in tests)
+    claims a 120s key on (identity, sig) at the top of the node and
+    silently drops every concurrent re-entry. Asserted by pre-claiming
+    the dedupe key BEFORE the upload — the upload then takes the silent
+    drop path and never reaches the extract.
+    """
+    from app.services.workflow.onboarding import _invoice_attempt_sig
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+    workflow = harness.platform.workflow
+
+    attachments = [{"filename": "INV-1.pdf", "content_base64": DOC}]
+    sig = _invoice_attempt_sig(attachments)
+    inflight_key = f"invoice:inflight:{IDENTITY}:{sig}"
+
+    # Simulate a concurrent runner that already claimed the key.
+    claimed = await workflow._dedupe.claim(inflight_key, ttl_seconds=120)
+    assert claimed is True
+
+    pre_calls = len(harness.invoices.calls)
+    pre_sent = len(harness.messenger.sent)
+
+    await runtime.resume(WA, IDENTITY, message={"attachments": attachments})
+
+    # The drop is silent — no extract, no outbound.
+    assert len(harness.invoices.calls) == pre_calls
+    assert len(harness.messenger.sent) == pre_sent
+
+
+async def test_invoice_first_runner_proceeds_through_inflight_guard(harness) -> None:
+    """The guard only blocks CONCURRENT entries. The first runner with a
+    fresh sig proceeds through the node and fires extract exactly once."""
+    await _drive_to_activated(harness)
+    runtime = harness.platform.runtime
+
+    await runtime.resume(
+        WA, IDENTITY,
+        message={"attachments": [{"filename": "INV-1.pdf", "content_base64": DOC}]},
+    )
+
+    # Extract ran exactly once — the guard didn't block the first call.
+    inv_calls = [n for n, _ in harness.invoices.calls]
+    assert inv_calls.count("extract_base64") == 1
+
+
+async def test_payment_send_link_does_not_call_send_monetization_payment_link(
+    harness,
+) -> None:
+    """UAT 2026-06-19: the side-channel ``send_monetization_payment_link``
+    MCP call was dropped (always 400 in UAT, zero SME benefit). Only the
+    primary CTA-URL send via our own messenger should fire."""
+    # Drive a fresh harness directly to payment_send_link (mirrors the
+    # _drive_to_payment_block helper in test_payment_block.py).
+    runtime = harness.platform.runtime
+    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
+    await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+    await runtime.resume(WA, IDENTITY, message={"text": "biz@example.com"})
+    await runtime.resume(WA, IDENTITY, message={"text": "CONSENT"})
+    await runtime.resume(WA, IDENTITY, message={
+        "attachments": [{"filename": "CR.pdf", "content_base64": DOC}],
+    })
+    await runtime.resume(WA, IDENTITY, message={
+        "attachments": [{"filename": "Audited.pdf", "content_base64": DOC}],
+    })
+    harness.identity.journey_status = "PRE_QUALIFIED"
+    await runtime.resume(WA, IDENTITY, message={
+        "event": "eligibility.updated", "journey_status": "PRE_QUALIFIED",
+    })
+    for doc_name in ("Establishment_Card.pdf",):
+        await runtime.resume(WA, IDENTITY, message={
+            "attachments": [{"filename": doc_name, "content_base64": DOC}],
+        })
+    harness.identity.journey_status = "QUALIFIED"
+    await runtime.resume(WA, IDENTITY, message={
+        "event": "madad_score.ready", "journey_status": "QUALIFIED",
+    })
+
+    # The MCP payments recorder must NOT have a send_monetization_payment_link.
+    payment_call_names = [n for n, _ in harness.payments.calls]
+    assert "send_monetization_payment_link" not in payment_call_names

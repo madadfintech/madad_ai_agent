@@ -47,13 +47,14 @@ async def test_payment_chain_runs_in_order(harness):
     await _drive_to_payment_block(harness)
 
     names = [name for name, _ in harness.payments.calls]
-    # Spec-aligned flow dropped the eligibility_update node, so the duplicate
-    # state-sync call no longer happens. Only the payment chain proper.
+    # UAT 2026-06-19: dropped the side-channel ``send_monetization_payment_link``
+    # call. The primary payment-link message goes via our own messenger
+    # (CTA-URL + plain-text fallback); the backend's tool returned HTTP 400
+    # in every UAT run and added no SME-visible value.
     assert names == [
         "get_business_details",
         "list_monetization_products",
         "create_monetization_payment",
-        "send_monetization_payment_link",
     ]
 
 
@@ -75,32 +76,20 @@ async def test_idempotency_keys_recorded_in_state(harness):
     keys = after_status.values["idempotency_keys"]
 
     assert "create_monetization_payment" in keys
-    assert "send_monetization_payment_link" in keys
     # Format is f"{run_id}:create_monetization_payment" — the run_id prefix
     # makes the key unique per workflow run, while the action suffix is
     # constant so retries reuse the same key.
     assert keys["create_monetization_payment"].endswith(":create_monetization_payment")
-    assert keys["send_monetization_payment_link"].endswith(
-        ":send_monetization_payment_link"
-    )
 
 
-async def test_idempotency_keys_sent_to_create_and_send_link_tools(harness):
+async def test_create_payment_idempotency_key_sent_to_tool(harness):
     await _drive_to_payment_block(harness)
 
     by_name = {name: payload for name, payload in harness.payments.calls}
     create_payload = by_name["create_monetization_payment"]
-    send_payload = by_name["send_monetization_payment_link"]
 
     assert create_payload["idempotency_key"].endswith(
         ":create_monetization_payment"
-    )
-    assert send_payload["idempotency_key"].endswith(
-        ":send_monetization_payment_link"
-    )
-    # And the keys differ per write so backend dedupe is per-write, not joint.
-    assert (
-        create_payload["idempotency_key"] != send_payload["idempotency_key"]
     )
 
 
@@ -118,13 +107,20 @@ async def test_payment_create_uses_business_details_and_product_from_prior_steps
 
 
 async def test_send_link_uses_channel_and_identity_from_context(harness):
+    # UAT 2026-06-19: the side-channel send_monetization_payment_link MCP
+    # call was dropped (always 400 in UAT). The primary payment link
+    # still goes via our own messenger; assert the messenger received the
+    # WhatsApp CTA-URL keyed on the SME's identity.
     await _drive_to_payment_block(harness)
 
-    by_name = {name: payload for name, payload in harness.payments.calls}
-    send = by_name["send_monetization_payment_link"]
-
-    assert send["channel"] == Channel.WHATSAPP
-    assert send["identity"] == IDENTITY
+    cta_sends = [
+        s for s in harness.messenger.sent
+        if s.get("template_key") == "onboarding.payment.request.button"
+        and "cta" in s
+    ]
+    assert len(cta_sends) == 1
+    assert cta_sends[0]["channel"] == Channel.WHATSAPP
+    assert cta_sends[0]["identity"] == IDENTITY
 
 
 async def test_payment_request_template_sent_at_send_link_node(harness):

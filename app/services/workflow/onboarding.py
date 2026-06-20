@@ -4674,11 +4674,12 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "journey_wait_await", ctx, last_status_source="chat"
             )
         if _is_casual_message(payload):
-            await self._send(
-                ctx,
-                state,
-                "onboarding.help.contextual",
-                {"answer": "I’m here and tracking your application.", "next_step": _next_step_hint(state)},  # noqa: E501
+            # Smart Groq answer (with real account state) instead of a canned
+            # line, so questions like "difference between the tenures?" get a
+            # real reply at the offer/wait step (user 2026-06-20).
+            await self._smart_contextual(
+                ctx, state, payload,
+                "I’m here and tracking your application.",
             )
             return self._step(
                 "journey_wait_await", ctx, last_status_source="chat"
@@ -5313,11 +5314,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             return self._step("lender_wait_await", ctx, last_status_source="chat")
         if _is_casual_message(payload):
-            await self._send(
-                ctx,
-                state,
-                "onboarding.help.contextual",
-                {"answer": "I’m here and tracking your lender review.", "next_step": _next_step_hint(state)},  # noqa: E501
+            await self._smart_contextual(
+                ctx, state, payload,
+                "I’m here and tracking your lender review.",
             )
             return self._step("lender_wait_await", ctx, last_status_source="chat")
         if _is_portal_query(payload):

@@ -410,7 +410,7 @@ _TEMPLATE_BODIES = {
     # can take 60–90s) so the SME isn't watching a silent chat.
     "onboarding.invoice.processing": (
         "📄 Got your invoice — reading it now…\n\n"
-        "Please wait a moment while we extract the details. ⏳\n\n"
+        "Please wait a moment while we extract the details — it may take up to 10 minutes. ⏳\n\n"
         "Thank you for being with us. 🙏"
     ),
     # UAT 2026-06-18 (Ishan Bug 1) — SUBMIT-FIRST ack. Replaces the old

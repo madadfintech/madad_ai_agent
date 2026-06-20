@@ -5946,7 +5946,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         # overwhelming it. Each extract has its own per-call timeout
         # (180s in mcp.provider) so the slowest member doesn't gate
         # the others.
-        sem = _asyncio.Semaphore(5)
+        # OCR is single-worker (serializes); issuing N extracts in
+        # parallel makes the later ones time out waiting in its queue
+        # (UAT 2026-06-20 bulk failure). Extract ONE at a time so each
+        # call gets a fresh per-call timeout. Slower but reliable.
+        sem = _asyncio.Semaphore(1)
 
         async def _extract_one(
             idx: int, att: dict[str, Any],
@@ -7100,7 +7104,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         # submit_base64 independently so a single transient failure
         # doesn't drag the rest down.
         import asyncio as _asyncio
-        sem = _asyncio.Semaphore(5)
+        # OCR is single-worker (serializes); issuing N extracts in
+        # parallel makes the later ones time out waiting in its queue
+        # (UAT 2026-06-20 bulk failure). Extract ONE at a time so each
+        # call gets a fresh per-call timeout. Slower but reliable.
+        sem = _asyncio.Semaphore(1)
 
         async def _submit_one(row: dict[str, Any]) -> dict[str, Any] | None:
             draft = row.get("draft") or {}

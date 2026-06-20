@@ -438,7 +438,7 @@ _TEMPLATE_BODIES = {
     # now…" spam that hit the SME with 10+ messages per upload.
     "onboarding.invoice.bulk.processing": (
         "📦 Received {{ count }} invoices — processing.\n\n"
-        "We'll send you the review summary in a moment. ⏳\n\n"
+        "We'll send you the review summary shortly — for several invoices this can take a few minutes. ⏳\n\n"
         "Thank you for being with us. 🙏"
     ),
     # Fires AFTER the SME taps Approve on the confirm card — the

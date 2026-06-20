@@ -7981,6 +7981,17 @@ class OnboardingWorkflow(WorkflowDefinition):
                     f"{_ninv} invoice(s) already submitted and now being "
                     "processed/reviewed by the Madad team for disbursement"
                 )
+            for _o in (state.offers or []):
+                if not isinstance(_o, dict):
+                    continue
+                _ln = _lender_name(_o) or "a lender"
+                _lim = _o.get("creditLimit") or _o.get("credit_limit") or _o.get("limit")
+                _rt = _o.get("interestRate") or _o.get("interest_rate") or _o.get("rate")
+                _tn = _o.get("tenureDays") or _o.get("tenure_days") or _o.get("tenure")
+                _facts.append(
+                    f"offer from {_ln}: credit limit QAR {_lim}, interest "
+                    f"{_rt}%/mo, tenure {_tn} days"
+                )
             if _facts:
                 llm_hint = (
                     hint + "\nACTUAL ACCOUNT STATE (answer using THIS; do NOT "
@@ -8274,7 +8285,7 @@ def _offers_block(state: OnboardingState) -> str:
             tenure = f"{int(o.get('tenureDays') or o.get('tenure_days') or o.get('tenure') or 0)} days"
         except (TypeError, ValueError):
             tenure = "—"
-        rows.append(f"🏦 {lender} — {limit} · {rate} · {tenure}")
+        rows.append(f"🏦 {lender} — Limit: {limit} · Interest: {rate} · Tenure: {tenure}")
     # Double-newline separator: most Meta renderers preserve ``\n\n``
     # (paragraph break) even when collapsing single ``\n`` to a space.
     return "\n\n".join(rows) if rows else "Please log in to view your offer details."

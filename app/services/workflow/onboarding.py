@@ -732,9 +732,10 @@ def _confirm_card_variables(draft: dict[str, Any]) -> dict[str, Any]:
             amount_str = f"{currency} {int(float(total)):,}"
         except (TypeError, ValueError):
             amount_str = f"{currency} {total}"
+    buyer = draft.get("customer_name") or "—"
     summary = (
         f"📄 Extracted {invoice_number} · {amount_str} · Due {due_date}\n"
-        f"Supplier: {supplier}"
+        f"Buyer: {buyer}"
     )
     return {
         "summary":   summary,
@@ -1821,6 +1822,10 @@ def _next_step_hint(state: OnboardingState) -> str:
         return "Right now your payment link is ready. Once payment is complete, we will forward your application."  # noqa: E501
     if step in {"documents_complete", "journey_wait_await", "lender_wait_await"}:
         return "Your application is under review. I’ll notify you as soon as there is an update."
+    if step in {"invoice_collect_send", "invoice_collect_await"}:
+        return ("Your credit line is ACTIVE — you can submit invoices for "
+                "financing here anytime. Submitted invoices are reviewed by "
+                "our team and you’ll get an update here once disbursed.")
     return "I’ll guide you step by step through the application."
 
 
@@ -4984,10 +4989,21 @@ class OnboardingWorkflow(WorkflowDefinition):
         # an upstream notification provider that has been flaky in UAT and
         # adds no value over our own send).
         amount = f"{(state.payment_amount_qar or ONBOARDING_FEE_QAR):,}"
-        score = state.madad_score if state.madad_score is not None else 78
+        # Never fabricate a Madad score. When the backend has not sent a
+        # real score, omit the entire score line (blank > hardcoded --
+        # user 2026-06-19). This also drops the fixed "Strong" label,
+        # which previously rendered regardless of the real score.
+        score = state.madad_score
+        score_line = (
+            f"📊 Madad Score: {score}/100\n\n"
+            "Based on this score, we believe you have high chances of "
+            "getting approval from our banking partners. 💪\n\n"
+            if score is not None else ""
+        )
         variables = {
             "amount":         amount,
-            "score":          score,
+            "score":          score if score is not None else "",
+            "score_line":     score_line,
             "payment_link":   state.payment_link or "",
             "provider_ref":   state.payment_provider_ref or "",
         }
@@ -5387,33 +5403,10 @@ class OnboardingWorkflow(WorkflowDefinition):
         # node's one-shot send.
         if _offers_sig(state.offers) == state.offers_preview_shown_sig:
             return self._step("offer_view_send", ctx)
-        # UAT 2026-06-19 QA #6b: backend fires one ``offers.available``
-        # event per lender; a 2-lender app produces 2 events seconds
-        # apart and the SME used to see the "offers ready" message
-        # twice. Debounce 30s on first arrival: the next status-poll
-        # tick (60s cadence) re-enters here past the window and sends
-        # ONE consolidated message with the full offer set.
-        now = ctx.clock.now()
-        first_seen_iso = state.offers_first_seen_at
-        if not first_seen_iso:
-            # First time we see ANY offer for this run → start the
-            # debounce timer; re-park silently. Poll/webhook within
-            # the next 30s won't send; the poll AFTER 30s will.
-            return self._step(
-                "offer_view_send", ctx,
-                offers_first_seen_at=now.isoformat(),
-            )
-        try:
-            first_seen = datetime.fromisoformat(first_seen_iso)
-            elapsed = (now - first_seen).total_seconds()
-        except (TypeError, ValueError):
-            elapsed = 1e9  # corrupt timestamp — treat as elapsed
-        if elapsed < 30.0:
-            # Still inside the debounce window; new offers may yet
-            # arrive. Re-park silently — state.offers is updated so
-            # the next render will reflect every lender.
-            return self._step("offer_view_send", ctx)
-
+        # Offers must reach the SME ASAP — send immediately whenever the
+        # offer SET changes (a new lender offered). The sig guard above
+        # already stops re-spamming the SAME set on routine polls. No
+        # debounce: lenders can offer hours/days apart (user 2026-06-20).
         await self._send(
             ctx,
             state,
@@ -5436,39 +5429,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         # re-sending). Only (re)send the button when new offers were just shown.
         if _offers_sig(state.offers) == state.offers_shown_sig:
             return self._step("offer_handoff_to_madad", ctx, outcome="offer_handoff")
-        # PDF Step 8 — tappable "Login to Madad →" CTA-URL button on WhatsApp
-        # (Meta caps the label at 20 chars). Falls back to the plain-text
-        # template (with the URL inline) if the interactive path fails.
-        portal_url = "https://uat-portal.madadfintech.com"
-        sent_as_button = False
-        if ctx.channel is Channel.WHATSAPP:
-            try:
-                sent_as_button = await self._msg.send_cta_url(
-                    channel=_channel(ctx),
-                    identity=ctx.identity,
-                    template_key="onboarding.offer.handoff.button",
-                    button_text="Login to Madad →",
-                    button_url=portal_url,
-                    variables={},
-                    locale=state.locale,
-                )
-            except Exception as exc:  # noqa: BLE001 — fall back to text
-                ctx.logger.warning(
-                    "offer_handoff.cta_failed",
-                    error=str(exc)[:200],
-                    note="falling back to plain-text handoff message",
-                )
-        # UAT 2026-06-18 (Ishan Bug 2): both ``offers.preview`` and
-        # ``offer.handoff`` now map to the same approved Meta template.
-        # If ``offer_view_send`` just delivered the offers via the
-        # template (preview sig matches current offers), skip this
-        # second template send so the SME doesn't get the same offers
-        # block twice. The CTA-URL button above is a session message
-        # and is independent — fine to keep when it succeeds.
-        if not sent_as_button:
-            if _offers_sig(state.offers) != state.offers_preview_shown_sig:
-                await self._send(ctx, state, "onboarding.offer.handoff")
-        # Record the shown offer set so routine polls don't re-send these cards.
+        # The offer cards (onboarding.offers.preview) are already sent by
+        # offer_view_send. We deliberately DO NOT send the trailing
+        # "please login to finalise your offer" handoff message any more
+        # (user 2026-06-20: it replaced the offer in the SME's view and is
+        # redundant). This node now only records the shown sig + advances.
         return self._step(
             "offer_handoff_to_madad", ctx, outcome="offer_handoff",
             offers_shown_sig=_offers_sig(state.offers),
@@ -5731,6 +5696,9 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "invoice.submitted_sig.dedupe_skip", sig=sig,
                 note="run already submitted this attachment set; refusing re-submit",
             )
+            # Never silently drop a re-upload — tell the SME it is already
+            # in, so re-sending the same file never feels like dead silence.
+            await self._smart_contextual(ctx, state, reply, 'You’ve already submitted this invoice and our team is reviewing it. 🙂 To finance another, just send a different invoice here.')
             return self._step("invoice_collect_await", ctx)
 
         # UAT 2026-06-19 QA: cross-execution inflight guard. Madad's
@@ -7983,6 +7951,35 @@ class OnboardingWorkflow(WorkflowDefinition):
                 f"{hint}\nDocuments already received: {_recv_str}. "
                 f"Documents still needed: {_miss_str}."
             )
+        # Post-activation / under-review steps: hand Groq the REAL account
+        # state so it answers status questions accurately and NEVER claims
+        # "being reviewed" once the credit line is active (user 2026-06-20).
+        if last_step in {"invoice_collect_send", "invoice_collect_await",
+                         "journey_wait_await", "lender_wait_await"}:
+            _facts: list[str] = []
+            try:
+                _st = state.journey_status.value if state.journey_status else None
+            except Exception:  # noqa: BLE001
+                _st = None
+            if _st:
+                _facts.append(f"current journey status = {_st}")
+            if last_step in {"invoice_collect_send", "invoice_collect_await"}:
+                _facts.append(
+                    "the credit line is ACTIVE and the SME can submit invoices "
+                    "for financing right here"
+                )
+            _ninv = len(state.invoices_submitted or [])
+            if _ninv:
+                _facts.append(
+                    f"{_ninv} invoice(s) already submitted and now being "
+                    "processed/reviewed by the Madad team for disbursement"
+                )
+            if _facts:
+                llm_hint = (
+                    hint + "\nACTUAL ACCOUNT STATE (answer using THIS; do NOT "
+                    "say the application is 'being reviewed' if the credit line "
+                    "is active): " + "; ".join(_facts) + "."
+                )
         answer = await _llm_answer(reply_text(reply), llm_hint)
         if answer:
             # The model answers ONLY the question (told not to invent/restate

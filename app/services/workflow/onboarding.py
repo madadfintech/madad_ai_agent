@@ -4815,6 +4815,24 @@ class OnboardingWorkflow(WorkflowDefinition):
             return self._step(
                 "journey_wait_await", ctx, last_status_source="chat"
             )
+        # Catch-all: a real SME free-text question we didn't pattern-match
+        # (e.g. "what is my tenure?") → answer with Groq + live account/offer
+        # state instead of silently re-parking. Synthetic poll/webhook/status
+        # resumes carry no text, so they skip this and fall through to the
+        # status-extraction below (user 2026-06-21: never go silent on a Q).
+        if (
+            _extract_journey_status(payload) is None
+            and not (
+                isinstance(payload, dict)
+                and payload.get("type") in {"status_update", "docs_settle", "phase1b_event"}
+            )
+            and reply_text(payload).strip()
+        ):
+            await self._smart_contextual(
+                ctx, state, payload,
+                "I\u2019m here and tracking your application.",
+            )
+            return self._step("journey_wait_await", ctx, last_status_source="chat")
         source = _extract_status_source(payload)
         fields: dict[str, Any] = {"last_status_source": source}
         forced = _extract_journey_status(payload)
@@ -5444,6 +5462,19 @@ class OnboardingWorkflow(WorkflowDefinition):
                     "answer": await self._safe_status_answer(state),
                     "next_step": _next_step_hint(state),
                 },
+            )
+            return self._step("lender_wait_await", ctx, last_status_source="chat")
+        if (
+            _extract_journey_status(payload) is None
+            and not (
+                isinstance(payload, dict)
+                and payload.get("type") in {"status_update", "docs_settle", "phase1b_event"}
+            )
+            and reply_text(payload).strip()
+        ):
+            await self._smart_contextual(
+                ctx, state, payload,
+                "I\u2019m here and tracking your lender review.",
             )
             return self._step("lender_wait_await", ctx, last_status_source="chat")
         source = _extract_status_source(payload)

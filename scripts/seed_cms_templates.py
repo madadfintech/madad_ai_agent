@@ -334,9 +334,7 @@ _TEMPLATE_BODIES = {
     "onboarding.payment.request.button": (
         "Hello! 👋\n\n"
         "Your application has been reviewed by our team. Here is your result:\n\n"
-        "📊 Madad Score: {{ score }}/100 · Strong\n\n"
-        "Based on this score, we believe you have high chances of getting approval "
-        "from our banking partners. 💪\n\n"
+        "{{ score_line }}"
         "Your application is ready to be forwarded.\n"
         "To submit your application to the banks, a one-time onboarding and assessment "
         "fee of QAR {{ amount }} is required.\n\n"
@@ -347,9 +345,7 @@ _TEMPLATE_BODIES = {
     "onboarding.payment.request": (
         "Hello! 👋\n\n"
         "Your application has been reviewed by our team. Here is your result:\n\n"
-        "📊 Madad Score: {{ score }}/100 · Strong\n\n"
-        "Based on this score, we believe you have high chances of getting approval "
-        "from our banking partners. 💪\n\n"
+        "{{ score_line }}"
         "Your application is ready to be forwarded.\n"
         "To submit your application to the banks, a one-time onboarding and assessment "
         "fee of QAR {{ amount }} is required.\n\n"
@@ -481,16 +477,16 @@ _TEMPLATE_BODIES = {
     "onboarding.invoice.confirm": (
         "{{ summary }}\n\n"
         "Confirm to submit, Edit to correct a field (reply with "
-        "`edit amount: 32000` for example), or Reject to discard."
+        "`edit amount: <new amount>` for example), or Reject to discard."
     ),
     # When the SME taps "Edit" with no field — ask which to change.
     "onboarding.invoice.edit.prompt": (
         "Which field would you like to update? Reply like:\n\n"
-        "`edit amount: 32000`\n"
-        "`edit due: 2026-07-28`\n"
-        "`edit supplier: Almaha Medical`\n"
-        "`edit buyer: AIKHAJA STORE`\n"
-        "`edit invoice no: INV-2981`\n\n"
+        "`edit amount: <new amount>`\n"
+        "`edit due: <YYYY-MM-DD>`\n"
+        "`edit supplier: <supplier name>`\n"
+        "`edit buyer: <buyer name>`\n"
+        "`edit invoice no: <number>`\n\n"
         "Current draft:\n{{ summary }}"
     ),
     # When the SME taps "Reject" — confirm the discard, no backend write.

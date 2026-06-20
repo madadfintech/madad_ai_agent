@@ -91,6 +91,13 @@ def _load_rules() -> list[dict[str, Any]]:
         except re.error as exc:
             log.warning("invalid regex for rule %s: %s", name, exc)
             continue
+        exclude = entry.get("exclude")
+        if exclude:
+            try:
+                entry["_exclude_re"] = re.compile(exclude)
+            except re.error as exc:
+                log.warning("invalid exclude regex for rule %s: %s", name, exc)
+                continue
         entry.setdefault("severity", "warning")
         entry.setdefault("description", "")
         rules.append(entry)
@@ -107,8 +114,12 @@ LIVE_QUEUES: set[asyncio.Queue[dict[str, Any]]] = set()
 def match_line(line: str) -> dict[str, Any] | None:
     """Return the first rule that matches, or None."""
     for rule in RULES:
-        if rule["_re"].search(line):
-            return rule
+        if not rule["_re"].search(line):
+            continue
+        exclude_re = rule.get("_exclude_re")
+        if exclude_re is not None and exclude_re.search(line):
+            continue
+        return rule
     return None
 
 

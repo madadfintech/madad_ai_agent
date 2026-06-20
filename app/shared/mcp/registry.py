@@ -168,7 +168,14 @@ class Tools:
             "madad_payments_get_",
             "madad_payments_list_",
             "madad_invoices_get_",
-            "madad_invoices_extract_invoice",
+            # UAT 2026-06-20: ``madad_invoices_extract_invoice*`` was here.
+            # The OCR call routinely takes 60-235 seconds; the first attempt
+            # almost always wins eventually. When the upstream bridge times
+            # out and we retry, we just pile a second 200+ second wait on
+            # top of the first — never improves the outcome, just compounds
+            # the latency and load on Madad's OCR. Single-shot is correct
+            # here. Same logic for the ``and_submit`` variant (already
+            # single-shot because it's a write).
             "madad_invoices_inspect_zip",
             "madad_mcp_get_webhook_events",
         )

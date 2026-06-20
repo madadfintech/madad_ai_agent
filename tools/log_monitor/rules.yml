@@ -75,10 +75,10 @@ rules:
     severity: info
     description: The "Got it — please wait" docs ack send failed.
 
-  - name: orphan_run_skip
-    pattern: 'status_poller\.orphan_run_skip|invoice_attempt\.deduped'
+  - name: dedupe_caught_duplicate
+    pattern: 'status_poller\.orphan_run_skip|invoice_attempt\.deduped|docs\.inflight\.dedupe_skip|invoice\.inflight\.dedupe_skip|invoice\.submitted_sig\.dedupe_skip'
     severity: info
-    description: Poller / inbound dedupe noticed an orphan / duplicate and skipped.
+    description: A dedupe layer (status poller / inbound dedupe / inflight guard) caught a duplicate and silently dropped. SUCCESS signal — confirms guards are working.
 
   - name: forget_session
     pattern: 'forget_session\.cleared|forget_session\.failed'
@@ -96,9 +96,13 @@ rules:
     description: A 5xx response surfaced (backend, MCP cluster, or our own service).
 
   - name: http_4xx_non_auth
+    # Exclude common internet-scanner probe paths so real 4xx signals
+    # don't drown in bot noise (UAT 2026-06-20: 60/71 captured events
+    # were one scanner hitting /, /mcp, /jsonrpc, /robots.txt, etc.).
     pattern: '(\bstatus(_code)?=4(00|02|04|05|06|08|09|22|29)\b)|("[A-Z]+ [^"]+ HTTP/[\d.]+" 4(00|02|04|05|06|08|09|22|29))'
+    exclude: '(path=/($|[? ])|path=/(robots\.txt|security\.txt|favicon\.ico|mcp|jsonrpc|sse)([? /]|$))|("(GET|POST|HEAD|PUT|DELETE|OPTIONS) /(\?[^"]*)? HTTP)|("(GET|POST|HEAD|PUT|DELETE|OPTIONS) /(robots\.txt|security\.txt|favicon\.ico|mcp|jsonrpc|sse)([? ][^"]*)? HTTP)'
     severity: warning
-    description: A non-auth 4xx (400, 404, 409, etc.).
+    description: A non-auth 4xx (400, 404, 409, etc.) from a legitimate path. Scanner probes (/, /mcp, /jsonrpc, /robots.txt, /security.txt, /favicon.ico, /sse) are excluded.
 
   - name: http_401_403
     pattern: '(\bstatus(_code)?=40[13]\b)|("[A-Z]+ [^"]+ HTTP/[\d.]+" 40[13])'

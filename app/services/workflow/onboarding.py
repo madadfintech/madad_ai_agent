@@ -3884,6 +3884,44 @@ class OnboardingWorkflow(WorkflowDefinition):
                 missing_documents=list(state.missing_documents),
                 documents_received=False,
             )
+        # UAT 2026-06-20 (post-457d271): cross-execution inflight guard,
+        # same root cause as the invoice path. Madad's
+        # ``classify_and_upload_document_base64`` takes several seconds
+        # per file; the bridge / webhook caller can retry the inbound
+        # before our node returns, spawning a concurrent run from the
+        # same checkpoint. The state-level ack debounce below uses
+        # ``state.documents_processing_ack_at`` which isn't visible to
+        # concurrent runners (LangGraph writes state on node return only).
+        # SET NX EX over Redis claims the (identity, attachment_sig) key
+        # for 60s; the second runner sees the lock and silently drops
+        # without re-sending ``documents.single_received`` or
+        # re-uploading. Sig reuses _invoice_attempt_sig (filename +
+        # 4KB-content fingerprint per attachment — same shape works).
+        doc_sig = _invoice_attempt_sig(attachments)
+        if doc_sig:
+            inflight_key = f"docs:inflight:{ctx.identity}:{doc_sig}"
+            try:
+                first_runner = await self._dedupe.claim(
+                    inflight_key, ttl_seconds=60
+                )
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "docs.inflight.claim_failed",
+                    error=str(exc)[:200],
+                    note="proceeding without inflight guard",
+                )
+                first_runner = True
+            if not first_runner:
+                ctx.logger.info(
+                    "docs.inflight.dedupe_skip", sig=doc_sig,
+                    note="concurrent doc upload already running for this set",
+                )
+                return self._step(
+                    "documents_upload_loop_await", ctx,
+                    missing_documents=list(state.missing_documents),
+                    documents_received=False,
+                )
+
         # Bug #1b (2026-06-09): immediate ack the instant valid attachments
         # land — large ZIPs can keep the classify+upload chain busy for
         # tens of seconds; mirrors the CR ack so the SME never sits in

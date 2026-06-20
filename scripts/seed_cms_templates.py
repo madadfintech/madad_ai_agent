@@ -364,24 +364,6 @@ _TEMPLATE_BODIES = {
         "{{ offer_cards }}\n\n"
         "💬 Feel free to ask me anything about these offers right here!"
     ),
-    "onboarding.offer.handoff": (
-        "When you're ready to select, please login to your Madad account to finalise "
-        "your offer — this is where you'll also manage your invoices going forward.\n\n"
-        "Login to Madad Platform → uat-portal.madadfintech.com"
-    ),
-    # Spec Step 8 button variant + UAT 2026-06-10 combined-message fix.
-    # User saw the offers preview + the handoff message arriving as TWO
-    # separate WhatsApp bubbles with the offer cards rendered empty. Body
-    # now carries the FULL flow in one message: opening "Exciting news",
-    # the offer cards (populated from {{ offer_cards }}), the "ask me
-    # anything" invite, AND the handoff line — followed by the Meta
-    # "Login to Madad" CTA-URL button. Button URL is supplied at send-
-    # time (capped at 20 chars by Meta).
-    "onboarding.offer.handoff.button": (
-        "When you're ready to select, please login to your Madad account to "
-        "finalise your offer — this is where you'll also manage your invoices "
-        "going forward."
-    ),
     # Step 8.5 — the SME selected/accepted an offer in the Madad portal
     # (backend offer.selected webhook). One-time ✅ confirmation; the run then
     # parks for the credit-line activation message below.

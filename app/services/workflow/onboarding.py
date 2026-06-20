@@ -148,8 +148,6 @@ TEMPLATE_KEYS = [
     "onboarding.payment.request",
     "onboarding.payment.request.button",
     "onboarding.offers.preview",
-    "onboarding.offer.handoff",
-    "onboarding.offer.handoff.button",
     "onboarding.offer.confirmed",
     "onboarding.activated",
     # Phase 1.b — invoice financing (post-activation) + repayment lifecycle.
@@ -8504,7 +8502,6 @@ _STATUS_TEMPLATES: dict[str, str] = {
     # ``onboarding_offers_available`` template so every offer notice
     # reliably delivers regardless of conversation age.
     "onboarding.offers.preview":        "onboarding_offers_available",
-    "onboarding.offer.handoff":         "onboarding_offers_available",
     "onboarding.offer.confirmed":       "onboarding_offer_confirmed",
     "onboarding.activated":             "onboarding_activated",
     "onboarding.disbursement.received": "onboarding_disbursement_received",
@@ -8605,7 +8602,7 @@ def _status_components(
         return body(v.get("ref"), _strip_qar(v.get("amount")), v.get("due_date"))
     if key == "onboarding.repayment.overdue":
         return body(v.get("ref"), _strip_qar(v.get("amount")), v.get("due_date") or "—")
-    if key in ("onboarding.offer.handoff", "onboarding.offers.preview"):
+    if key == "onboarding.offers.preview":
         # Both map to the same approved ``onboarding_offers_available``
         # Meta template with a single {{1}} variable for the offer block.
         return body(_offers_block(state))

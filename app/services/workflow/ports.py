@@ -714,6 +714,20 @@ class KycClient(Protocol):
         """
         ...
 
+    async def classify_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Classify a document's TYPE only — fast, NO upload and NO OCR
+        extraction. Returns ``{classified, document_type, classification_label,
+        confidence}``. For gating UX (e.g. the CR affirmation) without the
+        slow extract path."""
+        ...
+
     async def classify_and_upload_zip_base64(
         self,
         *,
@@ -905,6 +919,31 @@ class InMemoryKycClient:
             "document_id": new_id("doc"),
             "document_type": document_type,
             "confidently_classified": document_type != "additional_document",
+        }
+
+    async def classify_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        self._record(
+            "classify_document_base64",
+            access_token=access_token, filename=filename, mime_type=mime_type,
+        )
+        lowered = (filename or "").lower()
+        dtype = (
+            "COMMERCIAL_REGISTRATION"
+            if ("cr" in lowered or "commercial" in lowered)
+            else None
+        )
+        return {
+            "classified": dtype is not None,
+            "document_type": dtype,
+            "classification_label": dtype,
+            "confidence": 0.9 if dtype else 0.0,
         }
 
     async def classify_and_upload_zip_base64(

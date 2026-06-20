@@ -3202,20 +3202,49 @@ class OnboardingWorkflow(WorkflowDefinition):
         # timeout/error all leave it False → no false Qatar claim. A genuine CR
         # that fails to classify just misses the affirmation line (the financials
         # request still goes out) — far better than asserting Qatar for a non-CR.
-        # UAT 2026-06-19 QA fix: previously we called BOTH
-        # ``upload_commercial_registration`` (forced) AND
-        # ``classify_and_upload_document_base64`` (informational) — but
-        # the classifier tool ALSO uploads to the backend, so each CR
-        # landed twice in the DB. Per QA: the SME was explicitly asked
-        # to upload their CR + the backend OCR validates it Qatar-side
-        # → we can trust it's a CR without re-classifying. Forced upload
-        # only; set cr_verified=True on success so the "registered in
-        # Qatar ✅" line still renders downstream.
+        # UAT 2026-06-21: the affirmation "registered in Qatar — all good ✅"
+        # was firing for ANYTHING (even a selfie) because the build set
+        # cr_verified=True whenever the forced upload SUCCEEDED — which it does
+        # for any file. Gate it on a FAST classify-ONLY check (the /classify
+        # service — NO OCR extraction, so we never block 1-2 min just to decide
+        # one line). cr_verified is True ONLY when the classifier confirms a
+        # Commercial Registration; a logo / selfie / other → False → no false
+        # Qatar claim. The actual CR upload stays the fast forced upload below
+        # (lands it in the CR slot; backend extracts CR#/Qatar in background).
         cr_verified = False
         if token and state.cr_ref:
-            # [TEMP-DBG] obs.kyc.upload — behavioral instrumentation. The
-            # monitor watches for same (identity, filename) uploaded
-            # more than once within 60s.
+            try:
+                cls = await self._kyc.classify_document_base64(
+                    access_token=token,
+                    content_base64=state.cr_content_base64 or "",
+                    filename=state.cr_ref,
+                    mime_type=state.cr_mime_type,
+                )
+                if isinstance(cls, dict):
+                    backend_type = (
+                        cls.get("document_type")
+                        or cls.get("classification_label")
+                        or ""
+                    )
+                    resolved = _workflow_doc_type(str(backend_type))
+                    combined = f"{backend_type} {resolved}".lower()
+                    cr_verified = (
+                        "commercial_registration" in combined
+                        and cls.get("classified") is not False
+                    )
+                    ctx.logger.info(
+                        "cr_upload.classified",
+                        backend_type=str(backend_type),
+                        resolved=resolved,
+                        cr_verified=cr_verified,
+                    )
+            except Exception as exc:  # noqa: BLE001 — gate degrades to no-affirmation
+                ctx.logger.warning(
+                    "cr_upload.classify_failed", error=str(exc)[:200],
+                )
+            # Forced CR upload (fast — lands the CR in the CR slot; backend
+            # extracts CR#/Qatar validation in the background). Kept separate
+            # from the classify so we never block on extraction.
             ctx.logger.info(
                 "[TEMP-DBG] obs.kyc.upload",
                 identity=ctx.identity,
@@ -3231,14 +3260,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                     filename=state.cr_ref,
                     mime_type=state.cr_mime_type,
                 )
-                cr_verified = True
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
                     "cr_upload.forced_failed", error=str(exc)[:200],
-                    note=(
-                        "forced CR upload failed; flow continues but the SME's "
-                        "CR isn't recorded — surface to ops via the issue monitor"
-                    ),
+                    note="forced CR upload failed; CR not recorded — surface to ops",
                 )
         # Step 2 — CR uploaded (backend journey_status: INCOMPLETE).
         progress_step = await self._update_progress(state, ctx, step=2)

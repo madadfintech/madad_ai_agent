@@ -91,6 +91,7 @@ class Tools:
     # inference and routes everything through the same backend pipeline
     # the MSME complete-onboarding page uses.
     KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64 = "madad_kyc_classify_and_upload_document_base64"
+    KYC_CLASSIFY_DOCUMENT_BASE64 = "madad_kyc_classify_document_base64"
     KYC_CLASSIFY_AND_UPLOAD_ZIP_BASE64 = "madad_kyc_classify_and_upload_zip_base64"
     KYC_UPLOAD_INVOICE_BASE64 = "madad_kyc_upload_invoice_base64"
     KYC_UPLOAD_COMMERCIAL_REGISTRATION = "madad_kyc_upload_commercial_registration"

@@ -225,6 +225,24 @@ class McpKycClient:
             Tools.KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64, payload
         )
 
+    async def classify_document_base64(
+        self,
+        *,
+        access_token: str,
+        content_base64: str,
+        filename: str,
+        mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "file_name": filename,
+            "mime_type": mime_type or _infer_mime_type(filename),
+            "base64": content_base64,
+            "access_token": access_token,
+        }
+        return await self._tools.call_tool(
+            Tools.KYC_CLASSIFY_DOCUMENT_BASE64, payload
+        )
+
     async def classify_and_upload_zip_base64(
         self,
         *,

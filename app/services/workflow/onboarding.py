@@ -454,6 +454,9 @@ _EDIT_FIELD_ALIASES: dict[str, str] = {
     "total amount": "total_amount",
     "totalamount": "total_amount",
     "amt": "total_amount",
+    "date": "invoice_date",
+    "invoice date": "invoice_date",
+    "invoicedate": "invoice_date",
     "due": "due_date",
     "due date": "due_date",
     "duedate": "due_date",
@@ -529,6 +532,10 @@ _BATCH_APPROVE_PHRASES = (
 )
 _BATCH_EDIT_HEADS = frozenset({"edit", "change", "modify", "update"})
 _BATCH_REMOVE_HEADS = frozenset({"remove", "delete", "drop", "discard"})
+_BATCH_REJECT_PHRASES = (
+    "reject all", "rejectall", "reject everything", "discard all",
+    "cancel all", "decline all", "batch_reject_all",
+)
 
 
 def _classify_batch_action(value: Any) -> str | None:
@@ -537,6 +544,8 @@ def _classify_batch_action(value: Any) -> str | None:
     text = reply_text(value).strip().lower()
     if not text:
         return None
+    if any(p in text for p in _BATCH_REJECT_PHRASES):
+        return "reject_all"
     if any(p in text for p in _BATCH_APPROVE_PHRASES):
         return "approve_all"
     head = text.split()[0] if text else ""
@@ -723,15 +732,33 @@ def _csv_cell(value: Any) -> str:
     return str(value)
 
 
-def _render_invoice_batch_csv(batch: list[dict[str, Any]], currency: str = "QAR") -> str:
-    """Render the pending batch as CSV text (header + one row per invoice).
+_BLOCK_LABEL_ALIASES = {
+    "invoice_no": "invoice_number", "invoice no": "invoice_number",
+    "invoice_number": "invoice_number", "invoice number": "invoice_number",
+    "invoice": "invoice_number", "number": "invoice_number",
+    "no": "invoice_number", "ref": "invoice_number",
+    "date": "invoice_date", "invoice_date": "invoice_date", "invoice date": "invoice_date",
+    "due": "due_date", "due_date": "due_date", "due date": "due_date",
+    "buyer": "customer_name", "customer": "customer_name", "customer_name": "customer_name",
+    "supplier": "supplier_name", "supplier_name": "supplier_name",
+    "amount": "total_amount", "total": "total_amount", "total_amount": "total_amount",
+    "currency": "currency",
+}
+_INVOICE_HDR_RE = re.compile(r"^\s*invoice\s+(\d+)\b", re.IGNORECASE | re.MULTILINE)
 
-    Failed-extraction rows have empty cells so the SME can fill them in. The
-    columns are re-parseable by ``_parse_invoice_batch_csv`` on the round-trip."""
-    import csv as _csv
-    buf = io.StringIO()
-    writer = _csv.writer(buf)
-    writer.writerow(["row", *_CSV_COLUMNS])
+
+def _render_invoice_batch_csv(batch: list[dict[str, Any]], currency: str = "QAR") -> str:
+    """Render the batch as an easy-to-edit labeled text sheet — one block per
+    invoice. The SME edits the value after each ':' (keeping the labels) and
+    sends the file back; ``_parse_invoice_batch_csv`` reads it back. Failed
+    rows have blank values for the SME to fill in."""
+    lines = [
+        "MADAD — INVOICE REVIEW",
+        "Edit the value after each ':'  (keep the labels). Leave blank if unknown.",
+        "Then send this file back to submit — or tap Approve all in the chat.",
+        "========================",
+        "",
+    ]
     for entry in batch or []:
         draft = entry.get("draft") or {}
         amount = draft.get("total_amount")
@@ -739,30 +766,53 @@ def _render_invoice_batch_csv(batch: list[dict[str, Any]], currency: str = "QAR"
             amount_s = str(int(float(amount))) if amount not in (None, "", "—") else ""
         except (TypeError, ValueError):
             amount_s = _csv_cell(amount)
-        cur = draft.get("currency") if isinstance(draft.get("currency"), str) else currency
-        writer.writerow([
-            entry.get("row") or "",
-            _csv_cell(draft.get("invoice_number")),
-            _csv_cell(draft.get("invoice_date")),
-            _csv_cell(draft.get("due_date")),
-            _csv_cell(draft.get("customer_name")),
-            _csv_cell(draft.get("supplier_name")),
-            amount_s,
-            cur or currency,
-        ])
-    return buf.getvalue()
+        lines += [
+            f"Invoice {entry.get('row') or ''}".rstrip(),
+            f"  invoice_no : {_csv_cell(draft.get('invoice_number'))}",
+            f"  date       : {_csv_cell(draft.get('invoice_date'))}",
+            f"  due        : {_csv_cell(draft.get('due_date'))}",
+            f"  buyer      : {_csv_cell(draft.get('customer_name'))}",
+            f"  supplier   : {_csv_cell(draft.get('supplier_name'))}",
+            f"  amount     : {amount_s}",
+            "------------------------",
+        ]
+    return "\n".join(lines) + "\n"
 
 
 def _parse_invoice_batch_csv(text: str) -> list[dict[str, Any]]:
-    """Parse an SME-edited CSV back into per-row field dicts.
+    """Parse the SME-edited review file back into per-invoice field dicts.
 
-    Tolerant: maps header aliases, handles a missing/extra header row, and
-    falls back to positional columns + 1-based row numbers when the ``row``
-    column is absent."""
-    import csv as _csv
+    Primary format is the labeled blocks (``Invoice N`` + ``label : value``);
+    a comma-separated CSV is still accepted as a fallback."""
     out: list[dict[str, Any]] = []
     if not text or not text.strip():
         return out
+
+    # Labeled-block format (what we now send).
+    if _INVOICE_HDR_RE.search(text) is not None and ":" in text:
+        cur: dict[str, Any] | None = None
+        for line in text.splitlines():
+            m = _INVOICE_HDR_RE.match(line)
+            if m:
+                if cur is not None:
+                    out.append(cur)
+                cur = {"row": int(m.group(1))}
+                continue
+            if cur is None or ":" not in line:
+                continue
+            label, _, value = line.partition(":")
+            field = _BLOCK_LABEL_ALIASES.get(label.strip().lower())
+            if field:
+                cur[field] = value.strip()
+        if cur is not None:
+            out.append(cur)
+        return [
+            {"row": r.get("row"), **{f: r.get(f) for f in _CSV_COLUMNS}}
+            for r in out
+        ]
+
+    # CSV fallback (legacy / if the SME pastes a spreadsheet export).
+    import csv as _csv
     try:
         rows = [r for r in _csv.reader(io.StringIO(text)) if any((c or "").strip() for c in r)]
     except Exception:  # noqa: BLE001
@@ -781,7 +831,6 @@ def _parse_invoice_batch_csv(text: str) -> list[dict[str, Any]]:
         for j, cell in enumerate(raw):
             if j < len(header) and header[j]:
                 rec[header[j]] = (cell or "").strip()
-        row_no: int | None
         try:
             row_no = int(float(rec.get("row"))) if rec.get("row") else None
         except (TypeError, ValueError):
@@ -793,11 +842,17 @@ def _parse_invoice_batch_csv(text: str) -> list[dict[str, Any]]:
 
 
 def _first_csv_attachment(value: Any) -> dict[str, Any] | None:
-    """Return the first CSV/text attachment with bytes, else None."""
+    """Return the first CSV/text attachment with bytes (the edited review
+    sheet the SME sends back), else None."""
     for att in _valid_upload_attachments(value):
         mime = str(att.get("mime_type") or "").lower()
         name = str(att.get("filename") or "").lower()
-        if "csv" in mime or name.endswith(".csv") or mime in ("text/plain", "application/csv"):
+        if (
+            "csv" in mime
+            or "text/plain" in mime
+            or "application/csv" in mime
+            or name.endswith((".csv", ".txt"))
+        ):
             return att
     return None
 
@@ -1926,7 +1981,9 @@ def _next_step_hint(state: OnboardingState) -> str:
     if step in {"payment_send_link", "payment_await"}:
         return "Right now your payment link is ready. Once payment is complete, we will forward your application."  # noqa: E501
     if step in {"documents_complete", "journey_wait_await", "lender_wait_await"}:
-        return "Your application is under review. I’ll notify you as soon as there is an update."
+        # (user 2026-06-21) no canned "under review" line — it was wrongly
+        # appended to every answer, incl. at the offer step. Stay silent here.
+        return ""
     if step in {"invoice_collect_send", "invoice_collect_await"}:
         return ("Your credit line is ACTIVE — you can submit invoices for "
                 "financing here anytime. Submitted invoices are reviewed by "
@@ -7196,6 +7253,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         pending batch. Returns the next workflow step."""
         if action == "approve_all":
             return await self._invoice_batch_submit_all(state, ctx)
+        if action == "reject_all":
+            await self._send(ctx, state, "onboarding.invoice.batch.cleared", {})
+            return self._step(
+                "invoice_collect_await", ctx,
+                pending_invoice_batch=[],
+                pending_invoice_batch_total_qar=None,
+                pending_invoice_batch_currency=None,
+            )
 
         text = reply_text(reply).strip()
         if action == "remove":
@@ -7285,18 +7350,18 @@ class OnboardingWorkflow(WorkflowDefinition):
         back to the inline table preview)."""
         content_b64 = base64.b64encode(csv_text.encode("utf-8")).decode("ascii")
         caption = (
-            f"📄 Your {count} invoice(s) — review sheet. Edit any cell "
-            "(keep the header row) and send it back, or reply APPROVE ALL to "
-            "submit as-is."
+            f"📄 Your {count} invoice(s) — review sheet. Open it, edit the value "
+            "after any label, and send the file back to correct them — or tap "
+            "Approve all / Reject all below."
         )
         try:
             sent = await self._msg.send_document(
                 channel=_channel(ctx),
                 identity=ctx.identity,
-                filename="invoices_review.csv",
+                filename="invoices_review.txt",
                 content_base64=content_b64,
                 caption=caption,
-                mime_type="text/csv",
+                mime_type="text/plain",
                 locale=state.locale,
             )
         except Exception as exc:  # noqa: BLE001 — degrade to inline table
@@ -7316,7 +7381,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                     channel=_channel(ctx),
                     identity=ctx.identity,
                     template_key="onboarding.invoice.batch.csv_review",
-                    buttons=[("batch_approve_all", "Approve all")],
+                    buttons=[("batch_approve_all", "Approve all"), ("batch_reject_all", "Reject all")],
                     variables=prompt_vars,
                     locale=state.locale,
                 )

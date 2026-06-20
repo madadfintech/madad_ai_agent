@@ -841,6 +841,21 @@ def _parse_invoice_batch_csv(text: str) -> list[dict[str, Any]]:
     return out
 
 
+def _render_submitted_details(batch: list[dict[str, Any]]) -> str:
+    """One labeled line per submitted invoice for the post-submit receipt.
+    Returns '' (with no trailing blank lines) when there's nothing to show."""
+    out: list[str] = []
+    for entry in batch or []:
+        draft = entry.get("draft") or {}
+        out.append(
+            f"📄 Invoice {entry.get('row')} — "
+            f"Invoice No: {draft.get('invoice_number') or '—'}, "
+            f"Buyer: {draft.get('customer_name') or '—'}, "
+            f"Due: {draft.get('due_date') or '—'}"
+        )
+    return ("\n".join(out) + "\n\n") if out else ""
+
+
 def _first_csv_attachment(value: Any) -> dict[str, Any] | None:
     """Return the first CSV/text attachment with bytes (the edited review
     sheet the SME sends back), else None."""
@@ -6348,6 +6363,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 {
                     "count": str(len(auto_ledger)),
                     "noun":  noun,
+                    "details": "",
                     "failure_block": failure_block,
                 },
             )
@@ -7052,6 +7068,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 {
                     "count": str(len(submitted)),
                     "noun": noun,
+                    "details": "",
                     "failure_block": failure_block,
                 },
             )
@@ -7562,6 +7579,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             {
                 "count":         str(len(accepted)),
                 "noun":          noun,
+                "details":       _render_submitted_details(target_batch),
                 "failure_block": failure_block,
             },
         )

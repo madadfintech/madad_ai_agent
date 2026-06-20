@@ -411,6 +411,7 @@ _TEMPLATE_BODIES = {
     # carries a short bullet list of the (rare) per-member failures otherwise.
     "onboarding.invoice.bulk.submitted": (
         "📦 Got your {{ count }} {{ noun }} — all submitted ✅\n\n"
+        "{{ details }}"
         "We'll confirm the details shortly. Our team will review each "
         "and you'll get an update here once they're disbursed. 💸{{ failure_block }}\n\n"
         "Send more invoices anytime — single file or a ZIP both work."
@@ -486,12 +487,12 @@ _TEMPLATE_BODIES = {
     ),
     # Bulk: accompanies the review CSV document (the SME edits + sends back).
     "onboarding.invoice.batch.csv_review": (
-        "📊 I've put your {{ count }} invoice(s) in the CSV above "
+        "📊 I've attached your {{ count }} invoice(s) as a file "
         "(total {{ total }}).\n\n"
         "• Tap *Approve all* to submit them as-is.\n"
         "• Tap *Reject all* to discard this batch.\n"
         "• Or open the file, fill/correct any rows (especially blank ones "
-        "we couldn't read), keep the header row, and send the file back."
+        "we couldn't read), keep the labels, and send the file back."
     ),
     # Sent when the SME's reply at batch-preview can't be parsed.
     "onboarding.invoice.batch.help": (

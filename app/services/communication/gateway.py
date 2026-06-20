@@ -115,6 +115,33 @@ class McpCommunicationGateway(CommunicationGateway):
                 raw=response,
             )
 
+        # Document attachment (WhatsApp): e.g. the bulk-invoice review CSV the
+        # SME edits and sends back. Selected when the outbound carries a
+        # ``document`` block with base64 bytes in its metadata.
+        doc = (message.metadata or {}).get("document") if message.metadata else None
+        if message.channel is Channel.WHATSAPP and isinstance(doc, dict) and doc.get("content_base64"):
+            tool = Tools.EXT_SEND_WHATSAPP_DOCUMENT
+            doc_payload: dict[str, Any] = {
+                "to": message.identity,
+                "filename": doc.get("filename") or "document.csv",
+                "content_base64": doc["content_base64"],
+            }
+            if doc.get("mime_type"):
+                doc_payload["mime_type"] = doc["mime_type"]
+            if doc.get("caption"):
+                doc_payload["caption"] = doc["caption"]
+            try:
+                response = await self._tools.call_tool(tool, doc_payload)
+            except Exception as exc:  # noqa: BLE001 - normalize transport errors
+                raise GatewayError(
+                    f"MCP tool {tool!r} failed: {exc}", details={"tool": tool}
+                ) from exc
+            return OutboundDispatchResult(
+                accepted=bool(response.get("accepted", True)),
+                provider_message_id=response.get("provider_message_id"),
+                raw=response,
+            )
+
         # Interactive CTA-URL button (WhatsApp): a tappable "Pay QAR 6,000 →"
         # button instead of a raw link. Selected when the outbound message
         # carries a ``cta`` block in its metadata.

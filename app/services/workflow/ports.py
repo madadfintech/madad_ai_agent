@@ -85,6 +85,25 @@ class Messenger(ABC):
 
         return False
 
+    async def send_document(
+        self,
+        *,
+        channel: Channel,
+        identity: str,
+        filename: str,
+        content_base64: str,
+        caption: str,
+        mime_type: str = "text/csv",
+        locale: str = "en",
+    ) -> bool:
+        """Send a document (file attachment) — e.g. the bulk-invoice review
+        CSV the SME edits and sends back. Returns ``True`` if dispatched as a
+        document. Default declines (``False``) so callers fall back to an
+        inline message; real messengers override.
+        """
+
+        return False
+
 
 class RecordingMessenger(Messenger):
     """Records outbound sends (no rendering needed) for tests."""
@@ -160,6 +179,32 @@ class RecordingMessenger(Messenger):
                     "name": template_name,
                     "language": language_code,
                     "components": components or [],
+                },
+            }
+        )
+        return True
+
+    async def send_document(
+        self,
+        *,
+        channel: Channel,
+        identity: str,
+        filename: str,
+        content_base64: str,
+        caption: str,
+        mime_type: str = "text/csv",
+        locale: str = "en",
+    ) -> bool:
+        self.sent.append(
+            {
+                "channel": channel,
+                "identity": identity,
+                "locale": locale,
+                "document": {
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "caption": caption,
+                    "content_base64": content_base64,
                 },
             }
         )

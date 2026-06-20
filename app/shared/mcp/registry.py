@@ -56,6 +56,7 @@ class Tools:
     EXT_SEND_WHATSAPP_INTERACTIVE_BUTTONS = (
         "madad_external_send_whatsapp_interactive_buttons"
     )
+    EXT_SEND_WHATSAPP_DOCUMENT = "madad_external_send_whatsapp_document"
 
     # -- MCP-side orchestration ----------------------------------------------
     MCP_CREATE_CHANNEL_SESSION = "madad_mcp_create_channel_session"

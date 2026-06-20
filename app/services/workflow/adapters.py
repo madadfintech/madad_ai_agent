@@ -208,6 +208,48 @@ class CommunicationMessenger(Messenger):
         )
         return getattr(message, "status", None) == MessageStatus.SENT
 
+    async def send_document(
+        self,
+        *,
+        channel: Channel,
+        identity: str,
+        filename: str,
+        content_base64: str,
+        caption: str,
+        mime_type: str = "text/csv",
+        locale: str = "en",
+    ) -> bool:
+        """Send a document (file attachment) through the Communication
+        service. The gateway picks the ``madad_external_send_whatsapp_document``
+        MCP tool from the ``document`` metadata block. ``caption`` doubles as
+        the required message text (CMS templating is bypassed for documents).
+        Returns True only if the document actually went out — the caller falls
+        back to an inline table otherwise (backend document route not live)."""
+        from app.services.communication.models import MessageStatus  # type: ignore[attr-defined]
+        from app.shared.i18n import Locale
+
+        _emit_obs_send(
+            identity=identity, channel=channel,
+            template_key="(document)", variables=None, send_kind="document",
+        )
+        message = await self._comms.send(
+            OutboundMessageRequest(
+                channel=channel,
+                identity=identity,
+                text=caption,
+                locale=Locale(locale),
+                metadata={
+                    "document": {
+                        "filename": filename,
+                        "content_base64": content_base64,
+                        "mime_type": mime_type,
+                        "caption": caption,
+                    }
+                },
+            )
+        )
+        return getattr(message, "status", None) == MessageStatus.SENT
+
 
 class NudgeReminders(Reminders):
     """Schedules/suppresses reminder sequences through the Nudge service."""

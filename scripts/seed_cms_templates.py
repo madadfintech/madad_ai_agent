@@ -502,6 +502,14 @@ _TEMPLATE_BODIES = {
         "`edit <row>: <field> <new value>` to change a row, "
         "or `remove <row>` to drop one."
     ),
+    # Bulk: accompanies the review CSV document (the SME edits + sends back).
+    "onboarding.invoice.batch.csv_review": (
+        "📊 I've put your {{ count }} invoice(s) in the CSV above "
+        "(total {{ total }}).\n\n"
+        "• Reply *APPROVE ALL* to submit them as-is.\n"
+        "• Or open the file, fill/correct any rows (especially blank ones "
+        "we couldn't read), keep the header row, and send the updated CSV back."
+    ),
     # Sent when the SME's reply at batch-preview can't be parsed.
     "onboarding.invoice.batch.help": (
         "{{ hint }}\n\n"

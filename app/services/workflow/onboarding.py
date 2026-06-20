@@ -175,6 +175,7 @@ TEMPLATE_KEYS = [
     "onboarding.invoice.rejected",
     # UAT 2026-06-16 #4: bulk ZIP CSV preview + APPROVE ALL/EDIT/REMOVE.
     "onboarding.invoice.batch.preview",
+    "onboarding.invoice.batch.csv_review",
     "onboarding.invoice.batch.help",
     "onboarding.invoice.batch.submitted",
     "onboarding.invoice.batch.cleared",
@@ -695,6 +696,112 @@ def _render_invoice_batch_table(
     lines.append("```")
     lines.append(f"\n📊 Batch total: {_fmt_qar(total, currency)}")
     return "\n".join(lines)
+
+
+_CSV_COLUMNS = (
+    "invoice_number", "invoice_date", "due_date",
+    "customer_name", "supplier_name", "total_amount", "currency",
+)
+_CSV_HEADER_ALIASES = {
+    "row": "row", "#": "row", "no.": "row", "sno": "row", "s.no": "row",
+    "invoice_number": "invoice_number", "invoice no": "invoice_number",
+    "invoice number": "invoice_number", "invoice": "invoice_number",
+    "number": "invoice_number", "ref": "invoice_number", "no": "invoice_number",
+    "invoice_date": "invoice_date", "date": "invoice_date", "invoice date": "invoice_date",
+    "due_date": "due_date", "due": "due_date", "due date": "due_date",
+    "customer_name": "customer_name", "customer": "customer_name",
+    "buyer": "customer_name", "customer name": "customer_name",
+    "supplier_name": "supplier_name", "supplier": "supplier_name",
+    "supplier name": "supplier_name",
+    "total_amount": "total_amount", "amount": "total_amount",
+    "total": "total_amount", "total amount": "total_amount",
+    "currency": "currency",
+}
+
+
+def _csv_cell(value: Any) -> str:
+    if value in (None, "", "—"):
+        return ""
+    return str(value)
+
+
+def _render_invoice_batch_csv(batch: list[dict[str, Any]], currency: str = "QAR") -> str:
+    """Render the pending batch as CSV text (header + one row per invoice).
+
+    Failed-extraction rows have empty cells so the SME can fill them in. The
+    columns are re-parseable by ``_parse_invoice_batch_csv`` on the round-trip."""
+    import csv as _csv
+    buf = io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(["row", *_CSV_COLUMNS])
+    for entry in batch or []:
+        draft = entry.get("draft") or {}
+        amount = draft.get("total_amount")
+        try:
+            amount_s = str(int(float(amount))) if amount not in (None, "", "—") else ""
+        except (TypeError, ValueError):
+            amount_s = _csv_cell(amount)
+        cur = draft.get("currency") if isinstance(draft.get("currency"), str) else currency
+        writer.writerow([
+            entry.get("row") or "",
+            _csv_cell(draft.get("invoice_number")),
+            _csv_cell(draft.get("invoice_date")),
+            _csv_cell(draft.get("due_date")),
+            _csv_cell(draft.get("customer_name")),
+            _csv_cell(draft.get("supplier_name")),
+            amount_s,
+            cur or currency,
+        ])
+    return buf.getvalue()
+
+
+def _parse_invoice_batch_csv(text: str) -> list[dict[str, Any]]:
+    """Parse an SME-edited CSV back into per-row field dicts.
+
+    Tolerant: maps header aliases, handles a missing/extra header row, and
+    falls back to positional columns + 1-based row numbers when the ``row``
+    column is absent."""
+    import csv as _csv
+    out: list[dict[str, Any]] = []
+    if not text or not text.strip():
+        return out
+    try:
+        rows = [r for r in _csv.reader(io.StringIO(text)) if any((c or "").strip() for c in r)]
+    except Exception:  # noqa: BLE001
+        return out
+    if not rows:
+        return out
+    header = [_CSV_HEADER_ALIASES.get((c or "").strip().lower(), (c or "").strip().lower()) for c in rows[0]]
+    known = [h for h in header if h in ("row", *_CSV_COLUMNS)]
+    if known:
+        data_rows = rows[1:]
+    else:
+        header = ["row", *_CSV_COLUMNS]
+        data_rows = rows
+    for idx, raw in enumerate(data_rows, 1):
+        rec: dict[str, Any] = {}
+        for j, cell in enumerate(raw):
+            if j < len(header) and header[j]:
+                rec[header[j]] = (cell or "").strip()
+        row_no: int | None
+        try:
+            row_no = int(float(rec.get("row"))) if rec.get("row") else None
+        except (TypeError, ValueError):
+            row_no = None
+        if row_no is None:
+            row_no = idx
+        out.append({"row": row_no, **{f: rec.get(f) for f in _CSV_COLUMNS}})
+    return out
+
+
+def _first_csv_attachment(value: Any) -> dict[str, Any] | None:
+    """Return the first CSV/text attachment with bytes, else None."""
+    for att in _valid_upload_attachments(value):
+        mime = str(att.get("mime_type") or "").lower()
+        name = str(att.get("filename") or "").lower()
+        if "csv" in mime or name.endswith(".csv") or mime in ("text/plain", "application/csv"):
+            return att
+    return None
 
 
 def _draft_is_empty(draft: dict[str, Any]) -> bool:
@@ -5657,6 +5764,17 @@ class OnboardingWorkflow(WorkflowDefinition):
                 return await self._handle_invoice_batch_action(
                     state, ctx, reply, batch_action,
                 )
+            # An edited CSV file sent back at a pending batch → reconcile the
+            # rows and submit (NOT a brand-new invoice upload).
+            csv_att = _first_csv_attachment(reply)
+            if csv_att is not None:
+                try:
+                    csv_text = base64.b64decode(
+                        csv_att.get("content_base64") or ""
+                    ).decode("utf-8", "replace")
+                except Exception:  # noqa: BLE001
+                    csv_text = ""
+                return await self._handle_edited_csv(state, ctx, csv_text)
 
         attachments = _valid_upload_attachments(reply)
         if not attachments:
@@ -6010,6 +6128,25 @@ class OnboardingWorkflow(WorkflowDefinition):
                 # Extraction failed or empty → auto-submit blank.
                 auto_submit_atts.append(att)
 
+        # SOME extracted, SOME failed → the failed uploads join the SAME
+        # review CSV as EMPTY rows for the SME to fill in (user 2026-06-20),
+        # rather than being auto-submitted blank behind their back. Only when
+        # NOTHING extracted do we auto-submit the whole batch (Path B below).
+        if batch:
+            for att in auto_submit_atts:
+                if not (att.get("content_base64") or ""):
+                    continue
+                batch.append({
+                    "row":          row_num,
+                    "draft":        {},
+                    "filename":     att.get("filename") or f"invoice_{row_num}.pdf",
+                    "content_b64":  att.get("content_base64") or "",
+                    "mime":         att.get("mime_type"),
+                    "flag":         _flag_for_row({}),
+                })
+                row_num += 1
+            auto_submit_atts = []
+
         # Auto-submit the blanks in PARALLEL — they all share the same
         # backend create path so they bench like the extracts.
         async def _submit_blank(att: dict[str, Any]) -> dict[str, Any] | None:
@@ -6050,19 +6187,28 @@ class OnboardingWorkflow(WorkflowDefinition):
         auto_ledger = [r for r in auto_results if r is not None]
         auto_failed = len(auto_submit_atts) - len(auto_ledger)
 
-        # Path A — reviewable CSV preview (one or more rows extracted OK)
+        # Path A — reviewable CSV (one or more rows extracted OK; any failed
+        # uploads ride along as EMPTY rows for the SME to fill). Send the batch
+        # as a real CSV document + an APPROVE ALL prompt; fall back to the
+        # inline table if the backend document route isn't live yet.
         if batch:
-            table = _render_invoice_batch_table(batch, currency, total_qar)
-            await self._send(
-                ctx, state, "onboarding.invoice.batch.preview",
-                {
-                    "table":   table,
-                    "count":   str(len(batch)),
-                    "total":   _fmt_qar(total_qar, currency),
-                    "saw_zip": "yes" if saw_zip else "no",
-                    "failed":  str(auto_failed),
-                },
+            csv_text = _render_invoice_batch_csv(batch, currency)
+            sent_doc = await self._send_invoice_csv(
+                ctx, state, csv_text,
+                count=len(batch), total=total_qar, currency=currency,
             )
+            if not sent_doc:
+                table = _render_invoice_batch_table(batch, currency, total_qar)
+                await self._send(
+                    ctx, state, "onboarding.invoice.batch.preview",
+                    {
+                        "table":   table,
+                        "count":   str(len(batch)),
+                        "total":   _fmt_qar(total_qar, currency),
+                        "saw_zip": "yes" if saw_zip else "no",
+                        "failed":  str(auto_failed),
+                    },
+                )
             new_sigs = list(state.invoice_submitted_sigs or [])
             # Note: we DON'T record attempt_sig in submitted_sigs yet
             # — the SME hasn't approved the batch yet. The sig is
@@ -7069,14 +7215,142 @@ class OnboardingWorkflow(WorkflowDefinition):
             pending_invoice_batch_currency=currency,
         )
 
+    async def _send_invoice_csv(
+        self,
+        ctx: WorkflowContext,
+        state: OnboardingState,
+        csv_text: str,
+        *,
+        count: int,
+        total: int,
+        currency: str,
+    ) -> bool:
+        """Send the batch as a CSV document + an APPROVE ALL / edit prompt.
+
+        Returns True iff the CSV document was delivered (False → caller falls
+        back to the inline table preview)."""
+        content_b64 = base64.b64encode(csv_text.encode("utf-8")).decode("ascii")
+        caption = (
+            f"📄 Your {count} invoice(s) — review sheet. Edit any cell "
+            "(keep the header row) and send it back, or reply APPROVE ALL to "
+            "submit as-is."
+        )
+        try:
+            sent = await self._msg.send_document(
+                channel=_channel(ctx),
+                identity=ctx.identity,
+                filename="invoices_review.csv",
+                content_base64=content_b64,
+                caption=caption,
+                mime_type="text/csv",
+                locale=state.locale,
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade to inline table
+            ctx.logger.warning(
+                "invoice_csv.send_document_failed", error=str(exc)[:200],
+            )
+            return False
+        if not sent:
+            return False
+        # Document delivered → follow up with the APPROVE ALL prompt + how-to.
+        prompt_vars = {"count": str(count), "total": _fmt_qar(total, currency)}
+        sent_btn = False
+        send_buttons = getattr(self._msg, "send_reply_buttons", None)
+        if send_buttons is not None:
+            try:
+                sent_btn = await send_buttons(
+                    channel=_channel(ctx),
+                    identity=ctx.identity,
+                    template_key="onboarding.invoice.batch.csv_review",
+                    buttons=[("batch_approve_all", "Approve all")],
+                    variables=prompt_vars,
+                    locale=state.locale,
+                )
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "invoice_csv.prompt_buttons_failed", error=str(exc)[:200],
+                )
+                sent_btn = False
+        if not sent_btn:
+            try:
+                await self._send(
+                    ctx, state, "onboarding.invoice.batch.csv_review", prompt_vars,
+                )
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "invoice_csv.prompt_failed", error=str(exc)[:200],
+                )
+        return True
+
+    async def _handle_edited_csv(
+        self,
+        state: OnboardingState,
+        ctx: WorkflowContext,
+        csv_text: str,
+    ) -> dict[str, Any]:
+        """Reconcile an SME-edited CSV against the pending batch (match by row
+        number, falling back to position) and submit the corrected rows."""
+        parsed = _parse_invoice_batch_csv(csv_text)
+        existing = list(state.pending_invoice_batch or [])
+        by_row: dict[int, dict[str, Any]] = {}
+        for entry in existing:
+            try:
+                by_row[int(entry.get("row"))] = entry
+            except (TypeError, ValueError):
+                continue
+        new_batch: list[dict[str, Any]] = []
+        new_row = 1
+        for idx, parsed_row in enumerate(parsed, 1):
+            entry = by_row.get(parsed_row.get("row"))
+            if entry is None and idx - 1 < len(existing):
+                entry = existing[idx - 1]
+            if entry is None or not (entry.get("content_b64") or ""):
+                # Can't submit a row with no underlying file bytes.
+                continue
+            draft = dict(entry.get("draft") or {})
+            for field in _CSV_COLUMNS:
+                value = parsed_row.get(field)
+                if value in (None, ""):
+                    continue
+                if field == "total_amount":
+                    try:
+                        draft[field] = int(float(str(value).replace(",", "")))
+                    except (TypeError, ValueError):
+                        draft[field] = value
+                else:
+                    draft[field] = value
+            updated = dict(entry)
+            updated["draft"] = draft
+            updated["row"] = new_row
+            updated["flag"] = _flag_for_row(draft)
+            new_batch.append(updated)
+            new_row += 1
+        if not new_batch:
+            # Unreadable / unmatched CSV — never drop their invoices silently.
+            await self._send(
+                ctx, state, "onboarding.invoice.batch.help",
+                {
+                    "hint": (
+                        "I couldn't read that CSV. Edit the cells (keep the "
+                        "header row) and resend, or reply APPROVE ALL to submit "
+                        "as-is."
+                    ),
+                },
+            )
+            return self._step("invoice_collect_await", ctx)
+        return await self._invoice_batch_submit_all(state, ctx, batch=new_batch)
+
     async def _invoice_batch_submit_all(
         self,
         state: OnboardingState,
         ctx: WorkflowContext,
+        batch: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Submit every row in the pending batch via ``submit_base64``
         and append the resulting records to the ledger. Clears the
-        batch on success or partial success."""
+        batch on success or partial success. ``batch`` overrides
+        ``state.pending_invoice_batch`` (used by the edited-CSV path)."""
+        target_batch = batch if batch is not None else (state.pending_invoice_batch or [])
         token, refresh, expires = await self._live_token(state, ctx)
         accepted: list[dict[str, Any]] = []
         failed = 0
@@ -7146,10 +7420,10 @@ class OnboardingWorkflow(WorkflowDefinition):
         # [TEMP-DBG]
         self._dbg(
             ctx, "invoice.bulk_submit_all.start",
-            row_count=len(state.pending_invoice_batch),
+            row_count=len(target_batch),
         )
         results = await _asyncio.gather(
-            *(_submit_one(row) for row in state.pending_invoice_batch)
+            *(_submit_one(row) for row in target_batch)
         )
         for record in results:
             if record is None:

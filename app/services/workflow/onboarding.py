@@ -2031,6 +2031,51 @@ def _is_conflict_error(exc: BaseException) -> bool:
     return False
 
 
+_DOCS_DONE_PHRASES = frozenset({
+    "done", "all done", "im done", "i'm done", "that's all", "thats all",
+    "that is all", "that's it", "thats it", "finished", "i'm finished",
+    "im finished", "all sent", "sent all", "sent everything",
+    "sent them all", "i've sent everything", "ive sent everything",
+    "i sent everything", "everything sent", "no more", "no more docs",
+    "no more documents", "nothing else", "nothing more", "all of them",
+    "i have sent all", "already sent", "i already sent it", "i sent it already",
+})
+
+
+def _docs_button_intent(value: Any) -> str | None:
+    """Map a tapped end-of-batch docs button (or its typed equivalent) to an
+    intent: 'more' (upload more) or 'done' (proceed)."""
+    t = reply_text(value).strip().lower().rstrip(" .!…")
+    if not t:
+        return None
+    if t in (
+        "yes, upload more", "yes upload more", "upload more",
+        "yes, i want to upload more documents", "i want to upload more",
+        "yes upload more documents",
+    ):
+        return "more"
+    if t in (
+        "no, i'm done", "no im done", "no, im done", "no i'm done",
+        "no, i am done", "no i am done", "i'm done", "im done", "done",
+    ):
+        return "done"
+    return None
+
+
+def _looks_done_with_docs(value: Any) -> bool:
+    """True when the SME signals they're finished uploading using natural
+    phrasing (not just a literal NO) — used as the docs-loop escape hatch so a
+    mis-classified-but-uploaded doc never traps them."""
+    t = reply_text(value).strip().lower().rstrip(" .!…")
+    if not t:
+        return False
+    return t in _DOCS_DONE_PHRASES or t.startswith((
+        "done", "all done", "i'm done", "im done", "that's all", "thats all",
+        "no more", "i've sent everything", "ive sent everything",
+        "i sent everything", "i already sent",
+    ))
+
+
 class OnboardingWorkflow(WorkflowDefinition):
     name = "onboarding"
     version = 1
@@ -3888,51 +3933,6 @@ class OnboardingWorkflow(WorkflowDefinition):
             },
         )
         return self._step("documents_upload_loop_send", ctx)
-
-_DOCS_DONE_PHRASES = frozenset({
-    "done", "all done", "im done", "i'm done", "that's all", "thats all",
-    "that is all", "that's it", "thats it", "finished", "i'm finished",
-    "im finished", "all sent", "sent all", "sent everything",
-    "sent them all", "i've sent everything", "ive sent everything",
-    "i sent everything", "everything sent", "no more", "no more docs",
-    "no more documents", "nothing else", "nothing more", "all of them",
-    "i have sent all", "already sent", "i already sent it", "i sent it already",
-})
-
-
-def _docs_button_intent(value: Any) -> str | None:
-    """Map a tapped end-of-batch docs button (or its typed equivalent) to an
-    intent: 'more' (upload more) or 'done' (proceed)."""
-    t = reply_text(value).strip().lower().rstrip(" .!…")
-    if not t:
-        return None
-    if t in (
-        "yes, upload more", "yes upload more", "upload more",
-        "yes, i want to upload more documents", "i want to upload more",
-        "yes upload more documents",
-    ):
-        return "more"
-    if t in (
-        "no, i'm done", "no im done", "no, im done", "no i'm done",
-        "no, i am done", "no i am done", "i'm done", "im done", "done",
-    ):
-        return "done"
-    return None
-
-
-def _looks_done_with_docs(value: Any) -> bool:
-    """True when the SME signals they're finished uploading using natural
-    phrasing (not just a literal NO) — used as the docs-loop escape hatch so a
-    mis-classified-but-uploaded doc never traps them."""
-    t = reply_text(value).strip().lower().rstrip(" .!…")
-    if not t:
-        return False
-    return t in _DOCS_DONE_PHRASES or t.startswith((
-        "done", "all done", "i'm done", "im done", "that's all", "thats all",
-        "no more", "i've sent everything", "ive sent everything",
-        "i sent everything", "i already sent",
-    ))
-
 
     async def _documents_upload_loop_await(
         self, state: OnboardingState, ctx: WorkflowContext

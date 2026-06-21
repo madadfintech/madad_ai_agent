@@ -63,6 +63,7 @@ def build_onboarding_platform(
     runtime: WorkflowRuntime | None = None,
     dedupe: WebhookDedupe | None = None,
     allowed_event_types: frozenset[str] | set[str] | None = None,
+    offers_debounce_seconds: float = 0.0,
 ) -> OnboardingPlatform:
     runtime = runtime or build_runtime()
     # Shared dedupe instance: dispatcher uses it for the 24h webhook event-id
@@ -79,6 +80,7 @@ def build_onboarding_platform(
         invoices=invoices or InMemoryInvoiceClient(),
         checklist=checklist,
         dedupe=shared_dedupe,
+        offers_debounce_seconds=offers_debounce_seconds,
     )
     runtime.register(workflow)
     dispatcher = OnboardingDispatcher(
@@ -131,5 +133,11 @@ def get_onboarding_platform() -> OnboardingPlatform:
             invoices=McpInvoiceClient(mcp),
             checklist=checklist,
             dedupe=dedupe,
+            # Coalesce ``offers.available`` webhooks 30 s apart into one
+            # SME-facing message (UAT 2026-06-21 +919497191690 screenshot:
+            # QIB at 11:38 + CBoQ at 11:39 produced two separate offer
+            # lists). Test deps default this to 0 to match the synchronous
+            # clock harness.
+            offers_debounce_seconds=30.0,
         )
     return build_onboarding_platform()

@@ -112,11 +112,12 @@ async def test_messages_sent_once_in_order(harness):
     # skipped on the QUALIFY-mid-docs path the helper drives — the
     # checklist isn't naturally complete, admin overrode it, and the
     # coffee message would misrepresent the SME's state.
-    # UAT 2026-06-10: the offers preview + handoff used to fire as TWO
-    # bubbles. Combined into a single CTA-URL message via
-    # ``onboarding.offer.handoff.button`` — ``offers.preview`` is now
-    # a back-compat fallback only and no longer fires on the WhatsApp
-    # happy path.
+    # UAT 2026-06-20: user feedback removed the trailing
+    # ``onboarding.offer.handoff.button`` CTA — the offer cards
+    # already include a tap-to-login button via the approved
+    # offers-available Meta template, and the extra handoff
+    # bubble was redundant. So ``offers.preview`` is now what
+    # SMEs see at the offer step.
     expected_subset = [
         "onboarding.campaign.intro",
         "onboarding.consent.request",
@@ -124,7 +125,7 @@ async def test_messages_sent_once_in_order(harness):
         "onboarding.account.created",
         "onboarding.documents.checklist",
         "onboarding.payment.request.button",
-        "onboarding.offer.handoff.button",
+        "onboarding.offers.preview",
     ]
     for tpl in expected_subset:
         assert tpl in templates, f"expected {tpl} in {templates}"

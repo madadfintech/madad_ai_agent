@@ -2092,12 +2092,20 @@ class OnboardingWorkflow(WorkflowDefinition):
         invoices: InvoiceClient | None = None,
         checklist: ChecklistProvider | None = None,
         dedupe: WebhookDedupe | None = None,
+        offers_debounce_seconds: float = 30.0,
     ) -> None:
         self._msg = messenger
         self._identity = identity
         self._kyc = kyc
         self._pay = payments
         self._reminders = reminders
+        # Offers-coalesce window. Madad fires one ``offers.available`` per
+        # lender quote; two banks within 33 s drove the +919497191690
+        # UAT bug (separate offer messages instead of one combined list).
+        # Production default 30 s. The deps factory passes 0 in tests
+        # because the deterministic test clock can't advance through the
+        # debounce inside a single resume cycle.
+        self._offers_debounce_seconds = max(0.0, offers_debounce_seconds)
         # Phase 1.b — invoice financing client. Optional only to keep
         # the long tail of existing test harnesses building without
         # naming a new ctor arg; the default in-memory fake fires when
@@ -3896,6 +3904,40 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _documents_upload_loop_send(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
+        # UAT 2026-06-21 (+919497191690 screenshot 11:34 AM): the
+        # ``Your application has been pre-qualified!`` checklist landed
+        # TWICE 167 ms apart — once from the workflow service handling
+        # the prequalification.completed webhook, once from the celery
+        # status_poller noticing the journey_status change at the same
+        # tick. Both runners arrived at this node with
+        # ``state.history`` still empty (their reads happened before
+        # the other could checkpoint), so the ``already_asked`` check
+        # below let both fire ``documents.checklist``.
+        #
+        # SET NX EX Redis claim per identity collapses the race: first
+        # runner sends, second runner finds the lock and silently drops.
+        # 120s TTL — long enough to swallow any in-flight retry, short
+        # enough that a legitimate later loop-back can still re-fire
+        # the (different) ``documents.missing`` reminder.
+        checklist_key = f"docs:checklist:{ctx.identity}"
+        try:
+            first_runner = await self._dedupe.claim(
+                checklist_key, ttl_seconds=120
+            )
+        except Exception as exc:  # noqa: BLE001 — Redis hiccup mustn't block onboarding
+            ctx.logger.warning(
+                "docs.checklist.claim_failed",
+                error=str(exc)[:200],
+                note="proceeding without inflight guard",
+            )
+            first_runner = True
+        if not first_runner:
+            ctx.logger.info(
+                "docs.checklist.dedupe_skip", identity=ctx.identity,
+                note="concurrent prequalified/poll runner already sent the checklist",
+            )
+            return self._step("documents_upload_loop_send", ctx)
+
         # First entry uses the checklist template; re-entries (missing-docs
         # loop-back) use the shorter "still missing" template.
         already_asked = any(
@@ -5727,10 +5769,38 @@ class OnboardingWorkflow(WorkflowDefinition):
         # node's one-shot send.
         if _offers_sig(state.offers) == state.offers_preview_shown_sig:
             return self._step("offer_view_send", ctx)
-        # Offers must reach the SME ASAP — send immediately whenever the
-        # offer SET changes (a new lender offered). The sig guard above
-        # already stops re-spamming the SAME set on routine polls. No
-        # debounce: lenders can offer hours/days apart (user 2026-06-20).
+        # UAT 2026-06-21 (+919497191690 screenshot 11:38/11:39 AM):
+        # Madad emits one ``offers.available`` webhook PER lender that
+        # quotes — two banks 33 seconds apart produced two separate
+        # offer-preview messages (QIB alone, then QIB + CBoQ). The SME
+        # only wanted the second cumulative message.
+        #
+        # 30-second debounce: on the first sighting record
+        # ``offers_first_seen_at``. The send happens only after the
+        # debounce window closes. The next driver here is either
+        #   * the next ``offers.available`` webhook (33s later in this
+        #     UAT — the debounce window expires and the cumulative
+        #     set goes out), OR
+        #   * the status_poller's 60-second tick for ACCEPTED-phase
+        #     runs — guarantees the SME sees the offer even when only
+        #     one lender ever quotes (single-offer case).
+        # Picked 30s as the shortest debounce that catches the
+        # "two banks within 33 s" race without delaying single-offer
+        # SMEs beyond one poller tick.
+        debounce_seconds = self._offers_debounce_seconds
+        if debounce_seconds > 0:
+            now = ctx.clock.now()
+            first_seen = _parse_iso_or_none(state.offers_first_seen_at)
+            if first_seen is None:
+                # First time this offer set was observed — record + wait.
+                return self._step(
+                    "offer_view_send", ctx,
+                    offers_first_seen_at=now.isoformat(),
+                )
+            if (now - first_seen).total_seconds() < debounce_seconds:
+                # Still inside the coalesce window — let the next webhook
+                # / poll re-enter this node when more offers may have arrived.
+                return self._step("offer_view_send", ctx)
         await self._send(
             ctx,
             state,
@@ -6044,15 +6114,23 @@ class OnboardingWorkflow(WorkflowDefinition):
         # above misses (LangGraph only writes state on node return). The
         # SME sees 3-4 ``bulk.processing`` acks and then "no response"
         # on subsequent uploads. SET NX EX over Redis: the first runner
-        # claims the (identity, sig) key for 120s; concurrent retries
-        # see the lock and silently drop. TTL > typical extract duration
-        # so the guard outlives the slow call without permanently
-        # blocking legitimate later re-attempts.
+        # claims the (identity, sig) key; concurrent retries see the
+        # lock and silently drop.
+        #
+        # UAT 2026-06-21 (+919497191690 screenshot): the original 120 s
+        # TTL was too tight. A 3-invoice bulk extract took 227 s; the
+        # webhook retry came at +210 s, found the lock already expired,
+        # ran its own extract for 166 s in parallel, and re-fired the
+        # CSV preview AFTER the SME had already tapped APPROVE ALL on
+        # the first runner's preview. Bumped to 600 s — comfortably
+        # outlives the worst extract latency we've measured (235 s)
+        # while still releasing within 10 minutes so a legitimate
+        # later re-upload of the same set isn't blocked indefinitely.
         if sig:
             inflight_key = f"invoice:inflight:{ctx.identity}:{sig}"
             try:
                 first_runner = await self._dedupe.claim(
-                    inflight_key, ttl_seconds=120
+                    inflight_key, ttl_seconds=600
                 )
             except Exception as exc:  # noqa: BLE001 — Redis hiccup must not block uploads
                 ctx.logger.warning(

@@ -182,9 +182,13 @@ async def test_real_payment_path_e2e_fires_confirmed_then_offers(make_harness) -
     # Real payment fires the confirmation message.
     assert "onboarding.payment.confirmed" in templates
     # And the offer cards render through the lender phase.
-    offer_templates = [t for t in templates if t.startswith("onboarding.offer.")]
+    # ``offer.`` (singular) or ``offers.`` (plural — the preview template).
+    offer_templates = [
+        t for t in templates
+        if t.startswith("onboarding.offer.") or t.startswith("onboarding.offers.")
+    ]
     assert offer_templates, (
-        f"expected an onboarding.offer.* template after offers.available; "
+        f"expected an onboarding.offer(s).* template after offers.available; "
         f"got: {templates}"
     )
 
@@ -229,7 +233,7 @@ async def test_waive_off_at_payment_await_e2e_no_msg_then_offers(make_harness) -
     )
 
     offer_templates = [
-        t for t in harness.messenger.templates() if t.startswith("onboarding.offer.")
+        t for t in harness.messenger.templates() if t.startswith("onboarding.offer.") or t.startswith("onboarding.offers.")
     ]
     assert offer_templates, (
         f"expected offer card after offers.available; got: "
@@ -277,7 +281,7 @@ async def test_waive_off_at_payment_wait_e2e_no_msg_then_offers(harness) -> None
     )
 
     offer_templates = [
-        t for t in harness.messenger.templates() if t.startswith("onboarding.offer.")
+        t for t in harness.messenger.templates() if t.startswith("onboarding.offer.") or t.startswith("onboarding.offers.")
     ]
     assert offer_templates, (
         f"expected offer card after offers.available; got: "
@@ -327,7 +331,7 @@ async def test_waive_off_at_docs_loop_e2e_no_msg_then_offers(harness) -> None:
     ))
 
     offer_templates = [
-        t for t in harness.messenger.templates() if t.startswith("onboarding.offer.")
+        t for t in harness.messenger.templates() if t.startswith("onboarding.offer.") or t.startswith("onboarding.offers.")
     ]
     assert offer_templates, (
         f"expected offer card after offers.available; got: "

@@ -5,13 +5,12 @@ from __future__ import annotations
 from app.shared.mcp import Tools
 
 
-def test_registry_has_all_77_constants_grouped_by_module() -> None:
+def test_registry_has_all_79_constants_grouped_by_module() -> None:
     names = Tools.all()
-    # 13 + 8 + 7 + 31 + 4 + 5 + 9 = 77. +1 vs prior is
-    # EXT_SEND_WHATSAPP_INTERACTIVE_BUTTONS — the tappable YES/NO buttons
-    # tool the docs settle-prompt uses (UAT 2026-06-13 end-of-upload
-    # interactive prompt).
-    assert len(names) == 77
+    # 13 + 9 + 7 + 32 + 4 + 5 + 9 = 79. +2 vs prior cut:
+    #   * EXT_SEND_EMAIL_TEXT — arbitrary-content email send.
+    #   * KYC_UPLOAD_INVOICE_BASE64 — invoice submit from base64.
+    assert len(names) == 79
 
     by_prefix: dict[str, int] = {}
     for value in names.values():
@@ -19,9 +18,9 @@ def test_registry_has_all_77_constants_grouped_by_module() -> None:
         by_prefix[prefix] = by_prefix.get(prefix, 0) + 1
 
     assert by_prefix["auth"] == 13
-    assert by_prefix["external"] == 8
+    assert by_prefix["external"] == 9
     assert by_prefix["mcp"] == 7
-    assert by_prefix["kyc"] == 31
+    assert by_prefix["kyc"] == 32
     assert by_prefix["offers"] == 4
     assert by_prefix["payments"] == 5
     assert by_prefix["invoices"] == 9

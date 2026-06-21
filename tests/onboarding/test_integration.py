@@ -89,8 +89,7 @@ async def test_onboarding_drives_real_communication_and_nudge():
     messages = await comms.get_messages(conversation.conversation_id)
     texts = [m.text for m in messages]
     assert "[onboarding.campaign.intro]" in texts
-    # WhatsApp uses the button variant (A11); fall back to plain text variant.
-    assert any(
-        t in texts
-        for t in ("[onboarding.offer.handoff.button]", "[onboarding.offer.handoff]")
-    )
+    # UAT 2026-06-20: dropped the trailing handoff CTA bubble; the
+    # offers preview itself carries the tap-to-login button via the
+    # approved Meta template.
+    assert "[onboarding.offers.preview]" in texts

@@ -197,8 +197,15 @@ async def test_zip_invoice_extracts_and_renders_csv_preview(harness) -> None:
     templates = harness.messenger.templates()
     # ONE consolidated "received N invoices — processing" ack.
     assert "onboarding.invoice.bulk.processing" in templates
-    # CSV preview rendered.
-    assert "onboarding.invoice.batch.preview" in templates
+    # CSV preview rendered (either as a CSV-document send or, as a fallback
+    # when the backend doc route isn't reachable, the inline table preview).
+    assert any(
+        t in templates
+        for t in (
+            "onboarding.invoice.batch.csv_review",
+            "onboarding.invoice.batch.preview",
+        )
+    )
 
 
 async def test_zip_approve_all_submits_in_parallel(harness) -> None:
@@ -277,11 +284,21 @@ async def test_zip_one_member_fails_extract_still_auto_submits(
     })
 
     inv_calls = [name for name, _ in harness.invoices.calls]
-    # 2 extracts attempted; the failed one fell through to auto-submit.
+    # 2 extracts attempted.
     assert inv_calls.count("extract_base64") == 2
-    assert "extract_and_submit_base64" in inv_calls, (
-        "the failed member must be auto-submitted (never silently dropped)"
-    )
+    # UAT 2026-06-20 refinement: when SOME extracts succeed and SOME
+    # fail, the failed member joins the SAME review batch as an empty
+    # row for the SME to fill in (instead of being auto-submitted
+    # blank). Auto-submit only runs when NOTHING extracted.
+    assert "extract_and_submit_base64" not in inv_calls
+    templates = harness.messenger.templates()
+    assert any(
+        t in templates
+        for t in (
+            "onboarding.invoice.batch.csv_review",
+            "onboarding.invoice.batch.preview",
+        )
+    ), "the failed member must reach the SME via the CSV review path"
 
 
 # -- Idempotency ------------------------------------------------------------

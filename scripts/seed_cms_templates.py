@@ -195,7 +195,9 @@ _TEMPLATE_BODIES = {
         "✅ Got it — {{ received }} of {{ total }} documents received! 🙌\n\n"
         "⏳ Still needed:\n"
         "{{ documents }}\n\n"
-        "No rush — send them one at a time or all together."
+        "Send them one at a time or all together. If a document keeps showing "
+        "as pending even after you've sent it, just reply *DONE* and our team "
+        "will verify it for you. 🙌"
     ),
     # Acknowledgement when the SME sends everything in one ZIP — header + the
     # per-document "Received & Validated" checklist built by the workflow.

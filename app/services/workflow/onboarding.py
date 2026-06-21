@@ -3889,6 +3889,31 @@ class OnboardingWorkflow(WorkflowDefinition):
         )
         return self._step("documents_upload_loop_send", ctx)
 
+_DOCS_DONE_PHRASES = frozenset({
+    "done", "all done", "im done", "i'm done", "that's all", "thats all",
+    "that is all", "that's it", "thats it", "finished", "i'm finished",
+    "im finished", "all sent", "sent all", "sent everything",
+    "sent them all", "i've sent everything", "ive sent everything",
+    "i sent everything", "everything sent", "no more", "no more docs",
+    "no more documents", "nothing else", "nothing more", "all of them",
+    "i have sent all", "already sent", "i already sent it", "i sent it already",
+})
+
+
+def _looks_done_with_docs(value: Any) -> bool:
+    """True when the SME signals they're finished uploading using natural
+    phrasing (not just a literal NO) — used as the docs-loop escape hatch so a
+    mis-classified-but-uploaded doc never traps them."""
+    t = reply_text(value).strip().lower().rstrip(" .!…")
+    if not t:
+        return False
+    return t in _DOCS_DONE_PHRASES or t.startswith((
+        "done", "all done", "i'm done", "im done", "that's all", "thats all",
+        "no more", "i've sent everything", "ive sent everything",
+        "i sent everything", "i already sent",
+    ))
+
+
     async def _documents_upload_loop_await(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
@@ -4051,7 +4076,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             # 2026-06-12). Only honoured once we've actually shown the "any
             # more documents?" prompt, so a stray "no" earlier in the phase
             # can't skip the document step.
-            if is_no(reply) and (state.more_docs_prompt_at or state.docs_uploaded_count > 0):
+            if (is_no(reply) or _looks_done_with_docs(reply)) and (
+                state.more_docs_prompt_at or state.docs_uploaded_count > 0
+            ):
                 # Per user (2026-06-12): on NO, send the coffee / "all received,
                 # we'll review within 24h" message (once) so the SME gets a
                 # clear next-step confirmation — not a bare "moving on".

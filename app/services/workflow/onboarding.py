@@ -3900,6 +3900,26 @@ _DOCS_DONE_PHRASES = frozenset({
 })
 
 
+def _docs_button_intent(value: Any) -> str | None:
+    """Map a tapped end-of-batch docs button (or its typed equivalent) to an
+    intent: 'more' (upload more) or 'done' (proceed)."""
+    t = reply_text(value).strip().lower().rstrip(" .!…")
+    if not t:
+        return None
+    if t in (
+        "yes, upload more", "yes upload more", "upload more",
+        "yes, i want to upload more documents", "i want to upload more",
+        "yes upload more documents",
+    ):
+        return "more"
+    if t in (
+        "no, i'm done", "no im done", "no, im done", "no i'm done",
+        "no, i am done", "no i am done", "i'm done", "im done", "done",
+    ):
+        return "done"
+    return None
+
+
 def _looks_done_with_docs(value: Any) -> bool:
     """True when the SME signals they're finished uploading using natural
     phrasing (not just a literal NO) — used as the docs-loop escape hatch so a
@@ -4016,44 +4036,87 @@ def _looks_done_with_docs(value: Any) -> bool:
         # Fire the coffee message once for closure, set docs_proceed=True
         # so ``_route_documents`` advances to the next step.
         if _is_docs_settle(reply):
-            required = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
-            acked = set(state.docs_acked)
-            all_required_touched = bool(required) and all(
-                d in acked or d not in state.missing_documents for d in required
-            )
-            enough_uploads = (
-                state.docs_uploaded_count >= len(required) if required else False
-            )
-            if state.docs_uploaded_count > 0 and (
-                all_required_touched or enough_uploads
-            ):
-                if not state.documents_complete_sent:
-                    try:
-                        await self._send(
-                            ctx, state, "onboarding.documents.complete"
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        ctx.logger.warning(
-                            "docs_settle_complete.failed", error=str(exc)[:200]
-                        )
+            # End-of-batch cue. The poller fires this ONLY when docs are still
+            # missing, >=1 doc has been classified (docs_acked), the SME has
+            # gone quiet (the whole batch is fully processed), and we haven't
+            # prompted yet — so it can never fire mid-classification or twice.
+            # Ask ONCE, with tappable buttons, whether they want to upload more
+            # (user 2026-06-21). All-received never reaches here (it routes to
+            # the "complete" path), so there are always pending docs to show.
+            pending = list(state.missing_documents)
+            if not pending:
                 return self._step(
-                    "documents_upload_loop_await",
-                    ctx,
-                    docs_proceed=True,
-                    documents_complete_sent=True,
+                    "documents_upload_loop_await", ctx,
                     docs_settle_prompted=True,
-                    missing_documents=list(state.missing_documents),
-                    documents_received=False,
+                    missing_documents=pending, documents_received=False,
                 )
+            prompt_vars = {
+                "documents": _format_documents(pending),
+                "count": str(len(pending)),
+            }
+            sent_btn = False
+            send_buttons = getattr(self._msg, "send_reply_buttons", None)
+            if send_buttons is not None:
+                try:
+                    sent_btn = await send_buttons(
+                        channel=_channel(ctx),
+                        identity=ctx.identity,
+                        template_key="onboarding.documents.more_docs_prompt",
+                        buttons=[
+                            ("docs_upload_more", "Yes, upload more"),
+                            ("docs_done", "No, I'm done"),
+                        ],
+                        variables=prompt_vars,
+                        locale=state.locale,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning(
+                        "docs_more_prompt.buttons_failed", error=str(exc)[:200]
+                    )
+                    sent_btn = False
+            if not sent_btn:
+                try:
+                    await self._send(
+                        ctx, state, "onboarding.documents.more_docs_prompt",
+                        prompt_vars,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning(
+                        "docs_more_prompt.failed", error=str(exc)[:200]
+                    )
             return self._step(
-                "documents_upload_loop_await",
-                ctx,
+                "documents_upload_loop_await", ctx,
                 docs_settle_prompted=True,
-                missing_documents=list(state.missing_documents),
-                documents_received=False,
+                missing_documents=pending, documents_received=False,
             )
         attachments = _valid_upload_attachments(reply)
         if not attachments:
+            # End-of-batch button taps (user 2026-06-21): "Yes, upload more"
+            # re-arms the prompt and waits for the next batch; "No, I'm done"
+            # proceeds even with some docs still pending. (Tappable buttons —
+            # no typed keywords required.)
+            docs_btn = _docs_button_intent(reply)
+            if docs_btn == "more":
+                await self._send(
+                    ctx, state, "onboarding.help.contextual",
+                    {"answer": "Sure — send the rest whenever you're ready, as a "
+                     "PDF, photo, or ZIP. \U0001f4ce", "next_step": ""},
+                )
+                return self._step(
+                    "documents_upload_loop_await", ctx,
+                    docs_settle_prompted=False,
+                    missing_documents=list(state.missing_documents),
+                    documents_received=False,
+                )
+            if docs_btn == "done":
+                if not state.documents_complete_sent:
+                    await self._send(ctx, state, "onboarding.documents.complete")
+                return self._step(
+                    "documents_upload_loop_await", ctx,
+                    docs_proceed=True, documents_complete_sent=True,
+                    missing_documents=list(state.missing_documents),
+                    documents_received=False,
+                )
             # Bug #16 (UAT 2026-06-09): per spec page 8 "PENDING DOCS",
             # the SME can ask "what am I still missing?" anytime and the
             # agent answers with the running list. With Bug #16's brief-
@@ -4472,7 +4535,9 @@ def _looks_done_with_docs(value: Any) -> bool:
             more_docs_prompt_at=more_docs_prompt_at,
             docs_last_upload_at=last_upload_at,
             docs_acked=docs_acked,
-            docs_settle_prompted=state.docs_settle_prompted,
+            # A new upload = a new batch: re-arm so the poller re-prompts once
+            # this batch settles (if anything is still missing).
+            docs_settle_prompted=False,
         )
 
     async def _send_pending_docs(

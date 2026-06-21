@@ -195,9 +195,7 @@ _TEMPLATE_BODIES = {
         "✅ Got it — {{ received }} of {{ total }} documents received! 🙌\n\n"
         "⏳ Still needed:\n"
         "{{ documents }}\n\n"
-        "Send them one at a time or all together. If a document keeps showing "
-        "as pending even after you've sent it, just reply *DONE* and our team "
-        "will verify it for you. 🙌"
+        "No rush — send them one at a time or all together."
     ),
     # Acknowledgement when the SME sends everything in one ZIP — header + the
     # per-document "Received & Validated" checklist built by the workflow.
@@ -230,9 +228,9 @@ _TEMPLATE_BODIES = {
     # reply-button send is on the cluster's backlog; until that ships,
     # this is plain-text + the synonym-aware matcher.
     "onboarding.documents.more_docs_prompt": (
-        "📄 Do you have any more documents to upload?\n\n"
-        "Reply YES if you'd like to send more, or NO if you're done — "
-        "we'll proceed with the next step."
+        "📋 Thanks — here's where your application stands. Still pending:\n\n"
+        "{{ documents }}\n\n"
+        "Would you like to upload more documents?"
     ),
     # End-of-upload "settle" message (UAT 2026-06-13): the checklist + the
     # any-more prompt in ONE message, fired ONCE by the docs_more_prompt nudge

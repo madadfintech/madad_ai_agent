@@ -186,6 +186,36 @@ async def _maybe_settle_docs(
         return False  # already prompted for this quiet period
     if last_upload is None or quiet_for is None or quiet_for < DOCS_SETTLE_QUIET.total_seconds():
         return False  # still actively uploading — wait for quiet
+
+    # UAT 2026-06-21 (+919497191690 07:07-07:10 logs): the workflow
+    # node correctly sets ``docs_settle_prompted=True`` in its return
+    # but the next poller eval STILL reads ``False`` — likely a
+    # checkpoint-merge / read-after-write window between celery and the
+    # workflow service. The result was ``more_docs_prompt`` firing every
+    # 60 s, one cadence tick apart. Redis SET NX EX backstop: claim a
+    # key that includes the ``last_upload`` timestamp before resuming.
+    # Same quiet window → identical key → only one prompt. A subsequent
+    # legitimate upload re-arms the prompt because the new last_upload
+    # produces a new key.
+    settle_key = f"docs:settle:{run.identity}:{run.run_id}:{last_upload_raw}"
+    try:
+        first_runner = await platform.workflow._dedupe.claim(  # type: ignore[attr-defined]
+            settle_key, ttl_seconds=1800
+        )
+    except Exception as exc:  # noqa: BLE001 — Redis hiccup must not block onboarding
+        logger.warning(
+            "docs_settle.claim_failed",
+            run_id=run.run_id, error=str(exc)[:200],
+            note="proceeding without inflight guard",
+        )
+        first_runner = True
+    if not first_runner:
+        logger.info(
+            "docs_settle.dedupe_skip", run_id=run.run_id,
+            note="another tick already claimed this settle window",
+        )
+        return False
+
     await platform.dispatcher.resume_external(
         run.channel,
         run.identity,

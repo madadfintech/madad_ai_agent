@@ -349,6 +349,7 @@ async def rules(authorization: str | None = Header(None)) -> dict[str, Any]:
             {
                 "name": r["name"],
                 "pattern": r["pattern"],
+                "exclude": r.get("exclude"),
                 "severity": r.get("severity"),
                 "description": r.get("description"),
             }
@@ -360,6 +361,10 @@ async def rules(authorization: str | None = Header(None)) -> dict[str, Any]:
                 "type": type(r).__name__,
                 "severity": r.severity,
                 "description": r.description,
+                "exclude": (
+                    r._exclude.pattern  # type: ignore[union-attr]
+                    if getattr(r, "_exclude", None) is not None else None
+                ),
                 **(
                     {
                         "threshold": r.threshold,

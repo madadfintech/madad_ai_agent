@@ -59,13 +59,21 @@ POLLABLE_STEPS: frozenset[str] = frozenset({
 # tappable YES/NO button prompt (UAT 2026-06-13).
 DOCS_UPLOAD_STEP = "documents_upload_loop_await"
 # How long the upload stream must be quiet before we fire the settle prompt.
-# A ZIP (or multi-file bulk) reaches us as separate inbound waves, and each
-# member's classify+upload can take up to ~25s — so consecutive waves can be
-# >25s apart. At 25s the sweep fired BETWEEN waves and rendered a stale partial
-# checklist ("all but 2 still missing" right after a full upload — UAT
-# 2026-06-13). 45s comfortably absorbs the inter-wave gap so the checklist
-# reflects the whole batch, while staying well inside the SME's attention span.
-DOCS_SETTLE_QUIET = timedelta(seconds=45)
+# ``docs_last_upload_at`` is stamped at the END of each inbound's node run —
+# i.e. AFTER that doc has finished classifying — so it advances continuously
+# while a burst is being processed. Empirically (UAT 2026-06-21, an 11-doc
+# multi-select from +918287611995) the bridge feeds docs in sequentially but
+# back-to-back: each classify takes ~1-3s and the next node.enter lands ~250ms
+# after the prior node.exit, so the gap between consecutive completions is
+# ~3s. An 8s quiet window therefore has >2x margin over the real inter-doc gap
+# — it cannot trip mid-burst (the timer keeps resetting as each doc lands) and
+# fires only once the whole batch has drained AND gone quiet. This replaces the
+# old fixed 45s (user 2026-06-21: "6-8s is way better than 45s") which was set
+# for a worst-case ~25s classify-hang that the normal flow never hits. The
+# ``more_docs_prompt_sig`` content-guard in the workflow node is the structural
+# backstop: even an occasional slow doc that did trip an early settle cannot
+# produce a duplicate — only a genuinely changed pending set re-prompts.
+DOCS_SETTLE_QUIET = timedelta(seconds=8)
 
 # Cadence per journey-status group, expressed as a timedelta.
 CADENCE_OFFER = timedelta(seconds=60)   # ACCEPTED/OFFER_ACCEPTED — see below

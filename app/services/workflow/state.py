@@ -186,6 +186,14 @@ class OnboardingState(WorkflowState):
     # buttons) has been sent for the current quiet period; reset on each new
     # upload wave so a later batch re-arms it (UAT 2026-06-13).
     docs_settle_prompted: bool = False
+    # Signature of the missing-doc set the LAST time we actually sent the "any
+    # more?" prompt (sorted doc keys joined). This is the structural
+    # duplicate-guard (user 2026-06-21: "we absolutely CANNOT have multiple
+    # messages"): the prompt only fires when the pending set DIFFERS from this
+    # — so repeated settle resumes for the same pending set are inert, while a
+    # genuine new upload (which shrinks the set) re-arms it exactly once. Time
+    # windows can race; a content signature cannot.
+    more_docs_prompt_sig: str | None = None
     # Deprecated (2026-06-12): replaced by the in-loop is_no/is_yes handling.
     # Retained for checkpoint back-compat; no longer read.
     more_docs_decision: str | None = None  # "yes" | "no" | None (not asked yet)

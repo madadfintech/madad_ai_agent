@@ -4092,6 +4092,24 @@ class OnboardingWorkflow(WorkflowDefinition):
                     docs_settle_prompted=True,
                     missing_documents=pending, documents_received=False,
                 )
+            # Structural duplicate-guard (user 2026-06-21): a settle resume for
+            # a pending set we've ALREADY prompted for is inert — set the flag
+            # and return WITHOUT sending. Only a genuine new upload (which
+            # shrinks the pending set → a new signature) re-arms a real prompt.
+            # This makes "exactly once per distinct pending set" structural, so
+            # no timing race or duplicate resume can produce a second message.
+            pending_sig = "|".join(sorted(pending))
+            if state.more_docs_prompt_sig == pending_sig:
+                ctx.logger.info(
+                    "docs_more_prompt.dedupe_skip",
+                    sig=pending_sig,
+                    note="already prompted for this exact pending set",
+                )
+                return self._step(
+                    "documents_upload_loop_await", ctx,
+                    docs_settle_prompted=True,
+                    missing_documents=pending, documents_received=False,
+                )
             prompt_vars = {
                 "documents": _format_documents(pending),
                 "count": str(len(pending)),
@@ -4129,6 +4147,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             return self._step(
                 "documents_upload_loop_await", ctx,
                 docs_settle_prompted=True,
+                more_docs_prompt_sig=pending_sig,
                 missing_documents=pending, documents_received=False,
             )
         attachments = _valid_upload_attachments(reply)

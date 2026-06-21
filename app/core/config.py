@@ -87,10 +87,13 @@ class CelerySettings(BaseModel):
     workflow_timeout_sweep_seconds: float = 300.0
     # Beat-tick interval for the journey-status polling worker. Every tick
     # scans all WAITING runs and decides per-run whether a poll is due via
-    # the cadence-by-status logic in :mod:`app.workers.status_poller`. A 60s
-    # tick balances responsiveness against load (per-run cadence is 5 min
-    # or longer, so 60s is "fast enough to catch the next due window").
-    status_poller_seconds: float = 60.0
+    # the cadence-by-status logic in :mod:`app.workers.status_poller`. A 15s
+    # tick keeps the end-of-upload "any more docs?" settle responsive (user
+    # 2026-06-21: prompt should land seconds after the batch goes quiet, not
+    # ~a minute later) — status polls stay cheap because their per-run cadence
+    # (5 min+) still gates the actual backend calls; only the cheap "is it
+    # due?" check runs more often.
+    status_poller_seconds: float = 15.0
 
 
 class EventBusSettings(BaseModel):

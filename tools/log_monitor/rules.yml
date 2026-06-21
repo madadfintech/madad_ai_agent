@@ -153,6 +153,13 @@ behavioral_rules:
     severity: warning
     description: Same template fired 3+ times for one identity within 5 minutes — UX spam suspect
     trigger: '\[TEMP-DBG\] obs\.outbound\.send.*identity=(?P<identity>\S+).*template_key=(?P<template_key>\S+)'
+    # UAT 2026-06-21: a few templates legitimately fire once per
+    # SME action (KYC doc ack, invoice ack, LLM contextual reply) —
+    # 3+ within 5 minutes is normal behaviour, not duplication.
+    # Templates whose duplication WOULD be a real bug
+    # (bulk.processing, batch.preview, documents.checklist, offers.preview, …)
+    # are NOT in this list so they still fire.
+    exclude: 'template_key=onboarding\.documents\.single_received|template_key=onboarding\.invoice\.received|template_key=onboarding\.invoice\.submitting|template_key=onboarding\.help\.contextual'
     threshold: 3
     window_seconds: 300
     cooldown_seconds: 300

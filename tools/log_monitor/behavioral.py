@@ -70,11 +70,17 @@ class CountRule:
         window_seconds: float,
         cooldown_seconds: float = 300.0,
         max_events_per_bucket: int = 1000,
+        exclude: str | None = None,
     ) -> None:
         self.name = name
         self.severity = severity
         self.description = description
         self._trigger = re.compile(trigger)
+        # Optional exclude regex: when set, lines matching it are dropped
+        # before counting. UAT 2026-06-21 used this to keep legitimate
+        # per-upload doc acks (one ack per distinct file) from tripping
+        # ``duplicate_outbound_send``.
+        self._exclude = re.compile(exclude) if exclude else None
         self.threshold = threshold
         self.window_seconds = window_seconds
         self.cooldown_seconds = cooldown_seconds
@@ -84,6 +90,8 @@ class CountRule:
     def observe(self, line: str, now: float) -> dict[str, Any] | None:
         m = self._trigger.search(line)
         if not m:
+            return None
+        if self._exclude is not None and self._exclude.search(line):
             return None
         # Named groups win; fall back to positional. Convert all to str.
         if m.groupdict():
@@ -200,6 +208,7 @@ def load_behavioral_rules(spec: list[dict[str, Any]] | None) -> list:
                     threshold=int(entry["threshold"]),
                     window_seconds=float(entry["window_seconds"]),
                     cooldown_seconds=float(entry.get("cooldown_seconds", 300)),
+                    exclude=entry.get("exclude"),
                 ))
             elif rtype == "value":
                 rules.append(ValueRule(

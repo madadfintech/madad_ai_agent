@@ -133,11 +133,12 @@ def get_onboarding_platform() -> OnboardingPlatform:
             invoices=McpInvoiceClient(mcp),
             checklist=checklist,
             dedupe=dedupe,
-            # Coalesce ``offers.available`` webhooks 30 s apart into one
-            # SME-facing message (UAT 2026-06-21 +919497191690 screenshot:
-            # QIB at 11:38 + CBoQ at 11:39 produced two separate offer
-            # lists). Test deps default this to 0 to match the synchronous
-            # clock harness.
-            offers_debounce_seconds=30.0,
+            # NO debounce (user 2026-06-21): an offer message must reach the
+            # SME the INSTANT each lender quotes — lenders can quote hours or
+            # days apart, so coalescing hides/delays the first offer. The
+            # ``_offers_sig`` guard already stops re-spamming the SAME set on
+            # routine polls; 0 disables the coalesce window entirely so each
+            # new lender's offer fires immediately.
+            offers_debounce_seconds=0.0,
         )
     return build_onboarding_platform()

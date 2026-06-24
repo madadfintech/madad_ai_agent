@@ -392,7 +392,7 @@ _TEMPLATE_BODIES = {
     # can take 60–90s) so the SME isn't watching a silent chat.
     "onboarding.invoice.processing": (
         "📄 Got your invoice — reading it now…\n\n"
-        "Please wait a moment while we extract the details — it may take up to 10 minutes. ⏳\n\n"
+        "This may take a little while — we'll confirm here as soon as it's done. ⏳\n\n"
         "Thank you for being with us. 🙏"
     ),
     # UAT 2026-06-18 (Ishan Bug 1) — SUBMIT-FIRST ack. Replaces the old
@@ -421,7 +421,7 @@ _TEMPLATE_BODIES = {
     # now…" spam that hit the SME with 10+ messages per upload.
     "onboarding.invoice.bulk.processing": (
         "📦 Received {{ count }} invoices — processing.\n\n"
-        "We'll send you the review summary shortly — for several invoices this can take a few minutes. ⏳\n\n"
+        "We'll send you the review summary shortly — this may take a little while. ⏳\n\n"
         "Thank you for being with us. 🙏"
     ),
     # Fires AFTER the SME taps Approve on the confirm card — the
@@ -560,18 +560,24 @@ _TEMPLATE_BODIES = {
         "Updated Limit: {{ available_limit }} available.\n\n"
         "Send another invoice anytime — single file or a ZIP both work. 💼"
     ),
+    # Consolidated multi-invoice reminder (1..N invoices). ``{{ invoices }}`` is
+    # the pre-rendered ━-separated block built by _due_alert_block (📄 ref ·
+    # paymaster / 💰 amount · Due date (N days)); ``{{ total }}`` the sum.
     "onboarding.repayment.due_soon": (
-        "⏰ Friendly reminder — repayment due soon\n\n"
-        "{{ amount }} is due on {{ due_date }} for invoice {{ ref }}.\n"
-        "Please ensure funds are available; replies welcome here.\n\n"
-        "Questions? Call us on +974 3017 3888."
+        "⏰ Upcoming Payment Reminder\n\n"
+        "The following invoice(s) are due within 7 days — please ensure your "
+        "Paymasters are aware:\n"
+        "{{ invoices }}\n"
+        "🔔 Total due: QAR {{ total }}\n\n"
+        "Need help following up? Reply here or call +974 3017 3888."
     ),
     "onboarding.repayment.overdue": (
-        "🚨 Repayment overdue\n\n"
-        "{{ amount }} for invoice {{ ref }} is now {{ days_overdue }} days "
-        "past due. Please arrange payment as soon as possible to keep your "
-        "credit line in good standing.\n\n"
-        "Call us on +974 3017 3888 or reply here — we're here to help."
+        "⚠️ Payment Overdue\n\n"
+        "The following invoice(s) are overdue — please settle at the earliest "
+        "to keep your credit line in good standing:\n"
+        "{{ invoices }}\n"
+        "🔔 Total overdue: QAR {{ total }}\n\n"
+        "For any query call +974 3017 3888."
     ),
 }
 

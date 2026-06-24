@@ -8057,32 +8057,36 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "due_date":        str(due_date) if due_date else "—",
             }
             await self._send(ctx, state, template_key, variables)
-        elif event == "repayment.due_soon":
-            due_date = _get("dueDate", "due_date")
-            amount_due = _get(
-                "amount", "amount_qar", "amountQar", "amountDue", "amount_due",
-            )
+        elif event in ("repayment.due_soon", "repayment.overdue"):
+            # Consolidated, multi-invoice-aware due/overdue alert. The backend
+            # (or a demo trigger) MAY send a ``invoices`` list in the payload to
+            # alert on several invoices in one message; otherwise we synthesise a
+            # single-item list from the flat fields (back-compat). _due_alert_block
+            # renders the exact PM format (one ━-separated 2-line entry per
+            # invoice) with a total — 1 or N, no filler whitespace.
+            is_overdue = event == "repayment.overdue"
+            items = payload.get("invoices")
+            if not (isinstance(items, list) and items):
+                items = [{
+                    "invoiceRef": invoice_ref,
+                    "amount": _get(
+                        "amount", "amount_qar", "amountQar", "amountDue",
+                        "amount_due", "outstandingAmount", "outstanding_amount",
+                    ),
+                    "dueDate": _get("dueDate", "due_date"),
+                    "daysLeft": _get("daysLeft", "days_left"),
+                    "daysOverdue": _get("daysOverdue", "days_overdue"),
+                    "paymaster": _get(
+                        "paymasterName", "paymaster_name", "paymaster",
+                        "customerName", "customer_name", "buyer",
+                    ),
+                }]
+            block, total = _due_alert_block(items, overdue=is_overdue)
             await self._send(
-                ctx, state, "onboarding.repayment.due_soon",
-                {
-                    "amount":   _fmt_money(amount_due, currency),
-                    "ref":      invoice_ref or "—",
-                    "due_date": str(due_date) if due_date else "soon",
-                },
-            )
-        elif event == "repayment.overdue":
-            days_overdue = _get("daysOverdue", "days_overdue")
-            amount_due = _get(
-                "amount", "amount_qar", "amountQar",
-                "outstandingAmount", "outstanding_amount",
-            )
-            await self._send(
-                ctx, state, "onboarding.repayment.overdue",
-                {
-                    "amount":       _fmt_money(amount_due, currency),
-                    "ref":          invoice_ref or "—",
-                    "days_overdue": str(days_overdue) if days_overdue else "—",
-                },
+                ctx, state,
+                "onboarding.repayment.overdue" if is_overdue
+                else "onboarding.repayment.due_soon",
+                {"invoices": block, "total": f"{total:,}" if total else "—"},
             )
         else:
             # Defensive — unknown phase1b event, stay parked silently.
@@ -8848,6 +8852,88 @@ def _tpl_txt(v: Any) -> str:
     return s or "—"
 
 
+def _tpl_block(v: Any) -> str:
+    """A Meta body parameter that PRESERVES line breaks — for multi-row blocks
+    (the offers list, the multi-invoice due/overdue alert) where each row must
+    land on its own line. Still strips tabs + 4+ spaces (Meta rejects those)
+    and never returns empty. NOTE: whether Meta renders the embedded ``\\n`` is
+    delivery-path dependent — each row is glyph-prefixed (📄 / 🏦) so it stays
+    readable even if a renderer collapses the breaks."""
+    s = str(v if v is not None else "").replace("\t", " ")
+    s = "\n".join(ln.rstrip() for ln in s.split("\n")).strip("\n")
+    while "    " in s:
+        s = s.replace("    ", " ")
+    return s or "—"
+
+
+def _pretty_due_date(s: Any) -> str:
+    """'2026-06-20' -> '20 Jun'; pass anything non-ISO through unchanged."""
+    s = str(s or "").strip()
+    if not s:
+        return ""
+    try:
+        from datetime import date
+        d = date.fromisoformat(s[:10])
+        return f"{d.day} {d.strftime('%b')}"
+    except Exception:  # noqa: BLE001
+        return s
+
+
+def _due_days(s: Any, *, overdue: bool) -> Any:
+    """Days until (or, if overdue, since) an ISO due date; None if unparseable."""
+    s = str(s or "").strip()
+    if not s:
+        return None
+    try:
+        from datetime import date
+        delta = (date.fromisoformat(s[:10]) - date.today()).days
+        return -delta if overdue else delta
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _due_alert_block(items: list[dict[str, Any]], *, overdue: bool = False) -> tuple[str, int]:
+    """Render the multi-invoice due/overdue body block EXACTLY per the PM spec:
+    a ━ divider, then two lines per invoice
+    (``📄 {ref} · {paymaster}`` / ``💰 QAR {amt} · Due {date} ({N} days)``),
+    closing with a divider. Returns ``(block, total_int)``. Empty rows are
+    never emitted, so 1 or 10 invoices both render clean — no filler whitespace."""
+    DIV = "━━━━━━━━━━━━━"
+    rows: list[str] = []
+    total = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        ref = (it.get("invoiceRef") or it.get("invoiceNumber") or it.get("ref")
+               or it.get("reference") or it.get("invoice_number") or "—")
+        pay = (it.get("paymaster") or it.get("paymasterName") or it.get("paymaster_name")
+               or it.get("customerName") or it.get("customer_name") or it.get("buyer") or "")
+        amt_raw = it.get("amount")
+        for k in ("amountDue", "amount_due", "amountQar", "totalAmount", "total_amount"):
+            if amt_raw is None:
+                amt_raw = it.get(k)
+        try:
+            amt_i = int(float(amt_raw))
+            total += amt_i
+            amt_str = f"QAR {amt_i:,}"
+        except (TypeError, ValueError):
+            amt_str = "QAR —"
+        raw_due = it.get("dueDate") or it.get("due_date") or it.get("due")
+        due_disp = _pretty_due_date(raw_due)
+        days = (it.get("daysLeft") or it.get("days_left")
+                or it.get("daysOverdue") or it.get("days_overdue"))
+        if days in (None, "", 0, "0"):
+            days = _due_days(raw_due, overdue=overdue)
+        line1 = f"📄 {ref}" + (f" · {pay}" if pay else "")
+        tail = ""
+        if days not in (None, ""):
+            tail = f" ({days} days overdue)" if overdue else f" ({days} days)"
+        line2 = f"💰 {amt_str}" + (f" · Due {due_disp}" if due_disp else "") + tail
+        rows.append(f"{DIV}\n{line1}\n{line2}")
+    block = ("\n".join(rows) + f"\n{DIV}") if rows else "—"
+    return block, total
+
+
 def _strip_qar(v: Any) -> str:
     """Drop a leading 'QAR ' so a template that already prints 'QAR {{n}}' does
     not render 'QAR QAR 500,000'."""
@@ -8855,39 +8941,37 @@ def _strip_qar(v: Any) -> str:
     return s[4:].strip() if s.upper().startswith("QAR ") else s
 
 
-def _offers_block(state: OnboardingState) -> str:
-    """One line per offer for the offers_available Meta template's single
-    {{1}} variable.
+def _offer_line(o: dict[str, Any]) -> str:
+    """One bank's offer as a SINGLE line (no newlines — safe for a Meta body
+    variable, which rejects embedded ``\\n``)."""
+    lender = _lender_name(o) or "Bank"
+    try:
+        limit = f"QAR {int(o.get('creditLimit') or o.get('credit_limit') or o.get('limit') or 0):,}"
+    except (TypeError, ValueError):
+        limit = "QAR —"
+    try:
+        rate = f"{float(o.get('interestRate') or o.get('interest_rate') or o.get('rate') or 0):g}%/mo"
+    except (TypeError, ValueError):
+        rate = "—"
+    try:
+        tenure = f"{int(o.get('tenureDays') or o.get('tenure_days') or o.get('tenure') or 0)} days"
+    except (TypeError, ValueError):
+        tenure = "—"
+    return f"🏦 {lender} — Limit: {limit} · Interest: {rate} · Tenure: {tenure}"
 
-    UAT 2026-06-19 QA #6a fix: Meta WhatsApp body parameters strip plain
-    ``\\n`` in some renders, so two offers showed up as 'QIB — ...
-    Commercial Bank — ...' on a single line. Prepend each row with a
-    leading newline + bullet glyph so the visual break survives whatever
-    Meta does to the text — the glyph itself forces the eye to a new
-    row even if newlines collapse, and the leading newline kicks the
-    first row off the variable's same-line position when present.
-    """
-    rows: list[str] = []
-    for o in (getattr(state, "offers", None) or []):
-        if not isinstance(o, dict):
-            continue
-        lender = _lender_name(o) or "Bank"
-        try:
-            limit = f"QAR {int(o.get('creditLimit') or o.get('credit_limit') or o.get('limit') or 0):,}"
-        except (TypeError, ValueError):
-            limit = "QAR —"
-        try:
-            rate = f"{float(o.get('interestRate') or o.get('interest_rate') or o.get('rate') or 0):g}%/mo"
-        except (TypeError, ValueError):
-            rate = "—"
-        try:
-            tenure = f"{int(o.get('tenureDays') or o.get('tenure_days') or o.get('tenure') or 0)} days"
-        except (TypeError, ValueError):
-            tenure = "—"
-        rows.append(f"🏦 {lender} — Limit: {limit} · Interest: {rate} · Tenure: {tenure}")
-    # Double-newline separator: most Meta renderers preserve ``\n\n``
-    # (paragraph break) even when collapsing single ``\n`` to a space.
-    return "\n\n".join(rows) if rows else "Please log in to view your offer details."
+
+def _offer_lines(state: OnboardingState) -> list[str]:
+    """One single-line string per active offer (order = arrival)."""
+    return [_offer_line(o) for o in (getattr(state, "offers", None) or [])
+            if isinstance(o, dict)]
+
+
+def _offers_block(state: OnboardingState) -> str:
+    """Legacy single-block join — retained for any free-text use. The Meta
+    template now uses two STATIC-line variables ({{1}}, {{2}}); see
+    _status_components."""
+    lines = _offer_lines(state)
+    return "\n".join(lines) if lines else "Please log in to view your offer details."
 
 
 def _status_components(
@@ -8926,14 +9010,28 @@ def _status_components(
             v.get("ref"),
             _strip_qar(v.get("available_limit")) if v.get("available_limit") else "—",
         )
-    if key == "onboarding.repayment.due_soon":
-        return body(v.get("ref"), _strip_qar(v.get("amount")), v.get("due_date"))
-    if key == "onboarding.repayment.overdue":
-        return body(v.get("ref"), _strip_qar(v.get("amount")), v.get("due_date") or "—")
+    if key in ("onboarding.repayment.due_soon", "onboarding.repayment.overdue"):
+        # New consolidated 2-var template: {{1}} = the multi-invoice rows block
+        # (line breaks preserved), {{2}} = total. Handles 1..N invoices with no
+        # empty-variable filler. The block stays single-glyph-prefixed so it's
+        # readable even if a Meta renderer collapses the line breaks.
+        return [{"type": "body", "parameters": [
+            {"type": "text", "text": _tpl_block(v.get("invoices") or "—")},
+            {"type": "text", "text": _tpl_txt(v.get("total") or "—")},
+        ]}]
     if key == "onboarding.offers.preview":
-        # Both map to the same approved ``onboarding_offers_available``
-        # Meta template with a single {{1}} variable for the offer block.
-        return body(_offers_block(state))
+        # 2-variable template: each bank on its OWN static line ({{1}}, {{2}}).
+        # The line break lives in the template body (Meta rejects \n inside a
+        # variable), so each var is one line. Only two lenders exist on the
+        # platform → two slots; {{2}} is "—" when a single offer is in (the
+        # incremental first-offer send before the second lender quotes).
+        lines = _offer_lines(state)
+        first = lines[0] if lines else "Please log in to view your offer details."
+        second = lines[1] if len(lines) > 1 else "—"
+        return [{"type": "body", "parameters": [
+            {"type": "text", "text": _tpl_txt(first)},
+            {"type": "text", "text": _tpl_txt(second)},
+        ]}]
     if key == "onboarding.payment.request":
         pid = getattr(state, "payment_id", None)
         if not pid:

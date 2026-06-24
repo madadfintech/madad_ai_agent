@@ -74,33 +74,96 @@ app.add_middleware(
 
 
 def _monitor_url(path: str) -> str:
-    base = TunnelState.get().base_url
-    if base is None:
+    """Build the URL for a monitor admin API call. Triggers a lazy
+    tunnel reconnect first — so if the SSH session was idled out or
+    the network blipped, the next proxied call (and therefore the next
+    Refresh-button click) transparently re-establishes the tunnel
+    instead of failing the whole UI with a 503."""
+    state = TunnelState.get()
+    if not state.ensure_open():
         raise HTTPException(
-            503, detail="SSH tunnel not open — check /api/connection"
+            503,
+            detail=(
+                "SSH tunnel could not be (re-)established: "
+                f"{state.error or 'unknown error'}"
+            ),
         )
+    base = state.base_url
+    if base is None:  # safety net — shouldn't fire after ensure_open ok.
+        raise HTTPException(503, detail="SSH tunnel not open")
     return f"{base}{path}"
 
 
+# Connection errors thrown by httpx when the SSH tunnel itself is
+# alive in our object model but the underlying socket is dead (idle
+# timeout, server restart, etc.). When we see one of these we tear
+# the tunnel down, force a reopen, and retry the call exactly once.
+_TUNNEL_DEAD_EXCS: tuple[type[BaseException], ...] = (
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+    ConnectionResetError,
+    ConnectionRefusedError,
+)
+
+
 async def _monitor_get(path: str) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(
-            _monitor_url(path),
-            headers={"Authorization": f"Bearer {ADMIN_API_TOKEN}"},
-        )
-        r.raise_for_status()
-        return r.json()
+    for attempt in (1, 2):
+        try:
+            url = _monitor_url(path)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {ADMIN_API_TOKEN}"},
+                )
+                r.raise_for_status()
+                return r.json()
+        except _TUNNEL_DEAD_EXCS as exc:
+            if attempt == 2:
+                raise HTTPException(
+                    502,
+                    detail=(
+                        f"Tunnel reachable but monitor unreachable after "
+                        f"reopen: {type(exc).__name__}: {exc}"
+                    ),
+                )
+            log.warning(
+                "monitor GET %s hit %s — forcing tunnel reopen + retry",
+                path, type(exc).__name__,
+            )
+            TunnelState.get().close()
+            TunnelState.get().open()
+    raise HTTPException(500, detail="unreachable")  # pragma: no cover
 
 
 async def _monitor_post(path: str, body: dict | None = None) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post(
-            _monitor_url(path),
-            headers={"Authorization": f"Bearer {ADMIN_API_TOKEN}"},
-            json=body or {},
-        )
-        r.raise_for_status()
-        return r.json() if r.content else {}
+    for attempt in (1, 2):
+        try:
+            url = _monitor_url(path)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {ADMIN_API_TOKEN}"},
+                    json=body or {},
+                )
+                r.raise_for_status()
+                return r.json() if r.content else {}
+        except _TUNNEL_DEAD_EXCS as exc:
+            if attempt == 2:
+                raise HTTPException(
+                    502,
+                    detail=(
+                        f"Tunnel reachable but monitor unreachable after "
+                        f"reopen: {type(exc).__name__}: {exc}"
+                    ),
+                )
+            log.warning(
+                "monitor POST %s hit %s — forcing tunnel reopen + retry",
+                path, type(exc).__name__,
+            )
+            TunnelState.get().close()
+            TunnelState.get().open()
+    raise HTTPException(500, detail="unreachable")  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------

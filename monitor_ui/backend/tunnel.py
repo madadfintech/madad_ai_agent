@@ -46,6 +46,16 @@ class TunnelState:
     def open(self) -> None:
         if self.forwarder is not None and self.forwarder.is_active:
             return
+        # If we held a stale forwarder (process restart, network drop,
+        # idle SSH timeout), tear it down before starting a fresh one —
+        # sshtunnel can otherwise leak the underlying socket.
+        if self.forwarder is not None:
+            try:
+                self.forwarder.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.forwarder = None
+            self.local_port = None
         try:
             self.forwarder = SSHTunnelForwarder(
                 (SSH_HOST, SSH_PORT),
@@ -69,6 +79,18 @@ class TunnelState:
             self.forwarder = None
             self.local_port = None
             log.warning("SSH tunnel failed: %s", self.error)
+
+    def ensure_open(self) -> bool:
+        """Lazy reconnect — make sure the tunnel is live before a caller
+        does HTTP through it. Used by the monitor proxy so the Refresh
+        button (or any tab poll) can transparently rescue a dropped
+        tunnel without the operator having to click the Settings reopen.
+        Returns True on success, False if the tunnel couldn't be
+        (re-)established (e.g. SSH host unreachable)."""
+        if self.forwarder is not None and self.forwarder.is_active:
+            return True
+        self.open()
+        return self.forwarder is not None and self.forwarder.is_active
 
     def close(self) -> None:
         if self.forwarder is not None:

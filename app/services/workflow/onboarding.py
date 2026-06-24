@@ -8058,35 +8058,53 @@ class OnboardingWorkflow(WorkflowDefinition):
             }
             await self._send(ctx, state, template_key, variables)
         elif event in ("repayment.due_soon", "repayment.overdue"):
-            # Consolidated, multi-invoice-aware due/overdue alert. The backend
-            # (or a demo trigger) MAY send a ``invoices`` list in the payload to
-            # alert on several invoices in one message; otherwise we synthesise a
-            # single-item list from the flat fields (back-compat). _due_alert_block
-            # renders the exact PM format (one ━-separated 2-line entry per
-            # invoice) with a total — 1 or N, no filler whitespace.
+            # SINGLE-invoice card. A consolidated multi-invoice message can't be
+            # a Meta template (Meta rejects newlines in body vars), so per PM we
+            # send one invoice per message. If a payload ``invoices`` list is
+            # sent, alert on the FIRST one only. The 5 fields (ref, paymaster,
+            # amount, due date, day-phrase) map to the 5-var card template; the
+            # ━ dividers / line breaks are static in the template body.
             is_overdue = event == "repayment.overdue"
             items = payload.get("invoices")
-            if not (isinstance(items, list) and items):
-                items = [{
-                    "invoiceRef": invoice_ref,
-                    "amount": _get(
-                        "amount", "amount_qar", "amountQar", "amountDue",
-                        "amount_due", "outstandingAmount", "outstanding_amount",
-                    ),
-                    "dueDate": _get("dueDate", "due_date"),
-                    "daysLeft": _get("daysLeft", "days_left"),
-                    "daysOverdue": _get("daysOverdue", "days_overdue"),
-                    "paymaster": _get(
-                        "paymasterName", "paymaster_name", "paymaster",
-                        "customerName", "customer_name", "buyer",
-                    ),
-                }]
-            block, total = _due_alert_block(items, overdue=is_overdue)
+            inv = items[0] if (isinstance(items, list) and items
+                               and isinstance(items[0], dict)) else {}
+            ref = (inv.get("invoiceRef") or inv.get("invoiceNumber") or inv.get("ref")
+                   or invoice_ref or "—")
+            pay = (inv.get("paymaster") or inv.get("paymasterName")
+                   or inv.get("customerName")
+                   or _get("paymasterName", "paymaster_name", "paymaster",
+                           "customerName", "customer_name", "buyer") or "—")
+            amt_raw = inv.get("amount")
+            for k in ("amountDue", "amount_due", "totalAmount"):
+                if amt_raw is None:
+                    amt_raw = inv.get(k)
+            if amt_raw is None:
+                amt_raw = _get("amount", "amount_qar", "amountQar", "amountDue",
+                               "amount_due", "outstandingAmount", "outstanding_amount")
+            try:
+                amt_str = f"{int(float(amt_raw)):,}"
+            except (TypeError, ValueError):
+                amt_str = "—"
+            raw_due = (inv.get("dueDate") or inv.get("due_date")
+                       or _get("dueDate", "due_date"))
+            due_disp = _pretty_due_date(raw_due) or "—"
+            days = (inv.get("daysOverdue") or inv.get("days_overdue")
+                    or inv.get("daysLeft") or inv.get("days_left")
+                    or _get("daysOverdue", "days_overdue", "daysLeft", "days_left"))
+            if days in (None, "", 0, "0"):
+                days = _due_days(raw_due, overdue=is_overdue)
             await self._send(
                 ctx, state,
                 "onboarding.repayment.overdue" if is_overdue
                 else "onboarding.repayment.due_soon",
-                {"invoices": block, "total": f"{total:,}" if total else "—"},
+                {
+                    "ref": ref, "paymaster": pay, "amount": amt_str,
+                    "due_date": due_disp,
+                    "days": _due_days_phrase(days, overdue=is_overdue),
+                    # Single invoice → total == this invoice's amount (the card
+                    # keeps the PDF's "🔔 Total due" line verbatim).
+                    "total": amt_str,
+                },
             )
         else:
             # Defensive — unknown phase1b event, stay parked silently.
@@ -8892,6 +8910,20 @@ def _due_days(s: Any, *, overdue: bool) -> Any:
         return None
 
 
+def _due_days_phrase(days: Any, *, overdue: bool) -> str:
+    """The parenthetical day phrase for the due card: '6 days' / 'today' /
+    '7 days overdue'. Never empty (Meta var)."""
+    try:
+        d = int(days)
+    except (TypeError, ValueError):
+        return "overdue" if overdue else "due soon"
+    if overdue:
+        return "1 day overdue" if d == 1 else f"{d} days overdue"
+    if d <= 0:
+        return "today"
+    return "1 day" if d == 1 else f"{d} days"
+
+
 def _due_alert_block(items: list[dict[str, Any]], *, overdue: bool = False) -> tuple[str, int]:
     """Render the multi-invoice due/overdue body block EXACTLY per the PM spec:
     a ━ divider, then two lines per invoice
@@ -9011,14 +9043,15 @@ def _status_components(
             _strip_qar(v.get("available_limit")) if v.get("available_limit") else "—",
         )
     if key in ("onboarding.repayment.due_soon", "onboarding.repayment.overdue"):
-        # New consolidated 2-var template: {{1}} = the multi-invoice rows block
-        # (line breaks preserved), {{2}} = total. Handles 1..N invoices with no
-        # empty-variable filler. The block stays single-glyph-prefixed so it's
-        # readable even if a Meta renderer collapses the line breaks.
-        return [{"type": "body", "parameters": [
-            {"type": "text", "text": _tpl_block(v.get("invoices") or "—")},
-            {"type": "text", "text": _tpl_txt(v.get("total") or "—")},
-        ]}]
+        # 6-var single-invoice card (exact PDF wording): {{1}} ref, {{2}}
+        # paymaster, {{3}} amount, {{4}} due date, {{5}} day-phrase, {{6}} total
+        # (== amount for a single invoice). The ━ dividers + line breaks are
+        # STATIC in the template body (Meta rejects \n inside a variable), so
+        # the card renders correctly in AND out of the 24h window.
+        return body(
+            v.get("ref"), v.get("paymaster"), v.get("amount"),
+            v.get("due_date"), v.get("days"), v.get("total"),
+        )
     if key == "onboarding.offers.preview":
         # 2-variable template: each bank on its OWN static line ({{1}}, {{2}}).
         # The line break lives in the template body (Meta rejects \n inside a
@@ -9027,7 +9060,10 @@ def _status_components(
         # incremental first-offer send before the second lender quotes).
         lines = _offer_lines(state)
         first = lines[0] if lines else "Please log in to view your offer details."
-        second = lines[1] if len(lines) > 1 else "—"
+        # {{2}} can't be empty (Meta), and a dash looks broken — when only one
+        # offer is in, fill the slot with a neutral, NON-misleading line (we do
+        # NOT promise more offers, since the other bank may decline).
+        second = lines[1] if len(lines) > 1 else "You've received 1 offer so far."
         return [{"type": "body", "parameters": [
             {"type": "text", "text": _tpl_txt(first)},
             {"type": "text", "text": _tpl_txt(second)},

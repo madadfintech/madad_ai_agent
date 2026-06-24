@@ -560,24 +560,32 @@ _TEMPLATE_BODIES = {
         "Updated Limit: {{ available_limit }} available.\n\n"
         "Send another invoice anytime — single file or a ZIP both work. 💼"
     ),
-    # Consolidated multi-invoice reminder (1..N invoices). ``{{ invoices }}`` is
-    # the pre-rendered ━-separated block built by _due_alert_block (📄 ref ·
-    # paymaster / 💰 amount · Due date (N days)); ``{{ total }}`` the sum.
+    # Single-invoice due/overdue card (in-window free-text mirror of the 5-var
+    # Meta template). ━ dividers are static; fields = ref/paymaster/amount/
+    # due_date/days. One invoice per message (consolidated multi can't be a
+    # Meta template — Meta rejects \n in body vars).
+    # Exact PDF wording (single invoice → {{ total }} == {{ amount }}).
     "onboarding.repayment.due_soon": (
         "⏰ Upcoming Payment Reminder\n\n"
-        "The following invoice(s) are due within 7 days — please ensure your "
+        "The following invoices are due within 7 days. Please ensure your "
         "Paymasters are aware:\n"
-        "{{ invoices }}\n"
-        "🔔 Total due: QAR {{ total }}\n\n"
+        "━━━━━━━━━━━━━\n"
+        "📄 {{ ref }} · {{ paymaster }}\n"
+        "💰 QAR {{ amount }} · Due {{ due_date }} ({{ days }})\n"
+        "━━━━━━━━━━━━━\n"
+        "🔔 Total due: QAR {{ total }}\n"
         "Need help following up? Reply here or call +974 3017 3888."
     ),
     "onboarding.repayment.overdue": (
         "⚠️ Payment Overdue\n\n"
-        "The following invoice(s) are overdue — please settle at the earliest "
-        "to keep your credit line in good standing:\n"
-        "{{ invoices }}\n"
-        "🔔 Total overdue: QAR {{ total }}\n\n"
-        "For any query call +974 3017 3888."
+        "The following invoices are overdue. Please ensure your "
+        "Paymasters are aware:\n"
+        "━━━━━━━━━━━━━\n"
+        "📄 {{ ref }} · {{ paymaster }}\n"
+        "💰 QAR {{ amount }} · Due {{ due_date }} ({{ days }})\n"
+        "━━━━━━━━━━━━━\n"
+        "🔔 Total overdue: QAR {{ total }}\n"
+        "Need help following up? Reply here or call +974 3017 3888."
     ),
 }
 

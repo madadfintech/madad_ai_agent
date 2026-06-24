@@ -80,8 +80,18 @@ export default function Investigations() {
   const [templateKey, setTemplateKey] = useState(
     params.get("template_key") ?? ""
   );
+  // Default to 24h when typed-in directly so the operator gets a hit on
+  // the first try. Click-throughs from issue detail pass anchor_at so
+  // the window is centered on the source event regardless of how old it is.
   const [minutes, setMinutes] = useState<number>(
-    parseInt(params.get("minutes") ?? "60", 10)
+    parseInt(params.get("minutes") ?? "1440", 10)
+  );
+  // anchor_at survives the round-trip from the issue detail modal —
+  // the URL carries it, the API uses it to center the window. Cleared
+  // automatically when the operator types a fresh correlation key (no
+  // anchor → use the trailing window).
+  const [anchorAt, setAnchorAt] = useState<string | undefined>(
+    params.get("anchor_at") ?? undefined
   );
   const [groupByRule, setGroupByRule] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -93,14 +103,23 @@ export default function Investigations() {
     if (runId) next.run_id = runId;
     if (requestId) next.request_id = requestId;
     if (templateKey) next.template_key = templateKey;
-    if (minutes !== 60) next.minutes = String(minutes);
+    if (minutes !== 1440) next.minutes = String(minutes);
+    if (anchorAt) next.anchor_at = anchorAt;
     setParams(next, { replace: true });
-  }, [identity, runId, requestId, templateKey, minutes, setParams]);
+  }, [identity, runId, requestId, templateKey, minutes, anchorAt, setParams]);
 
   const hasCorrelation = !!(identity || runId || requestId || templateKey);
 
   const { data, isFetching, refetch } = useQuery({
-    queryKey: ["correlate", identity, runId, requestId, templateKey, minutes],
+    queryKey: [
+      "correlate",
+      identity,
+      runId,
+      requestId,
+      templateKey,
+      minutes,
+      anchorAt,
+    ],
     queryFn: () =>
       api.correlate({
         identity: identity || undefined,
@@ -108,6 +127,7 @@ export default function Investigations() {
         request_id: requestId || undefined,
         template_key: templateKey || undefined,
         minutes,
+        anchor_at: anchorAt,
       }),
     enabled: hasCorrelation,
     refetchInterval: hasCorrelation ? 10000 : false,
@@ -146,25 +166,37 @@ export default function Investigations() {
       <div className="grid grid-cols-1 gap-2 rounded-lg border border-border bg-panel p-3 md:grid-cols-2 lg:grid-cols-5">
         <input
           value={identity}
-          onChange={(e) => setIdentity(e.target.value)}
+          onChange={(e) => {
+            setIdentity(e.target.value);
+            setAnchorAt(undefined);
+          }}
           placeholder="Identity (e.g. +919497191690)"
           className="rounded border border-border bg-panel2 px-2 py-1.5 text-xs"
         />
         <input
           value={runId}
-          onChange={(e) => setRunId(e.target.value)}
+          onChange={(e) => {
+            setRunId(e.target.value);
+            setAnchorAt(undefined);
+          }}
           placeholder="Run ID (run_...)"
           className="rounded border border-border bg-panel2 px-2 py-1.5 text-xs font-mono"
         />
         <input
           value={requestId}
-          onChange={(e) => setRequestId(e.target.value)}
+          onChange={(e) => {
+            setRequestId(e.target.value);
+            setAnchorAt(undefined);
+          }}
           placeholder="Request ID (req_...)"
           className="rounded border border-border bg-panel2 px-2 py-1.5 text-xs font-mono"
         />
         <input
           value={templateKey}
-          onChange={(e) => setTemplateKey(e.target.value)}
+          onChange={(e) => {
+            setTemplateKey(e.target.value);
+            setAnchorAt(undefined);
+          }}
           placeholder="Template key"
           className="rounded border border-border bg-panel2 px-2 py-1.5 text-xs"
         />
@@ -174,11 +206,11 @@ export default function Investigations() {
             onChange={(e) => setMinutes(parseInt(e.target.value, 10))}
             className="flex-1 rounded border border-border bg-panel2 px-2 py-1.5 text-xs"
           >
-            <option value={15}>last 15m</option>
-            <option value={60}>last 60m</option>
-            <option value={180}>last 3h</option>
-            <option value={720}>last 12h</option>
-            <option value={1440}>last 24h</option>
+            <option value={15}>{anchorAt ? "±15m" : "last 15m"}</option>
+            <option value={60}>{anchorAt ? "±60m" : "last 60m"}</option>
+            <option value={180}>{anchorAt ? "±3h" : "last 3h"}</option>
+            <option value={720}>{anchorAt ? "±12h" : "last 12h"}</option>
+            <option value={1440}>{anchorAt ? "±24h" : "last 24h"}</option>
           </select>
           <button
             onClick={() => refetch()}
@@ -190,6 +222,22 @@ export default function Investigations() {
           </button>
         </div>
       </div>
+
+      {anchorAt && (
+        <div className="flex items-center justify-between rounded border border-accent/40 bg-accent/10 px-3 py-2 text-xs">
+          <span>
+            Window centered on event at{" "}
+            <span className="font-mono text-accent">{anchorAt}</span>{" "}
+            (±{minutes}m)
+          </span>
+          <button
+            onClick={() => setAnchorAt(undefined)}
+            className="rounded border border-border bg-panel2 px-2 py-0.5 text-[10px] uppercase tracking-wide text-mute hover:text-white"
+          >
+            Switch to trailing window
+          </button>
+        </div>
+      )}
 
       {!hasCorrelation && (
         <div className="rounded-lg border border-dashed border-border bg-panel p-8 text-center text-sm text-mute">

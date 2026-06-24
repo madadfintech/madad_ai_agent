@@ -765,9 +765,20 @@ async def correlate(
     template_key: str | None = None,
     minutes: int = 60,
     limit: int = 500,
+    anchor_at: str | None = None,
 ) -> dict[str, Any]:
     """Pull every event matching any of the supplied correlation keys
-    within the trailing window. Powers the Investigations page."""
+    within a time window. Powers the Investigations page.
+
+    Window selection:
+    * ``anchor_at`` set → events in [anchor - minutes, anchor + minutes].
+      Used when the operator clicks "Investigate" from an event detail —
+      the window is CENTERED on the source event so the source event
+      itself, plus everything that happened around it, is included.
+    * ``anchor_at`` absent → trailing window [now - minutes, now].
+      Used when the operator types a correlation key directly into
+      the Investigations page header.
+    """
     needles = [s for s in (identity, run_id, request_id, template_key) if s]
     if not needles:
         raise HTTPException(
@@ -776,13 +787,25 @@ async def correlate(
         )
 
     from datetime import timedelta as _td
-    lo = (datetime.now(UTC) - _td(minutes=minutes)).isoformat()
+    if anchor_at:
+        try:
+            anchor = datetime.fromisoformat(anchor_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(400, detail=f"bad anchor_at: {anchor_at}")
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=UTC)
+        lo = (anchor - _td(minutes=minutes)).isoformat()
+        hi = (anchor + _td(minutes=minutes)).isoformat()
+    else:
+        lo = (datetime.now(UTC) - _td(minutes=minutes)).isoformat()
+        hi = None
+
     with get_session() as s:
+        q = select(Event).where(Event.at >= lo)
+        if hi is not None:
+            q = q.where(Event.at <= hi)
         candidates = s.exec(
-            select(Event)
-            .where(Event.at >= lo)
-            .order_by(Event.at)  # type: ignore[arg-type]
-            .limit(limit * 5)
+            q.order_by(Event.at).limit(limit * 5)  # type: ignore[arg-type]
         ).all()
         out: list[dict[str, Any]] = []
         for cand in candidates:
@@ -802,6 +825,7 @@ async def correlate(
         "events": out,
         "count": len(out),
         "window_minutes": minutes,
+        "anchor_at": anchor_at,
         "correlation": {
             "identity": identity,
             "run_id": run_id,

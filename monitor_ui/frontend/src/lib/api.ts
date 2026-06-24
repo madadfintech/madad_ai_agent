@@ -173,6 +173,7 @@ export const api = {
     template_key?: string;
     minutes?: number;
     limit?: number;
+    anchor_at?: string;
   }) => {
     const p = new URLSearchParams();
     if (opts.identity) p.set("identity", opts.identity);
@@ -181,6 +182,7 @@ export const api = {
     if (opts.template_key) p.set("template_key", opts.template_key);
     if (opts.minutes) p.set("minutes", String(opts.minutes));
     if (opts.limit) p.set("limit", String(opts.limit));
+    if (opts.anchor_at) p.set("anchor_at", opts.anchor_at);
     return request<CorrelationResult>(`/api/correlate?${p.toString()}`);
   },
 

@@ -63,13 +63,25 @@ function CorrelationLink({
   label,
   param,
   value,
+  anchorAt,
 }: {
   label: string;
   param: "identity" | "run_id" | "request_id" | "template_key";
   value?: string | null;
+  anchorAt?: string;
 }) {
   if (!value) return null;
-  const search = new URLSearchParams({ [param]: value, minutes: "60" });
+  // The window is CENTERED on the source event so it captures the event
+  // itself + ±N minutes of related activity. Without anchor, the
+  // Investigations page would default to "last N minutes from now" and
+  // miss anything older than the window — the bug the operator hit on
+  // first try.
+  const params: Record<string, string> = {
+    [param]: value,
+    minutes: "60",
+  };
+  if (anchorAt) params.anchor_at = anchorAt;
+  const search = new URLSearchParams(params);
   return (
     <div className="flex items-start gap-3 py-1 text-[12px]">
       <div className="w-24 shrink-0 text-mute">{label}</div>
@@ -245,21 +257,25 @@ function DetailBody({
             label="Request ID"
             param="request_id"
             value={data.where.request_id}
+            anchorAt={data.at}
           />
           <CorrelationLink
             label="Run ID"
             param="run_id"
             value={data.where.run_id}
+            anchorAt={data.at}
           />
           <CorrelationLink
             label="Identity"
             param="identity"
             value={data.where.identity}
+            anchorAt={data.at}
           />
           <CorrelationLink
             label="Template"
             param="template_key"
             value={data.where.template_key}
+            anchorAt={data.at}
           />
           <KeyVal label="Tool" value={data.where.tool} />
           <KeyVal label="Filename" value={data.where.filename} />

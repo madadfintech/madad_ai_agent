@@ -1,11 +1,74 @@
 // Single API helper for the local backend. Vite proxies /api → 127.0.0.1:5001.
 
 export type Issue = {
+  id?: number;
   at: string;
   severity: "error" | "warning" | "info" | string;
   container: string;
   rule: string;
   line: string;
+};
+
+export type IssueDetail = {
+  id: number;
+  at: string;
+  seen_at: string;
+  rule: string;
+  severity: string;
+  container: string;
+  line: string;
+  inner_line: string;
+  parsed: {
+    kv: Record<string, string>;
+    group: Record<string, string>;
+    count: string | null;
+    window_seconds: string | null;
+    value: string | null;
+    threshold: string | null;
+    elapsed_ms: string | null;
+    error: string | null;
+    error_type: string | null;
+  };
+  where: {
+    container: string;
+    service?: string | null;
+    method?: string | null;
+    path?: string | null;
+    request_id?: string | null;
+    run_id?: string | null;
+    identity?: string | null;
+    tool?: string | null;
+    template_key?: string | null;
+    filename?: string | null;
+  };
+  rule_spec: null | {
+    name: string;
+    description?: string;
+    severity?: string;
+    kind: "regex" | "behavioral";
+    pattern?: string;
+    exclude?: string;
+    threshold?: number;
+    window_seconds?: number;
+  };
+  analysis: {
+    expected_behavior: string;
+    observed_deviation: string;
+    suggested_action: string;
+  };
+  related: Issue[];
+};
+
+export type CorrelationResult = {
+  events: Issue[];
+  count: number;
+  window_minutes: number;
+  correlation: {
+    identity: string | null;
+    run_id: string | null;
+    request_id: string | null;
+    template_key: string | null;
+  };
 };
 
 export type Stats = {
@@ -93,9 +156,32 @@ export const api = {
     if (opts.rule) p.set("rule", opts.rule);
     if (opts.container) p.set("container", opts.container);
     if (opts.source) p.set("source", opts.source);
-    return request<{ issues: Issue[]; count: number; source: string }>(
-      `/api/issues?${p.toString()}`
-    );
+    return request<{
+      issues: Issue[];
+      count: number;
+      source: string;
+      fetched_at: string;
+    }>(`/api/issues?${p.toString()}`);
+  },
+
+  issueDetail: (id: number) => request<IssueDetail>(`/api/issues/${id}`),
+
+  correlate: (opts: {
+    identity?: string;
+    run_id?: string;
+    request_id?: string;
+    template_key?: string;
+    minutes?: number;
+    limit?: number;
+  }) => {
+    const p = new URLSearchParams();
+    if (opts.identity) p.set("identity", opts.identity);
+    if (opts.run_id) p.set("run_id", opts.run_id);
+    if (opts.request_id) p.set("request_id", opts.request_id);
+    if (opts.template_key) p.set("template_key", opts.template_key);
+    if (opts.minutes) p.set("minutes", String(opts.minutes));
+    if (opts.limit) p.set("limit", String(opts.limit));
+    return request<CorrelationResult>(`/api/correlate?${p.toString()}`);
   },
 
   clearMonitor: () =>

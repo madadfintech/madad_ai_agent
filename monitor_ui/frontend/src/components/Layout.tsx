@@ -1,5 +1,12 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Activity, AlertTriangle, Users, Settings } from "lucide-react";
+import {
+  Activity,
+  AlertTriangle,
+  Users,
+  Settings,
+  Search,
+  ShieldCheck,
+} from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
@@ -47,11 +54,15 @@ export default function Layout() {
   return (
     <div className="flex h-screen">
       <aside className="flex w-60 flex-col border-r border-border bg-panel p-4">
-        <div className="mb-6 flex items-center">
-          <span className="text-base font-semibold text-white">
-            Madad Monitor
+        <div className="mb-1 flex items-center gap-2">
+          <ShieldCheck size={18} className="text-accent" />
+          <span className="text-base font-semibold tracking-wide text-white">
+            AEGIS
           </span>
           <StatusDot />
+        </div>
+        <div className="mb-6 text-[10px] uppercase tracking-[0.18em] text-mute">
+          Detect · Investigate · Heal
         </div>
         <nav className="space-y-1">
           <NavItem to="/" icon={<Activity size={18} />} label="Dashboard" />
@@ -59,6 +70,11 @@ export default function Layout() {
             to="/issues"
             icon={<AlertTriangle size={18} />}
             label="Issues"
+          />
+          <NavItem
+            to="/investigations"
+            icon={<Search size={18} />}
+            label="Investigations"
           />
           <NavItem
             to="/test-users"
@@ -71,8 +87,10 @@ export default function Layout() {
             label="Settings"
           />
         </nav>
-        <div className="mt-auto pt-4 text-xs text-mute">
-          v0.1.0 · localhost only
+        <div className="mt-auto pt-4 text-xs leading-relaxed text-mute">
+          <div className="font-medium text-slate-300">AEGIS v0.2</div>
+          <div>Self-healing observability</div>
+          <div className="opacity-60">localhost only</div>
         </div>
       </aside>
       <main className="flex-1 overflow-auto p-6">

@@ -54,7 +54,7 @@ function KeyVal({ label, value }: { label: string; value?: string | null }) {
   return (
     <div className="flex items-start gap-3 py-1 text-[12px]">
       <div className="w-24 shrink-0 text-mute">{label}</div>
-      <div className="flex-1 break-all font-mono text-slate-200">{value}</div>
+      <div className="flex-1 break-all font-mono text-ink">{value}</div>
     </div>
   );
 }
@@ -86,7 +86,7 @@ function CorrelationLink({
     <div className="flex items-start gap-3 py-1 text-[12px]">
       <div className="w-24 shrink-0 text-mute">{label}</div>
       <div className="flex flex-1 items-center gap-2">
-        <span className="break-all font-mono text-slate-200">{value}</span>
+        <span className="break-all font-mono text-ink">{value}</span>
         <Link
           to={`/investigations?${search.toString()}`}
           className="shrink-0 rounded border border-border bg-panel2 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent hover:bg-accent/10"
@@ -139,7 +139,7 @@ export default function IssueDetailDrawer({
           <div className="min-w-0 flex-1">
             <div className="mb-1 flex flex-wrap items-center gap-2">
               {data ? <SeverityChip severity={data.severity} /> : null}
-              <span className="text-sm font-semibold text-white">
+              <span className="text-sm font-semibold text-ink">
                 {data?.rule ?? "Loading…"}
               </span>
               {data ? (
@@ -156,7 +156,7 @@ export default function IssueDetailDrawer({
           </div>
           <button
             onClick={onClose}
-            className="shrink-0 rounded p-1.5 text-mute hover:bg-panel2 hover:text-white"
+            className="shrink-0 rounded p-1.5 text-mute hover:bg-panel2 hover:text-ink"
             title="Close (Esc)"
           >
             <X size={18} />
@@ -207,7 +207,7 @@ function DetailBody({
             <div className="mb-1 text-[10px] uppercase tracking-wider text-good">
               Expected
             </div>
-            <div className="text-[12.5px] leading-relaxed text-slate-200">
+            <div className="text-[12.5px] leading-relaxed text-ink">
               {data.analysis.expected_behavior || (
                 <span className="text-mute">
                   No playbook entry for this rule.
@@ -219,7 +219,7 @@ function DetailBody({
             <div className="mb-1 text-[10px] uppercase tracking-wider text-bad">
               Observed deviation
             </div>
-            <div className="text-[12.5px] leading-relaxed text-slate-200">
+            <div className="text-[12.5px] leading-relaxed text-ink">
               {data.analysis.observed_deviation || (
                 <span className="text-mute">Manual analysis required.</span>
               )}
@@ -230,7 +230,7 @@ function DetailBody({
               <Wrench size={11} />
               Suggested action
             </div>
-            <div className="text-[12.5px] leading-relaxed text-slate-200">
+            <div className="text-[12.5px] leading-relaxed text-ink">
               {data.analysis.suggested_action || (
                 <span className="text-mute">
                   No standard action — investigate manually.
@@ -350,7 +350,7 @@ function DetailBody({
       )}
 
       <Section icon={<FileText size={14} />} title="Raw log line">
-        <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-panel2 p-3 text-[11px] leading-relaxed text-slate-200">
+        <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-panel2 p-3 text-[11px] leading-relaxed text-ink">
           {data.inner_line}
         </pre>
       </Section>
@@ -371,10 +371,10 @@ function DetailBody({
                   {r.at.slice(11, 19)}
                 </div>
                 <SeverityChip severity={r.severity} />
-                <div className="w-40 shrink-0 truncate text-slate-300">
+                <div className="w-40 shrink-0 truncate text-muted">
                   {r.container}
                 </div>
-                <div className="min-w-0 flex-1 truncate text-white" title={r.rule}>
+                <div className="min-w-0 flex-1 truncate text-ink" title={r.rule}>
                   {r.rule}
                 </div>
               </button>

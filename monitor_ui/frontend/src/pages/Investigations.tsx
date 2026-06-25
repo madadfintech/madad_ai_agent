@@ -153,7 +153,7 @@ export default function Investigations() {
   return (
     <div className="space-y-4">
       <div>
-        <h1 className="flex items-center gap-2 text-xl font-semibold text-white">
+        <h1 className="flex items-center gap-2 text-xl font-semibold text-ink">
           <Compass size={20} className="text-accent" /> Investigations
         </h1>
         <p className="text-sm text-mute">
@@ -232,7 +232,7 @@ export default function Investigations() {
           </span>
           <button
             onClick={() => setAnchorAt(undefined)}
-            className="rounded border border-border bg-panel2 px-2 py-0.5 text-[10px] uppercase tracking-wide text-mute hover:text-white"
+            className="rounded border border-border bg-panel2 px-2 py-0.5 text-[10px] uppercase tracking-wide text-mute hover:text-ink"
           >
             Switch to trailing window
           </button>
@@ -254,7 +254,7 @@ export default function Investigations() {
               <div className="text-[10px] uppercase tracking-wider text-mute">
                 Events
               </div>
-              <div className="mt-1 text-2xl font-semibold text-white">
+              <div className="mt-1 text-2xl font-semibold text-ink">
                 {data?.count ?? 0}
               </div>
               <div className="text-[10px] text-mute">
@@ -265,7 +265,7 @@ export default function Investigations() {
               <div className="text-[10px] uppercase tracking-wider text-mute">
                 Distinct rules
               </div>
-              <div className="mt-1 text-2xl font-semibold text-white">
+              <div className="mt-1 text-2xl font-semibold text-ink">
                 {ruleCounts.length}
               </div>
               <div className="truncate text-[10px] text-mute">
@@ -294,7 +294,7 @@ export default function Investigations() {
                 <div className="text-[10px] uppercase tracking-wider text-mute">
                   Group by rule
                 </div>
-                <div className="mt-1 text-xs text-slate-300">
+                <div className="mt-1 text-xs text-muted">
                   Collapses bursts of the same rule
                 </div>
               </div>
@@ -340,10 +340,10 @@ export default function Investigations() {
                     <div className="col-span-1">
                       <SeverityChip severity={e.severity} />
                     </div>
-                    <div className="col-span-2 text-slate-300">
+                    <div className="col-span-2 text-muted">
                       {e.container}
                     </div>
-                    <div className="col-span-3 text-white">{e.rule}</div>
+                    <div className="col-span-3 text-ink">{e.rule}</div>
                     <div className="col-span-4 truncate text-mute" title={e.line}>
                       {e.line}
                     </div>
@@ -358,7 +358,7 @@ export default function Investigations() {
               {grouped.map(([rule, evs]) => (
                 <div key={rule} className="rounded-lg border border-border bg-panel">
                   <div className="flex items-center justify-between border-b border-border px-3 py-2 text-xs">
-                    <span className="font-semibold text-white">{rule}</span>
+                    <span className="font-semibold text-ink">{rule}</span>
                     <span className="text-mute">{evs.length} events</span>
                   </div>
                   <div className="max-h-[40vh] overflow-auto">

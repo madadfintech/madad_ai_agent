@@ -28,7 +28,7 @@ export default function SettingsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-semibold text-white">Settings</h1>
+        <h1 className="text-xl font-semibold text-ink">Settings</h1>
         <p className="text-sm text-mute">Connection, rules, and local data.</p>
       </div>
 
@@ -102,7 +102,7 @@ export default function SettingsPage() {
         </div>
         <div className="grid grid-cols-2 gap-0">
           <div className="border-r border-border p-3">
-            <div className="mb-2 text-xs font-semibold text-slate-300">
+            <div className="mb-2 text-xs font-semibold text-muted">
               Regex rules ({rules?.regex_rules.length ?? 0})
             </div>
             <ul className="space-y-1">
@@ -111,14 +111,14 @@ export default function SettingsPage() {
                   key={r.name}
                   className="rounded bg-panel2 px-2 py-1 font-mono text-[11px]"
                 >
-                  <span className="text-white">{r.name}</span>
+                  <span className="text-ink">{r.name}</span>
                   <span className="ml-2 text-mute">{r.severity}</span>
                 </li>
               ))}
             </ul>
           </div>
           <div className="p-3">
-            <div className="mb-2 text-xs font-semibold text-slate-300">
+            <div className="mb-2 text-xs font-semibold text-muted">
               Behavioral rules ({rules?.behavioral_rules.length ?? 0})
             </div>
             <ul className="space-y-1">
@@ -127,7 +127,7 @@ export default function SettingsPage() {
                   key={r.name}
                   className="rounded bg-panel2 px-2 py-1 font-mono text-[11px]"
                 >
-                  <span className="text-white">{r.name}</span>
+                  <span className="text-ink">{r.name}</span>
                   <span className="ml-2 text-mute">
                     {r.type} · {r.severity}
                   </span>

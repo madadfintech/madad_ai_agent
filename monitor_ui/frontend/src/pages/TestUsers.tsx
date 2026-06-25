@@ -72,7 +72,7 @@ export default function TestUsers() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-semibold text-white">Test Users</h1>
+        <h1 className="text-xl font-semibold text-ink">Test Users</h1>
         <p className="text-sm text-mute">
           Saved identities · ad-hoc input · pattern wipe · audit history.
         </p>
@@ -102,7 +102,7 @@ export default function TestUsers() {
                   className="accent-accent"
                 />
                 <div className="flex-1">
-                  <div className="font-mono text-white">{id.identity}</div>
+                  <div className="font-mono text-ink">{id.identity}</div>
                   {id.label && (
                     <div className="text-mute">{id.label}</div>
                   )}
@@ -222,7 +222,7 @@ export default function TestUsers() {
               <div className="border-b border-border px-4 py-2 text-xs uppercase tracking-wider text-mute">
                 Last run
               </div>
-              <pre className="max-h-[260px] overflow-auto p-4 text-[11px] font-mono text-slate-300">
+              <pre className="max-h-[260px] overflow-auto p-4 text-[11px] font-mono text-muted">
                 {result.output}
               </pre>
             </div>
@@ -250,7 +250,7 @@ export default function TestUsers() {
               {(cleanups?.cleanups || []).map((c) => (
                 <tr key={c.id} className="border-t border-border">
                   <td className="px-3 py-2 text-mute">{c.at.slice(0, 19)}</td>
-                  <td className="px-3 py-2 font-mono text-slate-200">
+                  <td className="px-3 py-2 font-mono text-ink">
                     {JSON.parse(c.identities || "[]").join(", ") || "(none)"}
                   </td>
                   <td className="px-3 py-2 font-mono">{c.pattern || "—"}</td>

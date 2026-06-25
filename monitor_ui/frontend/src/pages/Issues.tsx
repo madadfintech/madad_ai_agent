@@ -79,7 +79,7 @@ export default function Issues() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-semibold text-white">Issues</h1>
+          <h1 className="text-xl font-semibold text-ink">Issues</h1>
           <p className="text-sm text-mute">
             {source === "live"
               ? "Live tail from the staging monitor — auto-refreshing every 5s. Survives only until /clear."
@@ -89,7 +89,7 @@ export default function Issues() {
         <div className="text-right text-xs text-mute">
           <div>
             Last refresh:{" "}
-            <span className="text-slate-300">{freshness(lastFetched)}</span>
+            <span className="text-muted">{freshness(lastFetched)}</span>
           </div>
           <div className="opacity-60">Source: {data?.source ?? source}</div>
         </div>
@@ -164,7 +164,7 @@ export default function Issues() {
               refetch();
               qc.invalidateQueries({ queryKey: ["stats-for-filters"] });
             }}
-            className="flex items-center gap-1 rounded border border-border bg-panel2 px-2 py-1 text-xs text-slate-200 hover:bg-panel2/80"
+            className="flex items-center gap-1 rounded border border-border bg-panel2 px-2 py-1 text-xs text-ink hover:bg-panel2/80"
             title="Force a refresh now"
           >
             <RefreshCw
@@ -197,8 +197,8 @@ export default function Issues() {
               <div className="col-span-1">
                 <SeverityChip severity={iss.severity} />
               </div>
-              <div className="col-span-2 text-slate-300">{iss.container}</div>
-              <div className="col-span-3 text-white">{iss.rule}</div>
+              <div className="col-span-2 text-muted">{iss.container}</div>
+              <div className="col-span-3 text-ink">{iss.rule}</div>
               <div className="col-span-4 truncate text-mute" title={iss.line}>
                 {iss.line}
               </div>

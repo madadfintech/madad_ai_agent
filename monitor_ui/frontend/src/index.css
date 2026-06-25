@@ -2,18 +2,73 @@
 @tailwind components;
 @tailwind utilities;
 
+/* AEGIS palette — Sentinel Dark + Sentinel Light. All colors are RGB
+ * triples (no commas) so Tailwind's <alpha-value> + the `tokenColor`
+ * helper in tailwind.config.js can blend them with any opacity.
+ *
+ * Dark (default): deep space-grade navy + neon cyan accent.
+ * Light: cool slate paper + the same cyan accent at lower saturation.
+ */
+:root,
+.dark {
+  --c-bg:       10 15 23;          /* #0A0F17 */
+  --c-panel:    13 19 31;          /* #0D131F */
+  --c-panel2:  20 28 43;           /* #141C2B */
+  --c-elevated: 25 35 54;          /* #192336 */
+  --c-border:   38 50 71;          /* #263247 */
+
+  --c-ink:      241 245 249;       /* slate-100 */
+  --c-muted:    136 146 166;       /* #8892A6 */
+
+  --c-accent:    0 240 255;        /* #00F0FF (Primary) */
+  --c-accent2:  124 92 255;        /* #7C5CFF (Secondary) */
+  --c-good:      0 230 118;        /* #00E676 (Success) */
+  --c-warn:    255 176 32;         /* #FFB020 (Warning) */
+  --c-bad:     255  77  77;        /* #FF4D4D (Danger) */
+}
+
+.light {
+  --c-bg:       247 249 252;       /* slate paper */
+  --c-panel:   255 255 255;        /* card */
+  --c-panel2:  240 244 250;        /* subtle hover */
+  --c-elevated: 255 255 255;
+  --c-border:  214 222 235;
+
+  --c-ink:       15  23  42;       /* slate-900 */
+  --c-muted:     100 116 139;      /* slate-500 */
+
+  --c-accent:     8 145 178;       /* cyan-700 — lower-glare cyan for paper */
+  --c-accent2:    99  64 255;
+  --c-good:        5 150  85;
+  --c-warn:      217 119   6;
+  --c-bad:       220  38  38;
+}
+
 html, body, #root {
   height: 100%;
 }
 
 body {
-  background: #0b0f17;
-  color: #e2e8f0;
+  background: rgb(var(--c-bg));
+  color: rgb(var(--c-ink));
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
     Roboto, "Helvetica Neue", Arial, sans-serif;
+  transition: background 200ms, color 200ms;
 }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-track { background: #0b0f17; }
-::-webkit-scrollbar-thumb { background: #212b3d; border-radius: 6px; }
-::-webkit-scrollbar-thumb:hover { background: #2c3a52; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--c-border));
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgb(var(--c-elevated)); }
+
+/* Subtle starfield backdrop the sidebar header sits on — pure CSS so we
+ * don't ship any binary assets. */
+.starfield {
+  background:
+    radial-gradient(circle at 20% 30%, rgb(var(--c-accent) / 0.18) 0px, transparent 60%),
+    radial-gradient(circle at 80% 60%, rgb(var(--c-accent2) / 0.12) 0px, transparent 55%),
+    radial-gradient(circle at 50% 100%, rgb(var(--c-accent) / 0.10) 0px, transparent 60%);
+}

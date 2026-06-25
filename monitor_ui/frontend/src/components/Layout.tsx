@@ -204,7 +204,7 @@ export default function Layout() {
           <NavItem
             to="/issues"
             icon={<AlertTriangle size={16} />}
-            label="Deviations"
+            label="Issues"
           />
           <NavItem
             to="/investigations"

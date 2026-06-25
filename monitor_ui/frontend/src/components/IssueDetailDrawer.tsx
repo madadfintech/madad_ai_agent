@@ -10,6 +10,7 @@ import {
   MapPin,
   FileText,
   ListTree,
+  Search as InvestigateIcon,
 } from "lucide-react";
 import { api, type Issue, type IssueDetail } from "../lib/api";
 
@@ -83,14 +84,15 @@ function CorrelationLink({
   if (anchorAt) params.anchor_at = anchorAt;
   const search = new URLSearchParams(params);
   return (
-    <div className="flex items-start gap-3 py-1 text-[12px]">
+    <div className="flex items-start gap-3 py-1.5 text-[12px]">
       <div className="w-24 shrink-0 text-mute">{label}</div>
-      <div className="flex flex-1 items-center gap-2">
+      <div className="flex flex-1 flex-wrap items-center gap-2">
         <span className="break-all font-mono text-ink">{value}</span>
         <Link
           to={`/investigations?${search.toString()}`}
-          className="shrink-0 rounded border border-border bg-panel2 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent hover:bg-accent/10"
+          className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-accent bg-accent/15 px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-accent shadow-glowSoft hover:bg-accent/25"
         >
+          <InvestigateIcon size={11} />
           Investigate
         </Link>
       </div>

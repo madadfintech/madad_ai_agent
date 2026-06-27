@@ -3701,9 +3701,44 @@ class OnboardingWorkflow(WorkflowDefinition):
                         "documents_list_fetch.cms_lookup_failed",
                         error=str(exc)[:200],
                     )
+            # M1 acceptance gap (2026-06-28): when the CMS list is empty
+            # (operator wiped it, or seed never ran), we used to silently
+            # fall back to ``DEFAULT_WHATSAPP_REQUIRED_DOCS`` and the SME
+            # saw the vendor-shipped list as if nothing happened. The
+            # fallback STAYS — it's a safety net so the agent never
+            # silently shows zero documents to ask for — but its use is
+            # now LOUDLY observable (AEGIS catches the warning via the
+            # ``checklist_fallback_used`` rule). M1 demo asserts this
+            # warning never fires.
+            used_fallback = False
+            if not cms_required:
+                used_fallback = True
+                # Diagnostic crumb encoded in the message string so it
+                # survives both structlog (prod) and stdlib Logger (tests
+                # that pass a plain ``logging.getLogger("test")`` — the
+                # stdlib Logger rejects arbitrary kwargs). The AEGIS rule
+                # ``checklist_fallback_used`` matches on the event name.
+                ctx.logger.warning(
+                    "documents_list_fetch.checklist_fallback_used "
+                    "checklist=onboarding.whatsapp.required_docs "
+                    f"default_count={len(DEFAULT_WHATSAPP_REQUIRED_DOCS)} "
+                    "note='CMS empty — using vendor defaults; "
+                    "verify the seed ran and the checklist key is populated'"
+                )
             missing = cms_required or list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+            # M1 fix: cache the ACTIVE required-docs list on state so every
+            # downstream progress meter uses the same source as the SME-
+            # facing checklist. The previous code referenced
+            # ``DEFAULT_WHATSAPP_REQUIRED_DOCS`` directly at 3 sites, which
+            # made "N of 10" show even when ops had added an 11th doc.
+            # ``used_fallback`` is only consulted by the warning above; AEGIS
+            # picks up the warning event directly. No need to thread it through
+            # state.
+            _ = used_fallback
             return self._step(
-                "documents_list_fetch", ctx, missing_documents=missing
+                "documents_list_fetch", ctx,
+                missing_documents=missing,
+                required_documents=list(missing),
             )
         missing: list[str] = []
         if state.access_token:
@@ -3949,8 +3984,13 @@ class OnboardingWorkflow(WorkflowDefinition):
             else "onboarding.documents.checklist"
         )
         # Progress meter: count uploaded vs the full required set so re-entries
-        # show "N of M received" instead of repeating the same "still needed" text.
-        total = len(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+        # show "N of M received" instead of repeating the same "still needed"
+        # text. Uses ``state.required_documents`` (CMS-resolved) so when ops
+        # adds a doc the meter reads "of N+1" immediately; falls back to the
+        # vendor default when state hasn't been hydrated (e.g. checkpoint
+        # replay from before this field existed).
+        required_total_set = state.required_documents or DEFAULT_WHATSAPP_REQUIRED_DOCS
+        total = len(required_total_set)
         received = max(0, total - len(state.missing_documents))
         await self._send(
             ctx,
@@ -4627,7 +4667,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             return DOCUMENT_LABELS.get(doc, doc.replace("_", " ").title())
 
         received_set = set(received or [])
-        all_required = list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+        # M1 fix (2026-06-28): use the CMS-resolved list, not the Python
+        # default, so the pending-docs query reflects current ops config.
+        all_required = list(state.required_documents or DEFAULT_WHATSAPP_REQUIRED_DOCS)
         # Split the pending list: uploaded-but-unvalidated (⏳) vs never-sent.
         under_review = [d for d in missing if d in received_set]
         still_missing = [d for d in missing if d not in received_set]
@@ -8569,7 +8611,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         last_step = state.history[-1].step if state.history else ""
         if last_step in {"documents_upload_loop_send", "documents_upload_loop_await"}:
             _missing = list(state.missing_documents or [])
-            _received = [d for d in DEFAULT_WHATSAPP_REQUIRED_DOCS if d not in _missing]
+            # M1 fix (2026-06-28): LLM context reflects the CMS-resolved list
+            # so "documents already received" stays accurate when ops adds a
+            # doc — was reading the Python default and showing the wrong count.
+            _required = state.required_documents or DEFAULT_WHATSAPP_REQUIRED_DOCS
+            _received = [d for d in _required if d not in _missing]
             _recv_str = ", ".join(
                 DOCUMENT_LABELS.get(d, d.replace("_", " ").title()) for d in _received
             ) or "none yet"

@@ -130,6 +130,18 @@ rules:
   # logs tens of warnings/min. The rules above pick the high-signal
   # warnings; everything else stays in the raw container log.
 
+  # M1 acceptance test guard (2026-06-28): the agent has a code-constant
+  # fallback for the required-docs checklist that fires when the CMS
+  # checklist is empty. Useful safety net (so the agent never asks for
+  # zero documents), but if it fires during the M1 demo it MASKS the
+  # acceptance test ("add doc via backend config → agent lists it"). The
+  # M1 dry-run asserts this event fires zero times. In normal operation
+  # the rule fires only on a misconfigured CMS — high signal, low noise.
+  - name: checklist_fallback_used
+    pattern: 'documents_list_fetch\.checklist_fallback_used'
+    severity: warning
+    description: Agent fell back to DEFAULT_WHATSAPP_REQUIRED_DOCS — CMS checklist is empty/missing. Verify CMS seed + the canonical key (onboarding.whatsapp.required_docs).
+
 
 # Behavioral rules — match deviations from EXPECTED behavior. The line-by-
 # line regex rules above catch crashes; these catch the QA-bug class

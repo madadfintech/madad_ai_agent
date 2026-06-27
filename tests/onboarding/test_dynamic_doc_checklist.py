@@ -81,3 +81,51 @@ async def test_documents_list_fetch_falls_back_when_no_provider() -> None:
     step = await platform.workflow._documents_list_fetch(state, _ctx())  # noqa: SLF001
 
     assert step["missing_documents"] == list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+
+
+async def test_documents_list_fetch_caches_resolved_list_on_state() -> None:
+    """M1 acceptance — the CMS-resolved required-docs list is cached on
+    ``state.required_documents`` so every downstream progress meter
+    (``X of N received``, pending-docs summary, LLM off-script context)
+    reads from THIS list rather than the Python constant. When ops adds
+    an 11th doc via the CMS, the progress meter must read "of 11", not
+    "of 10".
+    """
+    custom_codes = [
+        "trade_license",
+        "tax_card",
+        "audited_report",
+        "audited_report_2023",
+        "audited_report_2022",
+        "credit_bureau_report",
+        "payable_ageing",
+        "receivable_ageing",
+        "interim_financial_statement",
+        "bank_statement_6_months",
+        "national_address_certificate",  # the 11th — ops added this
+    ]
+    checklist = InMemoryChecklistProvider()
+    checklist.add("onboarding.whatsapp.required_docs", custom_codes)
+    platform = build_onboarding_platform(checklist=checklist)
+
+    state = OnboardingState(identity=IDENTITY)
+    step = await platform.workflow._documents_list_fetch(state, _ctx())  # noqa: SLF001
+
+    assert step["missing_documents"] == custom_codes
+    assert step["required_documents"] == custom_codes
+    # Progress meter sourcing: len(state.required_documents) is what
+    # _documents_upload_loop_send uses for the "of N" denominator.
+    assert len(step["required_documents"]) == 11
+
+
+async def test_documents_list_fetch_fallback_also_populates_state() -> None:
+    """Even when the fallback fires, ``state.required_documents`` must be
+    populated — otherwise downstream progress meters degrade to 0/0."""
+    checklist = InMemoryChecklistProvider()
+    platform = build_onboarding_platform(checklist=checklist)
+
+    state = OnboardingState(identity=IDENTITY)
+    step = await platform.workflow._documents_list_fetch(state, _ctx())  # noqa: SLF001
+
+    assert step["missing_documents"] == list(DEFAULT_WHATSAPP_REQUIRED_DOCS)
+    assert step["required_documents"] == list(DEFAULT_WHATSAPP_REQUIRED_DOCS)

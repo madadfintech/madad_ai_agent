@@ -159,6 +159,14 @@ class OnboardingState(WorkflowState):
     # When this hits ``len(DEFAULT_WHATSAPP_REQUIRED_DOCS)`` the docs
     # loop unblocks even if some required slots are still pending.
     docs_uploaded_count: int = 0
+    # M1 acceptance gap fix (2026-06-28): the CMS-resolved required-docs
+    # list, cached here once at session start (``_documents_list_fetch``).
+    # All downstream progress meters (``X of N received``, pending-docs
+    # summary, LLM off-script context) read from THIS list rather than the
+    # Python ``DEFAULT_WHATSAPP_REQUIRED_DOCS`` constant, so when MADAD ops
+    # adds a doc via CMS the progress meter immediately reflects "of N+1".
+    # Empty when the docs phase hasn't started yet (e.g. pre-eligibility).
+    required_documents: list[str] = []
     # The coffee / "all documents received" message must fire exactly ONCE.
     # Set True after _documents_complete sends it; _route_documents then
     # re-parks silently in the upload-await node instead of re-sending it

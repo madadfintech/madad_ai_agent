@@ -200,7 +200,11 @@ async def test_m1_email_renders_canonical_journey_templates(harness):
     # arrive — this is the "offer marketplace" of Step 8.
     assert any(
         t in templates
-        for t in ("onboarding.offers.preview", "onboarding.offer.handoff", "onboarding.offer.handoff.button")
+        for t in (
+            "onboarding.offers.preview",
+            "onboarding.offer.handoff",
+            "onboarding.offer.handoff.button",
+        )
     ), f"M1 acceptance: expected offer preview on email; got: {templates}"
 
 

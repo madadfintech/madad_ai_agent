@@ -119,7 +119,11 @@ class McpCommunicationGateway(CommunicationGateway):
         # SME edits and sends back. Selected when the outbound carries a
         # ``document`` block with base64 bytes in its metadata.
         doc = (message.metadata or {}).get("document") if message.metadata else None
-        if message.channel is Channel.WHATSAPP and isinstance(doc, dict) and doc.get("content_base64"):
+        if (
+            message.channel is Channel.WHATSAPP
+            and isinstance(doc, dict)
+            and doc.get("content_base64")
+        ):
             tool = Tools.EXT_SEND_WHATSAPP_DOCUMENT
             doc_payload: dict[str, Any] = {
                 "to": message.identity,

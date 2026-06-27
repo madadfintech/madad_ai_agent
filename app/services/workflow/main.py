@@ -159,7 +159,8 @@ async def start_campaign(req: CampaignStartRequest, platform: Platform) -> RunSt
     )
     # ATOMIC dedupe: 30s lock keyed on (channel, identity). Reuses the
     # Webhook dedupe primitive (``SET NX EX``) we already deploy.
-    lock_key = f"campaign_start:{str(getattr(req.channel, 'value', req.channel)).lower()}:{req.identity}"
+    _ch = str(getattr(req.channel, "value", req.channel)).lower()
+    lock_key = f"campaign_start:{_ch}:{req.identity}"
     # Reuse the dispatcher's existing dedupe primitive (Redis SET NX EX
     # in prod / in-memory in tests). It's the same client the webhook
     # dedupe uses, so no new dependency.

@@ -38,3 +38,7 @@ pytest==8.3.4
 pytest-asyncio==0.24.0
 httpx==0.28.1
 aiosqlite==0.22.1
+
+# Lint + type-check (CI uses these; see .github/workflows/ci.yml)
+ruff==0.7.4
+mypy==1.13.0

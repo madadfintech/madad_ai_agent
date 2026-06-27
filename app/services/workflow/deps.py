@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Any
 
 from app.core.config import settings as default_settings
 from app.services.communication.deps import get_communication_service

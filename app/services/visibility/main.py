@@ -24,6 +24,7 @@ from .models import (
     DashboardSnapshot,
     FunnelReport,
     MetricsSnapshot,
+    ReplayEntry,
     WorkflowSummary,
 )
 from .persistence import ActivityFilter
@@ -211,16 +212,17 @@ _DASHBOARD_HTML_TMPL = """\
 """
 
 
-def _funnel_table_html(funnel) -> str:
+def _funnel_table_html(funnel: FunnelReport) -> str:
     """Render the funnel as a table with conversion bars."""
     if not funnel.stages:
         return '<div class="empty">No funnel data yet.</div>'
     rows = []
     for stage in funnel.stages:
         conv = stage.conversion
+        bar_pct: float
         if conv is None:
             conv_cell = "<td class='num'>—</td>"
-            bar_pct = 100
+            bar_pct = 100.0
         else:
             conv_cell = f"<td class='num'>{conv * 100:.1f}%</td>"
             bar_pct = max(0.0, min(100.0, conv * 100))
@@ -365,7 +367,7 @@ _COMMS_REVIEW_REPLAY_TMPL = """\
 """
 
 
-def _comms_index_table_html(rows) -> str:
+def _comms_index_table_html(rows: list[ConversationSummary]) -> str:
     """Render the conversation list table for the comms-review index."""
     if not rows:
         return '<div class="empty">No conversations match these filters.</div>'
@@ -391,7 +393,7 @@ def _comms_index_table_html(rows) -> str:
     )
 
 
-def _comms_replay_entries_html(entries) -> str:
+def _comms_replay_entries_html(entries: list[ReplayEntry]) -> str:
     """Render the chronological replay entries — messages + events."""
     if not entries:
         return '<div class="empty">No activity recorded for this conversation.</div>'

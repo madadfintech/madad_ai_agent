@@ -80,13 +80,13 @@ from typing import Any
 
 import httpx
 
+from app.services.document.checklist import ChecklistProvider
 from app.shared.workflow import (
     GraphBuilder,
     WorkflowContext,
     WorkflowDefinition,
     await_input,
 )
-from app.services.document.checklist import ChecklistProvider
 from app.shared.workflow.enums import Channel
 from app.shared.workflow.state import HistoryEntry
 
@@ -823,7 +823,10 @@ def _parse_invoice_batch_csv(text: str) -> list[dict[str, Any]]:
         return out
     if not rows:
         return out
-    header = [_CSV_HEADER_ALIASES.get((c or "").strip().lower(), (c or "").strip().lower()) for c in rows[0]]
+    header = [
+        _CSV_HEADER_ALIASES.get((c or "").strip().lower(), (c or "").strip().lower())
+        for c in rows[0]
+    ]
     known = [h for h in header if h in ("row", *_CSV_COLUMNS)]
     if known:
         data_rows = rows[1:]
@@ -958,7 +961,7 @@ def _sum_disbursements(records: list[dict[str, Any]]) -> tuple[int, str]:
         if not isinstance(r, dict):
             continue
         amt = r.get("amount")
-        if isinstance(amt, (int, float)):
+        if isinstance(amt, int | float):
             total += int(amt)
         elif isinstance(amt, str):
             try:
@@ -977,7 +980,7 @@ def _latest_emis_remaining(records: list[dict[str, Any]]) -> int | None:
         if not isinstance(r, dict):
             continue
         v = r.get("emis_remaining")
-        if isinstance(v, (int, float)):
+        if isinstance(v, int | float):
             return int(v)
     return None
 
@@ -6295,7 +6298,12 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             # Never silently drop a re-upload — tell the SME it is already
             # in, so re-sending the same file never feels like dead silence.
-            await self._smart_contextual(ctx, state, reply, 'You’ve already submitted this invoice and our team is reviewing it. 🙂 To finance another, just send a different invoice here.')
+            await self._smart_contextual(
+                ctx, state, reply,
+                "You’ve already submitted this invoice and our team is "
+                "reviewing it. 🙂 To finance another, just send a "
+                "different invoice here.",
+            )
             return self._step("invoice_collect_await", ctx)
 
         # UAT 2026-06-19 QA: cross-execution inflight guard. Madad's
@@ -8198,7 +8206,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             # back to None when nothing was provided.
             if is_closed:
                 outstanding = 0
-            elif isinstance(outstanding_amount, (int, float)):
+            elif isinstance(outstanding_amount, int | float):
                 outstanding = int(outstanding_amount)
             else:
                 outstanding = None
@@ -9174,7 +9182,10 @@ def _offer_line(o: dict[str, Any]) -> str:
     except (TypeError, ValueError):
         limit = "QAR —"
     try:
-        rate = f"{float(o.get('interestRate') or o.get('interest_rate') or o.get('rate') or 0):g}%/mo"
+        _rate_val = (
+            o.get("interestRate") or o.get("interest_rate") or o.get("rate") or 0
+        )
+        rate = f"{float(_rate_val):g}%/mo"
     except (TypeError, ValueError):
         rate = "—"
     try:
@@ -9324,7 +9335,7 @@ def _extract_madad_score(payload: Any) -> int | None:
     if isinstance(inner, dict):
         candidates += [inner.get("madadScore"), inner.get("madad_score")]
     for value in candidates:
-        if isinstance(value, (int, float)):
+        if isinstance(value, int | float):
             return int(value)
         if isinstance(value, str) and value.strip().isdigit():
             return int(value.strip())

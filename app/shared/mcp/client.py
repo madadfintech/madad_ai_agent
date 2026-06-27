@@ -200,9 +200,9 @@ class MCPClient(ABC):
                 summary[k] = f"<{type(v).__name__}:len={len(str(v))}>"
             elif k in {"file_base64", "content_base64", "file_content_base64"}:
                 summary[k] = f"<base64:len={len(str(v))}>"
-            elif isinstance(v, (str, bytes)) and len(v) > 200:
+            elif isinstance(v, str | bytes) and len(v) > 200:
                 summary[k] = f"<{type(v).__name__}:len={len(v)}>"
-            elif isinstance(v, (dict, list)):
+            elif isinstance(v, dict | list):
                 summary[k] = f"<{type(v).__name__}:len={len(v)}>"
             else:
                 summary[k] = v

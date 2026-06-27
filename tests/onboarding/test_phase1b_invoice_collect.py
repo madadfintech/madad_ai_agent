@@ -324,7 +324,7 @@ async def test_repeat_same_attachment_within_run_dedupes(harness) -> None:
 
     # Force the recent-retry window to expire so we exercise the
     # permanent sig tracker (NOT just the 5min dedupe).
-    snap_run = await runtime.run_store.get(
+    await runtime.run_store.get(
         (await runtime.sessions.get(WA, IDENTITY)).active_run_id  # type: ignore[union-attr]
     )
     # The 5min retry-window check uses ``last_invoice_attempt_at``; the

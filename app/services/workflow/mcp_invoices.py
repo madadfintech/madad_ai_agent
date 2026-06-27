@@ -260,7 +260,7 @@ class McpInvoiceClient:
             invoices = response
             extras: dict[str, Any] = {}
         elif isinstance(response, dict):
-            body = response.get("body") if isinstance(response.get("body"), (list, dict)) else None
+            body = response.get("body") if isinstance(response.get("body"), list | dict) else None
             if isinstance(body, list):
                 invoices = body
                 extras = {}

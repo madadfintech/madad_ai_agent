@@ -17,7 +17,6 @@ from app.shared.workflow.enums import Channel
 
 from .ports import Messenger, Reminders
 
-
 # [TEMP-DBG] To find exact bug - Temp Logs (behavioral instrumentation):
 # Every outbound send logs a structured ``obs.outbound.send`` line so the
 # log monitor's behavioral rules can detect:

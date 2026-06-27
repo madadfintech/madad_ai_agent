@@ -384,6 +384,21 @@ _TEMPLATE_BODIES = {
         "PDF or multiple invoices at once. 📄\n\n"
         "Track at uat-portal.madadfintech.com (Ref: {{ ref }})"
     ),
+    # Returning-SME re-greeting (UAT 2026-06-28). The agent fills two slots
+    # from the route detected by ``madad_mcp_check_registration``:
+    #   {{ scenario }} — the route-specific message ("Your credit line is
+    #                     already active — send any invoice…", or similar);
+    #                     the 7 options live in ``_registered_route_send``.
+    #   {{ ref_suffix }} — " (Ref: #N)" when a reference exists, else "".
+    # WhatsApp uses the approved template ``onboarding_welcome_back``
+    # ({{1}}, {{2}} positional params). Email + free-text fallback render
+    # this body directly, so the leading "Welcome back!" and trailing
+    # "For any queries…" live HERE so they appear on every channel.
+    "onboarding.welcome_back": (
+        "👋 Welcome back!\n\n"
+        "{{ scenario }}\n\n"
+        "For any queries, reply here or call 72773652.{{ ref_suffix }}"
+    ),
     # ----------------------------------------------------------------
     # Phase 1.b — invoice financing (Steps 10–13).
     # ----------------------------------------------------------------

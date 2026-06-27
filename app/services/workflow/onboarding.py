@@ -150,6 +150,10 @@ TEMPLATE_KEYS = [
     "onboarding.offers.preview",
     "onboarding.offer.confirmed",
     "onboarding.activated",
+    # Returning-SME re-greeting (UAT 2026-06-28). Approved Meta template:
+    # ``onboarding_welcome_back``; agent fills {{1}} scenario + {{2}} ref
+    # suffix per ``_registered_route_send`` route.
+    "onboarding.welcome_back",
     # Phase 1.b — invoice financing (post-activation) + repayment lifecycle.
     "onboarding.invoice.processing",
     "onboarding.invoice.submitting",
@@ -2735,49 +2739,72 @@ class OnboardingWorkflow(WorkflowDefinition):
         payload = state.registration_payload or {}
         ref = payload.get("referenceNumber") or ""
 
-        answer_by_route: dict[str, str] = {
+        # The 7 route-specific scenarios. These travel as the {{1}}
+        # parameter of the approved ``onboarding_welcome_back`` Meta
+        # template, so the whole greeting (including the leading
+        # "👋 Welcome back!" and the trailing "For any queries…" line)
+        # is window-safe out of the 24h care window. Wording stays
+        # identical to the prior free-text path so the SME-facing copy
+        # is unchanged.
+        #
+        # The leading greeting + trailing footer live in the template
+        # BODY (Meta-approved), not in these strings — so each
+        # scenario starts mid-sentence ("Your credit line is already
+        # active…") and reads cleanly when slotted into:
+        #     "👋 Welcome back!\n\n{{1}}\n\nFor any queries…{{2}}"
+        SCENARIO_BY_ROUTE: dict[str, str] = {
             "portal_login_required": (
-                "👋 Welcome back! Your application is being managed on the "
-                "Madad portal. Please log in at uat-portal.madadfintech.com to continue."
-                + (f" (Ref: {ref})" if ref else "")
+                "Your application is being managed on the Madad portal. "
+                "Please log in at uat-portal.madadfintech.com to continue."
             ),
             "invoice_discounting": (
-                "🎉 Welcome back! Your credit line is already active — "
-                "send any invoice you'd like to finance here as a PDF or "
-                "photo and I'll submit it right away."
+                "🎉 Your credit line is already active — send any invoice "
+                "you'd like to finance here as a PDF or photo and I'll "
+                "submit it right away."
             ),
             "offer_accepted_confirmation": (
-                "✅ Welcome back! You've already accepted an offer with us — "
-                "our team is coordinating the next steps and we'll be in "
-                "touch shortly."
+                "✅ You've already accepted an offer with us — our team "
+                "is coordinating the next steps and we'll be in touch "
+                "shortly."
             ),
             "offers_available": (
-                "🎉 Welcome back — your financing offers are ready to "
-                "review. Log in at uat-portal.madadfintech.com to compare them side "
-                "by side and pick the one you want."
+                "🎉 Your financing offers are ready to review. Log in at "
+                "uat-portal.madadfintech.com to compare them side by side "
+                "and pick the one you want."
             ),
             "payment_received": (
-                "💚 Welcome back! Your onboarding fee is already in and "
-                "your application is with our banking partners — we'll "
-                "ping you the moment they respond (typically 3–5 business "
-                "days)."
+                "💚 Your onboarding fee is already in and your application "
+                "is with our banking partners — we'll ping you the moment "
+                "they respond (typically 3–5 business days)."
             ),
             "payment_link": (
-                "👋 Welcome back! You're qualified for financing — please "
-                "complete the QAR 6,000 onboarding fee to forward your "
-                "application to the banks. Log in at uat-portal.madadfintech.com to "
-                "pay or reply 'pay' and I'll re-send the link."
+                "You're qualified for financing — please complete the QAR "
+                "6,000 onboarding fee to forward your application to the "
+                "banks. Log in at uat-portal.madadfintech.com to pay or "
+                "reply 'pay' and I'll re-send the link."
             ),
             "continue_step": (
-                "👋 Welcome back! Picking up where you left off — share "
-                "the next document we asked for whenever you're ready, "
-                "or reply 'list' to see what's still pending."
+                "Picking up where you left off — share the next document "
+                "we asked for whenever you're ready, or reply 'list' to "
+                "see what's still pending."
             ),
         }
-        answer = answer_by_route.get(route, answer_by_route["continue_step"])
+        scenario = SCENARIO_BY_ROUTE.get(route, SCENARIO_BY_ROUTE["continue_step"])
+        ref_suffix = f" (Ref: #{ref})" if ref else ""
+
         await self._send(
-            ctx, state, "onboarding.help.contextual",
-            {"answer": answer, "next_step": ""},
+            ctx, state, "onboarding.welcome_back",
+            {
+                "scenario": scenario,
+                "ref_suffix": ref_suffix,
+                # Back-compat: the free-text fallback path (when the Meta
+                # template send fails) renders the whole "Welcome back" envelope
+                # plus the scenario via the CMS-stored body. Pass the legacy
+                # ``answer`` shape too so any stale CMS body that references
+                # ``{{ answer }}`` still renders.
+                "answer": f"👋 Welcome back! {scenario}{ref_suffix}",
+                "next_step": "",
+            },
         )
         return self._step(
             "registered_route_send",
@@ -8891,6 +8918,13 @@ _STATUS_TEMPLATES: dict[str, str] = {
     "onboarding.documents.checklist":   "onboarding_documents_checklist",
     "onboarding.payment.request":       "onboarding_payment_request",
     "onboarding.payment.confirmed":     "onboarding_payment_confirmed",
+    # UAT 2026-06-28 (Ishan #4): returning-user re-greeting (the
+    # ``_registered_route_send`` path) used to send free text that Meta
+    # silently drops outside the 24h window — so an already-ACTIVATED
+    # SME messaging us after a week of quiet got no reply. The seven
+    # route-specific scenario strings now feed into an approved utility
+    # template (params: {{1}} scenario, {{2}} ref-number suffix or "").
+    "onboarding.welcome_back":          "onboarding_welcome_back",
     # UAT 2026-06-18 (Ishan Bug 2): offer cards arrive days after the
     # SME left the chat — free-text was being silently dropped outside
     # the 24h Meta window. Both ``offers.preview`` (the cards list) and
@@ -9066,6 +9100,12 @@ def _status_components(
 
     if key == "onboarding.documents.checklist":
         return []  # static body, no variables
+    if key == "onboarding.welcome_back":
+        # {{1}} = route-specific scenario ("Your credit line is already active…"),
+        # {{2}} = optional " (Ref: #X)" suffix or empty. Both come from the
+        # variables dict the workflow passes to ``_send``. Meta requires
+        # non-empty params, so empty ref → "—" via _tpl_txt.
+        return body(v.get("scenario") or "", v.get("ref_suffix") or "")
     if key == "onboarding.payment.confirmed":
         return body(v.get("provider_ref") or v.get("ref") or "—")
     if key == "onboarding.offer.confirmed":

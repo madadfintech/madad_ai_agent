@@ -2097,12 +2097,20 @@ class OnboardingWorkflow(WorkflowDefinition):
         checklist: ChecklistProvider | None = None,
         dedupe: WebhookDedupe | None = None,
         offers_debounce_seconds: float = 30.0,
+        cms: Any = None,
     ) -> None:
         self._msg = messenger
         self._identity = identity
         self._kyc = kyc
         self._pay = payments
         self._reminders = reminders
+        # Direct CMS reference for the few places the agent needs to look
+        # at template-side fields the messenger doesn't expose — currently
+        # ``data.buttons`` (Ishan #2: ops should edit reply-button labels
+        # via the portal without us redeploying). Optional + typed as Any
+        # so the long tail of test harnesses doesn't need to import the
+        # service. Real value: ``CmsService`` from ``app.services.cms``.
+        self._cms = cms
         # Offers-coalesce window. Madad fires one ``offers.available`` per
         # lender quote; two banks within 33 s drove the +919497191690
         # UAT bug (separate offer messages instead of one combined list).
@@ -2715,6 +2723,89 @@ class OnboardingWorkflow(WorkflowDefinition):
             outcome="domain_blocked",
             domain_block_reason=domain,
         )
+
+    # ------------------------------------------------------------------
+    # Reply-button label resolution (UAT 2026-06-28, Ishan #2).
+    # ------------------------------------------------------------------
+    # Madad ops should be able to edit button copy ("Yes, upload more" →
+    # "Yes — send another doc") via the portal without us redeploying.
+    # The agent listens for a stable BUTTON ID per intent — those IDs
+    # must NEVER change without a coordinated agent + portal change, or
+    # the click maps to no intent and the SME hits a dead end.
+    #
+    # ``BUTTON_DEFAULTS`` is the SINGLE SOURCE OF TRUTH for which
+    # (template_key → list[(id, default_label)]) the agent emits today.
+    # Each id is also the contract Ishan's portal pins as read-only on
+    # the row; only ``label`` is operator-editable. Add a new id here
+    # AND a corresponding handler before the portal lights it up.
+    BUTTON_DEFAULTS: dict[str, list[tuple[str, str]]] = {
+        "onboarding.documents.more_docs_prompt:settle": [
+            ("docs_upload_more", "Yes, upload more"),
+            ("docs_done", "No, I'm done"),
+        ],
+        "onboarding.documents.more_docs_prompt:simple": [
+            ("more_docs_yes", "Yes"),
+            ("more_docs_no", "No"),
+        ],
+        "onboarding.invoice.confirm": [
+            ("invoice_approve", "Approve"),
+            ("invoice_edit", "Edit"),
+            ("invoice_reject", "Reject"),
+        ],
+        "onboarding.invoice.batch.csv_review": [
+            ("batch_approve_all", "Approve all"),
+            ("batch_reject_all", "Reject all"),
+        ],
+    }
+
+    async def _resolve_buttons(
+        self,
+        template_key: str,
+        default: list[tuple[str, str]],
+        *,
+        locale: Any = None,
+        channel: Channel | None = None,
+    ) -> list[tuple[str, str]]:
+        """Look up the CMS-stored ``data.buttons`` array for a template;
+        fall back to ``default`` when the CMS isn't reachable or the
+        template carries no buttons. Returned tuples are
+        ``(stable_id, operator_editable_label)`` — IDs MUST match the
+        agent's intent map (see ``BUTTON_DEFAULTS``). Unknown IDs from
+        the CMS are silently skipped so an editor mistake can't
+        introduce a click-to-nowhere button."""
+
+        if self._cms is None:
+            return default
+        try:
+            from app.shared.i18n import Locale  # local import keeps test surface clean
+
+            loc = locale if isinstance(locale, Locale) else Locale.EN
+            record = await self._cms.get_template(
+                template_key, loc, channel=channel,
+            )
+        except Exception:  # noqa: BLE001 — CMS fault must never block the agent
+            return default
+        if record is None:
+            return default
+        value = record.value if hasattr(record, "value") else None
+        cms_buttons = value.get("buttons") if isinstance(value, dict) else None
+        if not isinstance(cms_buttons, list) or not cms_buttons:
+            return default
+        valid_ids = {bid for bid, _ in default}
+        out: list[tuple[str, str]] = []
+        for spec in cms_buttons:
+            if not isinstance(spec, dict):
+                continue
+            bid = str(spec.get("id") or "").strip()
+            label = str(spec.get("label") or "").strip()
+            if not bid or not label:
+                continue
+            if bid not in valid_ids:
+                # Unknown id — no intent mapping for it. Skip rather than
+                # render a button that does nothing on click.
+                continue
+            out.append((bid, label))
+        return out or default
 
     async def _registered_route_send(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -4185,14 +4276,19 @@ class OnboardingWorkflow(WorkflowDefinition):
             send_buttons = getattr(self._msg, "send_reply_buttons", None)
             if send_buttons is not None:
                 try:
+                    btns = await self._resolve_buttons(
+                        "onboarding.documents.more_docs_prompt",
+                        self.BUTTON_DEFAULTS[
+                            "onboarding.documents.more_docs_prompt:settle"
+                        ],
+                        locale=state.locale,
+                        channel=ctx.channel,
+                    )
                     sent_btn = await send_buttons(
                         channel=_channel(ctx),
                         identity=ctx.identity,
                         template_key="onboarding.documents.more_docs_prompt",
-                        buttons=[
-                            ("docs_upload_more", "Yes, upload more"),
-                            ("docs_done", "No, I'm done"),
-                        ],
+                        buttons=btns,
                         variables=prompt_vars,
                         locale=state.locale,
                     )
@@ -4756,11 +4852,19 @@ class OnboardingWorkflow(WorkflowDefinition):
         send_buttons = getattr(self._msg, "send_reply_buttons", None)
         if send_buttons is not None and ctx.channel is Channel.WHATSAPP:
             try:
+                btns_simple = await self._resolve_buttons(
+                    "onboarding.documents.more_docs_prompt",
+                    self.BUTTON_DEFAULTS[
+                        "onboarding.documents.more_docs_prompt:simple"
+                    ],
+                    locale=state.locale,
+                    channel=ctx.channel,
+                )
                 sent = await send_buttons(
                     channel=_channel(ctx),
                     identity=ctx.identity,
                     template_key="onboarding.documents.more_docs_prompt",
-                    buttons=[("more_docs_yes", "Yes"), ("more_docs_no", "No")],
+                    buttons=btns_simple,
                     locale=state.locale,
                 )
             except Exception as exc:  # noqa: BLE001 — fall back to text
@@ -6965,15 +7069,17 @@ class OnboardingWorkflow(WorkflowDefinition):
         send_buttons = getattr(self._msg, "send_reply_buttons", None)
         if send_buttons is not None and ctx.channel is Channel.WHATSAPP:
             try:
+                inv_btns = await self._resolve_buttons(
+                    "onboarding.invoice.confirm",
+                    self.BUTTON_DEFAULTS["onboarding.invoice.confirm"],
+                    locale=state.locale,
+                    channel=ctx.channel,
+                )
                 sent = await send_buttons(
                     channel=_channel(ctx),
                     identity=ctx.identity,
                     template_key="onboarding.invoice.confirm",
-                    buttons=[
-                        ("invoice_approve", "Approve"),
-                        ("invoice_edit",    "Edit"),
-                        ("invoice_reject",  "Reject"),
-                    ],
+                    buttons=inv_btns,
                     variables=variables,
                     locale=state.locale,
                 )
@@ -7652,11 +7758,17 @@ class OnboardingWorkflow(WorkflowDefinition):
         send_buttons = getattr(self._msg, "send_reply_buttons", None)
         if send_buttons is not None:
             try:
+                batch_btns = await self._resolve_buttons(
+                    "onboarding.invoice.batch.csv_review",
+                    self.BUTTON_DEFAULTS["onboarding.invoice.batch.csv_review"],
+                    locale=state.locale,
+                    channel=ctx.channel,
+                )
                 sent_btn = await send_buttons(
                     channel=_channel(ctx),
                     identity=ctx.identity,
                     template_key="onboarding.invoice.batch.csv_review",
-                    buttons=[("batch_approve_all", "Approve all"), ("batch_reject_all", "Reject all")],
+                    buttons=batch_btns,
                     variables=prompt_vars,
                     locale=state.locale,
                 )

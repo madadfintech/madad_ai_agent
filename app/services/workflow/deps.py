@@ -64,6 +64,7 @@ def build_onboarding_platform(
     dedupe: WebhookDedupe | None = None,
     allowed_event_types: frozenset[str] | set[str] | None = None,
     offers_debounce_seconds: float = 0.0,
+    cms: Any = None,
 ) -> OnboardingPlatform:
     runtime = runtime or build_runtime()
     # Shared dedupe instance: dispatcher uses it for the 24h webhook event-id
@@ -81,6 +82,7 @@ def build_onboarding_platform(
         checklist=checklist,
         dedupe=shared_dedupe,
         offers_debounce_seconds=offers_debounce_seconds,
+        cms=cms,
     )
     runtime.register(workflow)
     dispatcher = OnboardingDispatcher(
@@ -123,7 +125,8 @@ def get_onboarding_platform() -> OnboardingPlatform:
         from app.services.cms.deps import get_cms_service
         from app.services.document.checklist import CmsChecklistProvider
 
-        checklist: ChecklistProvider = CmsChecklistProvider(get_cms_service())
+        cms_service = get_cms_service()
+        checklist: ChecklistProvider = CmsChecklistProvider(cms_service)
         return build_onboarding_platform(
             messenger=CommunicationMessenger(get_communication_service()),
             identity=McpMadadIdentityClient(mcp),
@@ -133,6 +136,11 @@ def get_onboarding_platform() -> OnboardingPlatform:
             invoices=McpInvoiceClient(mcp),
             checklist=checklist,
             dedupe=dedupe,
+            # CMS handle on the workflow so the new ``_resolve_buttons``
+            # helper can read CMS-stored reply-button labels (Ishan #2).
+            # Hot-cached + pubsub-invalidated, so the agent picks up an
+            # ops edit within ~60s.
+            cms=cms_service,
             # NO debounce (user 2026-06-21): an offer message must reach the
             # SME the INSTANT each lender quotes — lenders can quote hours or
             # days apart, so coalescing hides/delays the first offer. The

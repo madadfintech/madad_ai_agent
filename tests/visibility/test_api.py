@@ -73,6 +73,78 @@ def test_dashboard_v1_html_renders_empty() -> None:
     assert "Workflow runs" in body
 
 
+def test_comms_review_index_empty_state() -> None:
+    """Empty-state comms-review index returns 200 + valid HTML with
+    a search form and "no conversations" placeholder."""
+    response = client.get("/visibility/comms/v1")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    body = response.text
+    assert "MADAD Comms Review" in body
+    # Search form must be present even before any data.
+    assert 'name="identity"' in body
+    assert 'name="text"' in body
+
+
+def test_comms_review_index_renders_conversation_rows() -> None:
+    """After ingesting a conversation event, the comms-review index
+    lists that conversation with a link into the replay view."""
+    r = client.post(
+        "/visibility/activities",
+        json={
+            "source": "communication",
+            "type": "message.received",
+            "conversation_id": "c-review-1",
+            "identity": "+97455500REV",
+            "channel": "whatsapp",
+            "summary": "I'd like financing",
+        },
+    )
+    assert r.status_code == 200, r.text
+    response = client.get("/visibility/comms/v1")
+    assert response.status_code == 200
+    body = response.text
+    assert "c-review-1" in body
+    assert "+97455500REV" in body
+    # Link into the replay view must be present.
+    assert "/visibility/comms/v1/c-review-1" in body
+
+
+def test_comms_review_index_filters_by_identity() -> None:
+    """Searching for a specific identity narrows the result list — the
+    M1 acceptance hook ("ops pastes the SME's phone, gets their
+    conversations")."""
+    # Seed two distinct conversations.
+    client.post("/visibility/activities", json={
+        "source": "communication", "type": "message.received",
+        "conversation_id": "c-fil-A", "identity": "+97455500AAA",
+        "channel": "whatsapp",
+    })
+    client.post("/visibility/activities", json={
+        "source": "communication", "type": "message.received",
+        "conversation_id": "c-fil-B", "identity": "+97455500BBB",
+        "channel": "whatsapp",
+    })
+    response = client.get("/visibility/comms/v1", params={"identity": "+97455500AAA"})
+    assert response.status_code == 200
+    body = response.text
+    assert "c-fil-A" in body
+    # The narrowed result should NOT include the B conversation.
+    assert "c-fil-B" not in body
+
+
+def test_comms_review_replay_shows_chronological_entries() -> None:
+    """The per-conversation replay view shows messages + events in
+    chronological order — the "who said what when" audit ops needs."""
+    response = client.get("/visibility/comms/v1/c-review-1")
+    assert response.status_code == 200
+    body = response.text
+    assert "Replay" in body
+    assert "c-review-1" in body
+    # The "back to list" link is present.
+    assert "/visibility/comms/v1" in body
+
+
 def test_dashboard_v1_html_renders_populated_data() -> None:
     """After a few activities + a workflow run, the dashboard shows the
     KPIs from the live snapshot — proves the page is wired to

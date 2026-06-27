@@ -190,9 +190,16 @@ class CommunicationService:
         locale = request.locale or conversation.locale
 
         text: str | None
+        # Email-channel subject (UAT 2026-06-28, Ishan #A). When the template
+        # carries a ``data.subject`` field, it's rendered with the same
+        # variable bag the body uses and threaded through ``metadata.subject``
+        # so the gateway picks it up instead of the default. Non-template
+        # sends (plain text) and non-email channels are unaffected — the
+        # subject is set on metadata but the WhatsApp gateway ignores it.
+        rendered_subject: str | None = None
         if request.template_key:
-            text = await self._renderer.render_template(
-                request.template_key, request.variables, locale=locale
+            text, rendered_subject = await self._renderer.render_with_subject(
+                request.template_key, request.variables, locale=locale,
             )
             msg_type = MessageType.TEMPLATE
         else:
@@ -200,6 +207,12 @@ class CommunicationService:
             msg_type = MessageType.MEDIA if request.attachments else MessageType.TEXT
 
         attachments = [to_attachment(a, MessageDirection.OUTBOUND) for a in request.attachments]
+        # Merge subject into metadata without overriding an explicitly
+        # supplied one (caller's choice wins). The gateway reads
+        # ``metadata.subject`` first, then falls back to its default.
+        merged_metadata = dict(request.metadata or {})
+        if rendered_subject and "subject" not in merged_metadata:
+            merged_metadata["subject"] = rendered_subject
         message = Message(
             conversation_id=conversation.conversation_id,
             channel=request.channel,
@@ -215,7 +228,7 @@ class CommunicationService:
             in_reply_to=request.in_reply_to,
             session_id=conversation.session_id,
             correlation_id=request.correlation_id,
-            metadata=request.metadata or {},
+            metadata=merged_metadata,
         )
         await self._messages.create(message)
         await self._touch_conversation(conversation)

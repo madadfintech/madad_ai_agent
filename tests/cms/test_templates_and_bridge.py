@@ -63,3 +63,100 @@ async def test_global_variables_round_trip(cms):
     await cms.set_variables({"company": "Madad", "phone": "72773652"})
     variables = await cms.get_variables()
     assert variables == {"company": "Madad", "phone": "72773652"}
+
+
+# -- Email subject (UAT 2026-06-28, Ishan #A) ------------------------------
+
+
+async def test_subject_round_trips_through_cms_and_bridge(cms):
+    """Upserting a template with ``subject=...`` stores it on the record
+    and the bridge exposes it through ``Template.subject`` so the
+    Communication service can thread it into outbound metadata."""
+
+    await cms.upsert_template(
+        "onboarding.payment.request",
+        Locale.EN,
+        "Score: {{ score }} · Pay QAR {{ amount }}",
+        subject="Madad — Your Application Result & Next Step",
+    )
+
+    bridge = CmsTemplateProvider(cms)
+    tpl = await bridge.get("onboarding.payment.request", Locale.EN)
+    assert tpl is not None
+    assert tpl.subject == "Madad — Your Application Result & Next Step"
+
+
+async def test_bridge_threads_subject_into_outbound_metadata():
+    """End-to-end: an email-channel send rendered through the CMS bridge
+    arrives at the gateway with ``metadata.subject`` set. The bridge
+    populates Template.subject; the comms service renders it and
+    merges into metadata."""
+
+    cms = build_cms_service()
+    await cms.upsert_template(
+        "onboarding.payment.request",
+        Locale.EN,
+        "Hi {{ name }}, please complete your QAR 6,000 onboarding fee.",
+        subject="Madad — Your Application Result & Next Step",
+        variables=["name"],
+    )
+
+    comms = build_communication_service(template_provider=CmsTemplateProvider(cms))
+    message = await comms.send(
+        OutboundMessageRequest(
+            channel=Channel.EMAIL,
+            identity="biz@example.com",
+            template_key="onboarding.payment.request",
+            variables={"name": "Jathish"},
+        )
+    )
+    assert message.metadata.get("subject") == "Madad — Your Application Result & Next Step"
+    # Body still renders correctly.
+    assert "Hi Jathish" in message.text
+
+
+async def test_explicit_metadata_subject_overrides_template_subject():
+    """When the caller passes ``metadata={"subject": "…"}`` explicitly,
+    that wins over the CMS-stored subject. Lets a one-off send use a
+    custom subject without re-editing the template."""
+
+    cms = build_cms_service()
+    await cms.upsert_template(
+        "onboarding.welcome_back",
+        Locale.EN,
+        "Welcome back!",
+        subject="Madad — Welcome Back",
+    )
+    comms = build_communication_service(template_provider=CmsTemplateProvider(cms))
+
+    message = await comms.send(
+        OutboundMessageRequest(
+            channel=Channel.EMAIL,
+            identity="biz@example.com",
+            template_key="onboarding.welcome_back",
+            variables={},
+            metadata={"subject": "Custom subject from the caller"},
+        )
+    )
+    assert message.metadata.get("subject") == "Custom subject from the caller"
+
+
+async def test_subject_renders_variables_non_strictly():
+    """Subject substitutes ``{{ var }}`` from the same bag the body uses.
+    Body-strict mode still hard-fails on missing body vars, but a
+    missing subject var falls through (gateway defaults absorb it) —
+    this prevents a half-rendered "Madad — your {{ amount }} is due"."""
+
+    cms = build_cms_service()
+    await cms.upsert_template(
+        "test.both",
+        Locale.EN,
+        "Body uses {{ name }}",
+        subject="Hello {{ name }} — amount {{ amount }}",
+        variables=["name", "amount"],
+    )
+
+    bridge = CmsTemplateProvider(cms)
+    tpl = await bridge.get("test.both", Locale.EN)
+    assert tpl is not None
+    assert tpl.subject == "Hello {{ name }} — amount {{ amount }}"

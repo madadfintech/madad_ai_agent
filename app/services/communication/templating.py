@@ -27,6 +27,11 @@ class Template(BaseModel):
     key: str
     locale: Locale
     body: str
+    # Email subject line (UAT 2026-06-28, Ishan #A). Optional because most
+    # templates don't carry one — WhatsApp ignores it, and the email path
+    # falls back to a deterministic subject when this is None. Stored in
+    # the CMS template's ``data.subject`` JSON field.
+    subject: str | None = None
 
 
 class TemplateProvider(ABC):
@@ -97,8 +102,25 @@ class TemplateRenderer:
         *,
         locale: Locale | None = None,
     ) -> str:
-        """Render template ``key`` in ``locale`` (falling back to the default)."""
+        """Render template ``key`` in ``locale`` (falling back to the default).
 
+        Returns the rendered BODY only — use :meth:`render_with_subject` when
+        the caller also needs the email subject line.
+        """
+        rendered, _ = await self.render_with_subject(key, variables, locale=locale)
+        return rendered
+
+    async def render_with_subject(
+        self,
+        key: str,
+        variables: dict[str, object],
+        *,
+        locale: Locale | None = None,
+    ) -> tuple[str, str | None]:
+        """Render the template and return ``(body, subject)`` — both with
+        ``{{ variables }}`` substituted. Subject is None when the template
+        doesn't define one (most do not — only email-specific templates).
+        """
         requested = locale or self._default_locale
         template = await self._provider.get(key, requested)
         if template is None and requested != self._default_locale:
@@ -108,4 +130,15 @@ class TemplateRenderer:
                 f"No template {key!r} for locale {requested}",
                 details={"key": key, "locale": str(requested)},
             )
-        return render(template.body, variables, strict=self._strict)
+        body = render(template.body, variables, strict=self._strict)
+        # Subject is rendered non-strict — a template missing a variable
+        # in its body must hard-fail (the SME gets wrong content) but a
+        # subject missing a variable can fall back to the default
+        # subject at the gateway. Avoids a half-rendered subject like
+        # "Madad — your {{ amount }} is due".
+        subject = (
+            render(template.subject, variables, strict=False)
+            if template.subject
+            else None
+        )
+        return body, subject

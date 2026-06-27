@@ -223,10 +223,24 @@ class CmsService:
         variables: list[str] | None = None,
         comment: str | None = None,
         updated_by: str | None = None,
+        subject: str | None = None,
+        buttons: list[dict[str, Any]] | None = None,
     ) -> ConfigRecord:
         value: dict[str, Any] = {"body": body}
         if variables is not None:
             value["variables"] = variables
+        # Email subject (UAT 2026-06-28, Ishan #A) — optional; rendered
+        # by ``TemplateRenderer.render_with_subject`` with the same
+        # ``{{ variable }}`` bag the body uses. Gateway picks it up from
+        # ``metadata.subject``; WhatsApp gateway ignores it.
+        if subject is not None:
+            value["subject"] = subject
+        # Reply-button labels (UAT 2026-06-28, Ishan #2) — optional;
+        # consumed by ``OnboardingWorkflow._resolve_buttons``. See
+        # ``OnboardingWorkflow.BUTTON_DEFAULTS`` for the stable ids
+        # the agent listens for (the portal editor pins those).
+        if buttons is not None:
+            value["buttons"] = buttons
         return await self.upsert(
             ConfigKind.TEMPLATE,
             name,

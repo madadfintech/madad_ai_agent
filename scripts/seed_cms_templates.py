@@ -761,6 +761,40 @@ _NUDGE_SCHEDULES: dict[str, dict[str, Any]] = {
 }
 
 
+    # Email subjects (UAT 2026-06-28 — Ishan #A). Only the steps the SME
+    # actually sees on email get explicit subjects; the rest fall back to
+    # ``_DEFAULT_EMAIL_SUBJECT`` ("Madad Financing — update on your
+    # application") at the gateway. Wording mirrors the email subjects in
+    # the agentic-flow PDF so the SME's inbox reads like the canonical
+    # journey rather than a bag of generic notifications.
+_EMAIL_SUBJECTS: dict[str, str] = {
+    "onboarding.campaign.intro":         "Madad — Unlock Cash Stuck in Your Invoices",
+    "onboarding.cr.received":            "Madad — CR Received · One More Document Needed",
+    "onboarding.financials.received":    "Madad — Financial Report Received · Pre-Qualification in 24 Hours",
+    "onboarding.documents.checklist":    "Madad — Pre-Qualified! Please Share Your Documents",
+    "onboarding.documents.single_received": "Madad — Documents Received · Checklist Update",
+    "onboarding.documents.complete":     "Madad — All Documents Received",
+    "onboarding.payment.request":        "Madad — Your Application Result & Next Step",
+    "onboarding.payment.confirmed":      "Madad — Payment Received · Application Forwarded to Banks",
+    "onboarding.offers.preview":         "Madad — Your Financing Offers Are Ready · Login to Select",
+    "onboarding.offer.confirmed":        "Madad — Offer Selection Confirmed",
+    "onboarding.activated":              "Madad — Your Credit Line is Active",
+    "onboarding.invoice.received":       "Madad — Invoice Received",
+    "onboarding.invoice.submitted":      "Madad — Invoice Submitted for Financing",
+    "onboarding.invoice.batch.preview":  "Madad — Invoice Review File Attached",
+    "onboarding.disbursement.received":  "Madad — Invoice Disbursed",
+    "onboarding.repayment.received":     "Madad — Repayment Received",
+    "onboarding.repayment.closed":       "Madad — Invoice Closed",
+    "onboarding.repayment.due_soon":     "Madad — Invoices Due Soon",
+    "onboarding.repayment.overdue":      "Madad — Invoice Overdue",
+    "onboarding.welcome_back":           "Madad — Welcome Back",
+    "onboarding.not_eligible":           "Madad — Eligibility Check Result",
+    "onboarding.not_pre_qualified":      "Madad — Pre-Qualification Update",
+    "onboarding.not_qualified":          "Madad — Application Update",
+    "onboarding.domain_blocked":         "Madad — Application Update",
+}
+
+
 async def run() -> int:
     cms = get_cms_service()
 
@@ -772,7 +806,10 @@ async def run() -> int:
         if body is None:
             skipped.append(key)
             continue
-        await cms.upsert_template(key, Locale.EN, body)
+        await cms.upsert_template(
+            key, Locale.EN, body,
+            subject=_EMAIL_SUBJECTS.get(key),
+        )
         seeded_templates += 1
         print(f"  ✓ template: {key}")
 

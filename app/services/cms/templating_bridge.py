@@ -33,4 +33,16 @@ class CmsTemplateProvider(TemplateProvider):
         record = await self._cms.get_template(key, locale, channel=self._channel)
         if record is None:
             return None
-        return Template(key=key, locale=record.locale or locale, body=str(record.value["body"]))
+        value = record.value if isinstance(record.value, dict) else {}
+        # Optional ``subject`` flows through for email-channel sends;
+        # absent / non-string → None and the gateway uses its default.
+        raw_subject = value.get("subject")
+        subject = (
+            raw_subject if isinstance(raw_subject, str) and raw_subject else None
+        )
+        return Template(
+            key=key,
+            locale=record.locale or locale,
+            body=str(value["body"]),
+            subject=subject,
+        )

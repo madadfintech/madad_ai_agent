@@ -134,6 +134,111 @@ async def test_resolve_buttons_cms_exception_falls_back_silently() -> None:
     assert out == default
 
 
+# -- Observability emits (M1 monitor coverage 2026-06-28) --------------------
+
+
+def _stub_ctx(captured: list[tuple[str, dict[str, Any]]]) -> Any:
+    """A minimal ctx-shape for the helper that records every warning() call."""
+
+    class _Logger:
+        def warning(self, event: str, **fields: Any) -> None:
+            captured.append((event, fields))
+
+        # _resolve_buttons only calls .warning; other levels delegate to noop.
+        def __getattr__(self, _name: str) -> Any:
+            return lambda *a, **k: None
+
+    class _Ctx:
+        logger = _Logger()
+
+    return _Ctx()
+
+
+async def test_resolve_buttons_emits_cms_fault_warning() -> None:
+    """A CMS fault path emits ``resolve_buttons.cms_fault`` so the monitor
+    rule fires and ops sees the CMS is broken. Without this log, an
+    SME still gets default-labelled buttons but the CMS-driven editing
+    is silently broken — exactly the deviation the monitor should
+    surface."""
+
+    class _BrokenCms:
+        async def get_template(self, *a: Any, **kw: Any) -> Any:
+            raise RuntimeError("CMS unreachable")
+
+    platform = build_onboarding_platform(cms=_BrokenCms())
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    out = await platform.workflow._resolve_buttons(  # noqa: SLF001
+        "onboarding.invoice.confirm",
+        platform.workflow.BUTTON_DEFAULTS["onboarding.invoice.confirm"],
+        locale=None,
+        channel=Channel.WHATSAPP,
+        ctx=_stub_ctx(captured),
+    )
+    assert out  # still returns defaults
+    events = [e for e, _ in captured]
+    assert "resolve_buttons.cms_fault" in events
+
+
+async def test_resolve_buttons_emits_unknown_ids_warning() -> None:
+    """An ops typo on the portal — saving an unknown button id —
+    triggers ``resolve_buttons.unknown_ids_dropped``. The SME's UI
+    still works because the typo is dropped, but the monitor catches
+    it so the portal editor mistake gets fixed."""
+    platform = build_onboarding_platform(
+        cms=_StubCms(
+            _StubCmsRecord({
+                "buttons": [
+                    {"id": "invoice_approve", "label": "Approve"},
+                    {"id": "typo_id_999", "label": "Surprise!"},
+                ],
+            })
+        )
+    )
+    captured: list[tuple[str, dict[str, Any]]] = []
+    await platform.workflow._resolve_buttons(  # noqa: SLF001
+        "onboarding.invoice.confirm",
+        platform.workflow.BUTTON_DEFAULTS["onboarding.invoice.confirm"],
+        locale=None,
+        channel=Channel.WHATSAPP,
+        ctx=_stub_ctx(captured),
+    )
+    events = [e for e, f in captured]
+    assert "resolve_buttons.unknown_ids_dropped" in events
+    # The fields carry the dropped id for the monitor message.
+    fields = next(f for e, f in captured if e == "resolve_buttons.unknown_ids_dropped")
+    assert "typo_id_999" in fields["dropped"]
+
+
+async def test_resolve_buttons_emits_fell_back_warning_when_all_dropped() -> None:
+    """If the CMS supplied *only* unknown ids, the helper falls back
+    to defaults entirely — and emits ``resolve_buttons.fell_back_to_defaults``
+    so the SME sees buttons but the monitor logs the portal editor
+    had nothing valid for the agent."""
+    platform = build_onboarding_platform(
+        cms=_StubCms(
+            _StubCmsRecord({
+                "buttons": [
+                    {"id": "all_typos_1", "label": "X"},
+                    {"id": "all_typos_2", "label": "Y"},
+                ],
+            })
+        )
+    )
+    captured: list[tuple[str, dict[str, Any]]] = []
+    out = await platform.workflow._resolve_buttons(  # noqa: SLF001
+        "onboarding.invoice.confirm",
+        platform.workflow.BUTTON_DEFAULTS["onboarding.invoice.confirm"],
+        locale=None,
+        channel=Channel.WHATSAPP,
+        ctx=_stub_ctx(captured),
+    )
+    default = platform.workflow.BUTTON_DEFAULTS["onboarding.invoice.confirm"]
+    assert out == default
+    events = [e for e, _ in captured]
+    assert "resolve_buttons.fell_back_to_defaults" in events
+
+
 def test_button_defaults_cover_every_call_site() -> None:
     """Lock the contract: every reply-button site the agent emits today
     has an entry in ``BUTTON_DEFAULTS``. If a new site is added without

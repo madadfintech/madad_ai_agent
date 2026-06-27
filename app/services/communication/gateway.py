@@ -15,6 +15,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+import structlog
 from pydantic import BaseModel
 
 from app.shared.mcp import MCPToolCaller, Tools
@@ -23,6 +24,8 @@ from app.shared.workflow.utils import new_id
 
 from .errors import GatewayError
 from .models import Message
+
+_LOG = structlog.get_logger(__name__)
 
 
 class OutboundDispatchResult(BaseModel):
@@ -238,9 +241,18 @@ def _build_outbound_payload(channel: Channel, message: Message) -> dict[str, Any
     if channel is Channel.EMAIL:
         # Arbitrary-content email via madad_external_send_email_text: subject +
         # body. Subject comes from the message metadata when the step supplies
-        # one, else a sensible default. (Was previously the OTP tool, which
-        # discarded the body.)
-        subject = (message.metadata or {}).get("subject") or _DEFAULT_EMAIL_SUBJECT
+        # one, else a sensible default. With CMS-seeded subjects (M1, 2026-06-28)
+        # the default should never fire on a templated email — log so the
+        # monitor surfaces it for the missing-subject row.
+        supplied = (message.metadata or {}).get("subject") if message.metadata else None
+        subject = supplied or _DEFAULT_EMAIL_SUBJECT
+        if not supplied:
+            _LOG.warning(
+                "email_send.subject_fallback",
+                template=getattr(message, "template_key", None),
+                identity=message.identity,
+                note="email sent with default subject; CMS template missing data.subject",
+            )
         return {
             "to": message.identity,
             "subject": str(subject),

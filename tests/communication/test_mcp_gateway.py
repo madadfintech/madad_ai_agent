@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from app.core.config import McpSettings
@@ -54,6 +56,56 @@ async def test_email_routes_to_email_text_tool() -> None:
 
     await gateway.send(_msg(Channel.EMAIL))
     assert caller.calls[0][0] == Tools.EXT_SEND_EMAIL_TEXT
+
+
+async def test_email_send_with_subject_uses_supplied_subject() -> None:
+    """A templated email with ``metadata.subject`` supplied threads it
+    into the outbound tool payload — and does NOT fall back to the
+    default. M1: with seeded subjects on every email-relevant template,
+    the default subject path should never fire."""
+    caller = InMemoryMCPClient(handlers={Tools.EXT_SEND_EMAIL_TEXT: lambda p: {"accepted": True}})
+    gateway = McpCommunicationGateway(caller)
+
+    msg = _msg(Channel.EMAIL)
+    msg.metadata = {"subject": "Madad — Welcome Back"}
+    await gateway.send(msg)
+
+    sent_payload = caller.calls[0][1]
+    assert sent_payload["subject"] == "Madad — Welcome Back"
+
+
+async def test_email_send_without_subject_falls_back_and_emits_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An email sent WITHOUT a subject (template missing ``data.subject``
+    or non-templated send) trips ``email_send.subject_fallback`` so the
+    monitor flags the gap. This is the M1 deviation rule. Asserts both
+    the BEHAVIOURAL fallback (tool received the default subject) and
+    the LOG emit (structlog warning fired) — the monitor rule keys on
+    the latter."""
+    from app.services.communication import gateway as gateway_mod
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    class _StubLogger:
+        def warning(self, event: str, **fields: Any) -> None:
+            captured.append((event, fields))
+
+        def __getattr__(self, _name: str) -> Any:
+            return lambda *a, **k: None
+
+    monkeypatch.setattr(gateway_mod, "_LOG", _StubLogger())
+
+    caller = InMemoryMCPClient(handlers={Tools.EXT_SEND_EMAIL_TEXT: lambda p: {"accepted": True}})
+    gateway = McpCommunicationGateway(caller)
+
+    await gateway.send(_msg(Channel.EMAIL))  # no metadata.subject
+
+    sent_payload = caller.calls[0][1]
+    assert "Madad Financing" in sent_payload["subject"]  # fell back to default
+    assert any(e == "email_send.subject_fallback" for e, _ in captured), (
+        f"expected email_send.subject_fallback emit; got: {captured}"
+    )
 
 
 async def test_transport_failure_is_normalised_to_gateway_error():

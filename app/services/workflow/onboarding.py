@@ -2768,6 +2768,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         *,
         locale: Any = None,
         channel: Channel | None = None,
+        ctx: WorkflowContext | None = None,
     ) -> list[tuple[str, str]]:
         """Look up the CMS-stored ``data.buttons`` array for a template;
         fall back to ``default`` when the CMS isn't reachable or the
@@ -2775,7 +2776,16 @@ class OnboardingWorkflow(WorkflowDefinition):
         ``(stable_id, operator_editable_label)`` — IDs MUST match the
         agent's intent map (see ``BUTTON_DEFAULTS``). Unknown IDs from
         the CMS are silently skipped so an editor mistake can't
-        introduce a click-to-nowhere button."""
+        introduce a click-to-nowhere button.
+
+        When ``ctx`` is supplied, every silent-fallback path emits a
+        structured log so the monitor can surface CMS faults / portal
+        editor mistakes that would otherwise be invisible at runtime
+        (the SME still sees buttons because of the fallback)."""
+
+        def _log_warn(event: str, **fields: Any) -> None:
+            if ctx is not None:
+                ctx.logger.warning(event, template_key=template_key, **fields)
 
         if self._cms is None:
             return default
@@ -2786,7 +2796,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             record = await self._cms.get_template(
                 template_key, loc, channel=channel,
             )
-        except Exception:  # noqa: BLE001 — CMS fault must never block the agent
+        except Exception as exc:  # noqa: BLE001 — CMS fault must never block the agent
+            _log_warn("resolve_buttons.cms_fault", error=str(exc)[:200])
             return default
         if record is None:
             return default
@@ -2796,6 +2807,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             return default
         valid_ids = {bid for bid, _ in default}
         out: list[tuple[str, str]] = []
+        dropped_unknown: list[str] = []
         for spec in cms_buttons:
             if not isinstance(spec, dict):
                 continue
@@ -2805,10 +2817,24 @@ class OnboardingWorkflow(WorkflowDefinition):
                 continue
             if bid not in valid_ids:
                 # Unknown id — no intent mapping for it. Skip rather than
-                # render a button that does nothing on click.
+                # render a button that does nothing on click. Surface so
+                # the portal editor mistake gets fixed.
+                dropped_unknown.append(bid)
                 continue
             out.append((bid, label))
-        return out or default
+        if dropped_unknown:
+            _log_warn(
+                "resolve_buttons.unknown_ids_dropped",
+                dropped=",".join(dropped_unknown[:5]),
+                valid=",".join(sorted(valid_ids)),
+            )
+        if not out:
+            _log_warn(
+                "resolve_buttons.fell_back_to_defaults",
+                reason="cms_buttons_all_dropped_or_empty",
+            )
+            return default
+        return out
 
     async def _registered_route_send(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -4286,6 +4312,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                         ],
                         locale=state.locale,
                         channel=ctx.channel,
+                        ctx=ctx,
                     )
                     sent_btn = await send_buttons(
                         channel=_channel(ctx),
@@ -4862,6 +4889,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                     ],
                     locale=state.locale,
                     channel=ctx.channel,
+                    ctx=ctx,
                 )
                 sent = await send_buttons(
                     channel=_channel(ctx),
@@ -7082,6 +7110,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                     self.BUTTON_DEFAULTS["onboarding.invoice.confirm"],
                     locale=state.locale,
                     channel=ctx.channel,
+                    ctx=ctx,
                 )
                 sent = await send_buttons(
                     channel=_channel(ctx),
@@ -7771,6 +7800,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                     self.BUTTON_DEFAULTS["onboarding.invoice.batch.csv_review"],
                     locale=state.locale,
                     channel=ctx.channel,
+                    ctx=ctx,
                 )
                 sent_btn = await send_buttons(
                     channel=_channel(ctx),

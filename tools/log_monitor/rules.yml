@@ -142,6 +142,44 @@ rules:
     severity: warning
     description: Agent fell back to DEFAULT_WHATSAPP_REQUIRED_DOCS — CMS checklist is empty/missing. Verify CMS seed + the canonical key (onboarding.whatsapp.required_docs).
 
+  # Reply-button label lookup hit a CMS fault. Returned defaults so SME UX is
+  # intact, but ops-side editing via the portal is silently broken until CMS
+  # heals. With Ishan's portal live, this firing means the CMS is the
+  # bottleneck (not the agent). High signal, low noise — fires only on real
+  # CMS unavailability.
+  - name: resolve_buttons_cms_fault
+    pattern: 'resolve_buttons\.cms_fault'
+    severity: warning
+    description: Reply-button CMS lookup raised — agent fell back to coded defaults. Portal editing of labels is currently a no-op for this template. Check CMS health.
+
+  # Portal editor saved a button with an id the agent doesn't listen for.
+  # The unknown id is dropped at render so the SME never clicks a dead
+  # button, but the portal row needs fixing — only the 9 stable ids in
+  # OnboardingWorkflow.BUTTON_DEFAULTS are wired to intents.
+  - name: resolve_buttons_unknown_id
+    pattern: 'resolve_buttons\.unknown_ids_dropped'
+    severity: warning
+    description: Portal saved a button with an id the agent does NOT route. Dropped at render. Pin the editor against the 9 stable ids in BUTTON_DEFAULTS.
+
+  # CMS-supplied buttons were all invalid (every id unknown or every label
+  # blank) — agent rendered the coded defaults instead of the operator-
+  # authored labels. Catches an "all rows broken" portal state.
+  - name: resolve_buttons_fully_fell_back
+    pattern: 'resolve_buttons\.fell_back_to_defaults'
+    severity: warning
+    description: Every CMS-supplied button was invalid; agent rendered coded defaults. Portal row needs a full fix-up — check ids AND labels.
+
+  # An email send went out WITHOUT a subject in metadata, so the gateway
+  # used the fallback ``Madad Financing — update on your application``.
+  # With seeded subjects on every email-relevant template (Item 4), this
+  # should NEVER fire in normal traffic — fires means the template lost
+  # its data.subject field or someone added a new email template without
+  # one. Check the CMS row.
+  - name: email_subject_fallback
+    pattern: 'email_send\.subject_fallback'
+    severity: warning
+    description: Email send used the default subject — the CMS template is missing data.subject. Seed it via cms_export_import or the portal.
+
 
 # Behavioral rules — match deviations from EXPECTED behavior. The line-by-
 # line regex rules above catch crashes; these catch the QA-bug class

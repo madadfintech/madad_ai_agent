@@ -2,6 +2,10 @@
 
 Drives the onboarding workflow:
 * ``POST /workflow/campaign/start`` — start onboarding (campaign entry / Step 0)
+* ``POST /workflow/campaign/broadcast`` — bulk start via CSV upload (Step 0
+  for many SMEs at a controlled rate). See :mod:`.broadcast`.
+* ``GET  /workflow/campaign/broadcast`` — recent broadcast batches index.
+* ``GET  /workflow/campaign/broadcast/{batch_id}`` — one batch's live status.
 * ``POST /workflow/inbound``        — feed an inbound channel message
   (start / resume on user reply).
 * ``POST /workflow/madad/events/{event_type}`` — backend webhook chokepoint.
@@ -19,16 +23,39 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.core.app import create_service_app
+from app.core.config import settings as default_settings
 from app.core.security import require_admin, verify_webhook_signature
 from app.shared.events import connect_forwarders, get_event_bus
 from app.shared.workflow import Channel, ExecutionResult
 from app.shared.workflow.errors import SessionNotFoundError
 
+from .broadcast import (
+    DEFAULT_RATE_PER_MINUTE,
+    MAX_RATE_PER_MINUTE,
+    BroadcastBatch,
+    BroadcastCoordinator,
+    BroadcastStore,
+    BroadcastSubmitResult,
+    InMemoryBroadcastStore,
+    RedisBroadcastStore,
+    make_batch_id,
+    parse_csv,
+    summarize_invalid_rows,
+)
 from .deps import OnboardingPlatform, get_onboarding_platform
 from .dispatcher import UnknownEventTypeError
 
@@ -218,6 +245,190 @@ async def start_campaign(req: CampaignStartRequest, platform: Platform) -> RunSt
             cancelled=cancelled_runs,
         )
     return RunStatusDTO.from_result(result)
+
+
+# ---------------------------------------------------------------------------
+# Bulk campaign broadcast (CSV upload → rate-limited fan-out)
+# ---------------------------------------------------------------------------
+# CTO-decided defaults (2026-06-28; see ``broadcast.py`` module docstring):
+# rate 30/min default, ceiling 60; CSV cols phone[+locale,name,tags]; best-
+# effort per-row dispatch; 24h idempotency; 7-day batch retention; max 5000
+# rows/batch. Reuses the per-(channel, identity) dedup the single-identity
+# endpoint already enforces, so retried rows are safe.
+
+
+_broadcast_store: BroadcastStore | None = None
+
+
+def get_broadcast_store() -> BroadcastStore:
+    """Process-singleton broadcast store.
+
+    Uses Redis when a URL is configured; falls back to an in-memory
+    store so the workflow service still boots in dev / tests without
+    Redis. The Redis client connects lazily on first use.
+    """
+    global _broadcast_store
+    if _broadcast_store is None:
+        if default_settings.redis.url:
+            _broadcast_store = RedisBroadcastStore(
+                url=default_settings.redis.url,
+                key_prefix=default_settings.redis.key_prefix,
+            )
+        else:
+            _broadcast_store = InMemoryBroadcastStore()
+    return _broadcast_store
+
+
+Store = Annotated[BroadcastStore, Depends(get_broadcast_store)]
+
+
+async def _start_one_for_broadcast(
+    platform: OnboardingPlatform,
+    *,
+    channel: Channel,
+    identity: str,
+    locale: str,
+) -> Any:
+    """Per-row entry point invoked by the BroadcastCoordinator.
+
+    Mirrors ``start_campaign`` minus the HTTP plumbing: same atomic
+    idempotency lock, same predecessor-cancellation behaviour, same
+    ``runtime.start`` call. Errors propagate so the coordinator can
+    record them in the batch's ``failures`` list.
+    """
+    from app.core.logging import get_logger as _bcast_log
+
+    _ch = str(getattr(channel, "value", channel)).lower()
+    lock_key = f"campaign_start:{_ch}:{identity}"
+    dedupe = platform.dispatcher._dedupe  # noqa: SLF001
+    claimed = await dedupe.claim(lock_key, ttl_seconds=30)
+    if not claimed:
+        existing = await _find_active_run(platform, channel, identity)
+        if existing is not None:
+            _bcast_log("workflow.broadcast").info(
+                "broadcast.row_deduped",
+                identity=identity, channel=str(channel),
+                existing_run=existing.run_id,
+            )
+            return existing
+    await _cancel_active_runs_for(platform, channel, identity)
+    return await platform.runtime.start(
+        "onboarding", channel, identity,
+        input={"trigger": "campaign", "locale": locale},
+    )
+
+
+@app.post("/workflow/campaign/broadcast", response_model=BroadcastSubmitResult, status_code=202)
+async def submit_broadcast(
+    background: BackgroundTasks,
+    platform: Platform,
+    store: Store,
+    file: Annotated[UploadFile, File(description="CSV with required column 'phone'.")],
+    channel: Annotated[Channel, Form()] = Channel.WHATSAPP,
+    idempotency_key: Annotated[str, Form(min_length=8, max_length=200)] = ...,  # type: ignore[assignment]
+    dry_run: Annotated[bool, Form()] = False,
+    rate_per_minute: Annotated[int, Form(ge=1, le=MAX_RATE_PER_MINUTE)] = DEFAULT_RATE_PER_MINUTE,
+    submitted_by: Annotated[str | None, Form()] = None,
+) -> BroadcastSubmitResult:
+    """Bulk start: upload a CSV of SMEs, get back a batch_id, watch progress.
+
+    Behaviour
+    ---------
+    * Validates the CSV up-front. Returns 400 if the file is unreadable
+      or missing the required ``phone`` column.
+    * Per-row issues (bad phone format, unsupported locale) are NOT
+      fatal — they're returned in ``invalid_details`` and skipped.
+    * Idempotency: re-submitting with the same ``idempotency_key``
+      returns the original batch_id (no new work scheduled).
+      ``deduped=true`` in the response distinguishes the case.
+    * Status 202 always when accepted — the background coordinator
+      runs after the response is sent.
+    """
+    if idempotency_key in (None, "", Ellipsis):
+        raise HTTPException(422, "idempotency_key is required")
+
+    raw = await file.read()
+    rows, fatal = parse_csv(raw)
+    if fatal:
+        raise HTTPException(400, {"errors": fatal})
+
+    proposed_batch_id = make_batch_id()
+    from .broadcast import IDEMPOTENCY_TTL_SECONDS
+    actual_batch_id = await store.claim_idempotency(
+        idempotency_key, proposed_batch_id,
+        ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
+    )
+    deduped = actual_batch_id != proposed_batch_id
+    if deduped:
+        existing = await store.get_batch(actual_batch_id)
+        if existing is not None:
+            return BroadcastSubmitResult(
+                batch_id=existing.batch_id,
+                idempotency_key=existing.idempotency_key,
+                deduped=True,
+                total_rows=existing.total_rows,
+                valid_rows=existing.valid_rows,
+                invalid_rows=existing.invalid_rows,
+                invalid_details=[],
+                started_at=existing.started_at,
+                status=existing.status,
+            )
+        # Idem key claimed but the batch record disappeared (TTL expired
+        # for instance). Fall through and treat this as a fresh start.
+
+    valid_rows = [r for r in rows if r.valid]
+    invalid = summarize_invalid_rows(rows)
+    batch = BroadcastBatch(
+        batch_id=actual_batch_id,
+        idempotency_key=idempotency_key,
+        channel=channel,
+        total_rows=len(rows),
+        valid_rows=len(valid_rows),
+        invalid_rows=len(rows) - len(valid_rows),
+        rate_per_minute=int(rate_per_minute),
+        dry_run=bool(dry_run),
+        submitted_by=submitted_by,
+        invalid_details=invalid,
+    )
+    await store.save_batch(batch)
+
+    async def _start_one(*, channel: Channel, identity: str, locale: str) -> Any:
+        return await _start_one_for_broadcast(
+            platform, channel=channel, identity=identity, locale=locale,
+        )
+
+    coordinator = BroadcastCoordinator(store, _start_one)
+    background.add_task(coordinator.process, batch, rows)
+
+    return BroadcastSubmitResult(
+        batch_id=batch.batch_id,
+        idempotency_key=batch.idempotency_key,
+        deduped=False,
+        total_rows=batch.total_rows,
+        valid_rows=batch.valid_rows,
+        invalid_rows=batch.invalid_rows,
+        invalid_details=invalid,
+        started_at=batch.started_at,
+        status=batch.status,
+    )
+
+
+@app.get("/workflow/campaign/broadcast/{batch_id}", response_model=BroadcastBatch)
+async def get_broadcast(batch_id: str, store: Store) -> BroadcastBatch:
+    """Live status for a batch. Polled by the portal to render a progress bar."""
+    batch = await store.get_batch(batch_id)
+    if batch is None:
+        raise HTTPException(404, "broadcast batch not found (may have expired)")
+    return batch
+
+
+@app.get("/workflow/campaign/broadcast", response_model=list[BroadcastBatch])
+async def list_broadcasts(store: Store) -> list[BroadcastBatch]:
+    """Most recent batches, newest first. 7-day retention; capped at 50."""
+    return await store.list_recent()
+
+
+# ---------------------------------------------------------------------------
 
 
 async def _find_active_run(

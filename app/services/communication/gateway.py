@@ -253,9 +253,20 @@ def _build_outbound_payload(channel: Channel, message: Message) -> dict[str, Any
                 identity=message.identity,
                 note="email sent with default subject; CMS template missing data.subject",
             )
-        return {
+        payload: dict[str, Any] = {
             "to": message.identity,
             "subject": str(subject),
             "body_text": message.text or "",
         }
+        # Email threading (UAT 2026-06-28). When the conversation already
+        # has a root Message-ID, the comms service stamps it on
+        # ``metadata.in_reply_to``; pass it through so the email tool
+        # writes the ``In-Reply-To`` / ``References`` headers. SME inbox
+        # then sees a single thread instead of a disjoint message per
+        # outbound. The MCP tool MUST honour these fields; see the
+        # Ishan handoff for the contract.
+        in_reply_to = (message.metadata or {}).get("in_reply_to") if message.metadata else None
+        if in_reply_to:
+            payload["in_reply_to"] = str(in_reply_to)
+        return payload
     return {"to": message.identity, "body": message.text or ""}

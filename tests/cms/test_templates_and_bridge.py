@@ -86,6 +86,97 @@ async def test_subject_round_trips_through_cms_and_bridge(cms):
     assert tpl.subject == "Madad — Your Application Result & Next Step"
 
 
+async def test_email_in_reply_to_propagates_from_conversation_thread_ref():
+    """End-to-end: when the conversation already has a root
+    ``external_thread_ref`` (set by an earlier outbound's Message-ID),
+    the NEXT email outbound carries it as ``metadata.in_reply_to`` so
+    Ishan's email tool can stamp the ``In-Reply-To`` header. WhatsApp
+    leaves ``external_thread_ref`` unset, so no header threads through
+    on that channel."""
+
+    cms = build_cms_service()
+    await cms.upsert_template(
+        "onboarding.welcome_back", Locale.EN, "Welcome back!",
+        subject="Madad — Welcome Back",
+    )
+    comms = build_communication_service(template_provider=CmsTemplateProvider(cms))
+
+    # Pre-populate the conversation with a root Message-ID — the
+    # situation after the FIRST outbound, where Ishan's tool returned
+    # an assigned Message-ID we stored as ``external_thread_ref``.
+    convo = await comms._resolve_conversation(  # noqa: SLF001
+        Channel.EMAIL, "biz@example.com",
+        external_thread_ref="outbound.001@madad",
+    )
+    convo.external_thread_ref = "outbound.001@madad"
+    await comms._conversations.save(convo)  # noqa: SLF001
+
+    message = await comms.send(
+        OutboundMessageRequest(
+            channel=Channel.EMAIL,
+            identity="biz@example.com",
+            template_key="onboarding.welcome_back",
+            variables={},
+        )
+    )
+    assert message.metadata.get("in_reply_to") == "outbound.001@madad"
+
+
+async def test_email_in_reply_to_can_be_overridden_by_caller():
+    """Caller-supplied ``metadata.in_reply_to`` always wins — even if
+    the conversation has a different root Message-ID. Lets the agent
+    send a "Re: this one specific email" reply when needed."""
+    cms = build_cms_service()
+    await cms.upsert_template(
+        "onboarding.welcome_back", Locale.EN, "Welcome back!",
+        subject="Madad — Welcome Back",
+    )
+    comms = build_communication_service(template_provider=CmsTemplateProvider(cms))
+    convo = await comms._resolve_conversation(  # noqa: SLF001
+        Channel.EMAIL, "biz@example.com",
+        external_thread_ref="outbound.001@madad",
+    )
+    convo.external_thread_ref = "outbound.001@madad"
+    await comms._conversations.save(convo)  # noqa: SLF001
+
+    message = await comms.send(
+        OutboundMessageRequest(
+            channel=Channel.EMAIL,
+            identity="biz@example.com",
+            template_key="onboarding.welcome_back",
+            variables={},
+            metadata={"in_reply_to": "specific.0099@madad"},
+        )
+    )
+    assert message.metadata.get("in_reply_to") == "specific.0099@madad"
+
+
+async def test_whatsapp_does_not_pick_up_in_reply_to():
+    """Even if the conversation has an ``external_thread_ref`` for
+    some weird reason, WhatsApp sends MUST NOT carry ``in_reply_to``
+    — the WhatsApp tool would reject the unknown field."""
+    cms = build_cms_service()
+    await cms.upsert_template(
+        "onboarding.welcome_back", Locale.EN, "Welcome back!",
+    )
+    comms = build_communication_service(template_provider=CmsTemplateProvider(cms))
+    convo = await comms._resolve_conversation(  # noqa: SLF001
+        Channel.WHATSAPP, "+97455500001",
+    )
+    convo.external_thread_ref = "outbound.001@madad"
+    await comms._conversations.save(convo)  # noqa: SLF001
+
+    message = await comms.send(
+        OutboundMessageRequest(
+            channel=Channel.WHATSAPP,
+            identity="+97455500001",
+            template_key="onboarding.welcome_back",
+            variables={},
+        )
+    )
+    assert "in_reply_to" not in (message.metadata or {})
+
+
 async def test_bridge_threads_subject_into_outbound_metadata():
     """End-to-end: an email-channel send rendered through the CMS bridge
     arrives at the gateway with ``metadata.subject`` set. The bridge

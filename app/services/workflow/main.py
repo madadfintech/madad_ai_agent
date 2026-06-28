@@ -31,6 +31,7 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    Request,
     UploadFile,
 )
 from fastapi.responses import JSONResponse
@@ -58,6 +59,7 @@ from .broadcast import (
 )
 from .deps import OnboardingPlatform, get_onboarding_platform
 from .dispatcher import UnknownEventTypeError
+from .email_inbound import SendgridInboundParser, to_inbound_request_dict
 
 
 @asynccontextmanager
@@ -541,6 +543,85 @@ async def inbound(
         waiting=result.waiting,
         completed=result.completed,
     )
+    return RunStatusDTO.from_result(result)
+
+
+# ---------------------------------------------------------------------------
+# Inbound email bridge — SendGrid Inbound Parse (also Mailgun-compatible)
+# ---------------------------------------------------------------------------
+# Translates an ESP webhook into our normalised :class:`InboundRequest`
+# shape and forwards through the same dispatcher the WhatsApp inbound
+# uses. The ESP is configured to POST parsed inbound emails to this URL.
+#
+# Threading: extracted ``In-Reply-To`` / ``References`` headers + the
+# inbound's own ``Message-ID`` are surfaced on ``data`` so future code
+# can match an email back to a known conversation. The current dispatch
+# still routes by ``(channel, identity)`` — the SME's email address —
+# which is the channel-is-identity principle.
+
+
+@app.post("/workflow/inbound/email/sendgrid", response_model=None)
+async def inbound_email_sendgrid(
+    request: Request, platform: Platform,
+) -> RunStatusDTO | JSONResponse:
+    """Receive a parsed inbound email from SendGrid Inbound Parse.
+
+    Webhook configuration on the SendGrid side: point Inbound Parse at
+    this URL with ``POST URL`` set to ``https://<workflow-host>/workflow
+    /inbound/email/sendgrid``. The same shape works for Mailgun Routes
+    (multipart/form-data with the same field names).
+    """
+    from app.core.logging import get_logger as _dbg_get_logger
+
+    form = await request.form()
+    text_fields: dict[str, str] = {}
+    files: dict[str, tuple[str, bytes, str | None]] = {}
+    for key in form.keys():
+        # multipart/form-data fields can repeat; the SendGrid contract
+        # uses unique keys for the fields we consume.
+        val = form[key]
+        # Detect file parts structurally — UploadFile is the runtime class
+        # but the precise import path differs between starlette and
+        # fastapi shims. ``filename`` is the contractual marker.
+        filename = getattr(val, "filename", None)
+        if filename is not None and hasattr(val, "read"):
+            content = await val.read()
+            content_type = getattr(val, "content_type", None)
+            files[str(key)] = (filename, content, content_type)
+        else:
+            text_fields[str(key)] = str(val)
+
+    parser = SendgridInboundParser(form=text_fields, files=files)
+    parsed = parser.parse()
+    if parsed is None:
+        _dbg_get_logger("workflow.inbound.email").warning(
+            "email_inbound.sendgrid.no_sender",
+            form_keys=sorted(text_fields.keys()),
+        )
+        return JSONResponse(
+            status_code=400,
+            content={"error": "could not extract sender from inbound email"},
+        )
+
+    inbound_dict = to_inbound_request_dict(parsed)
+    _dbg_get_logger("workflow.inbound.email").info(
+        "email_inbound.sendgrid.parsed",
+        sender=parsed.sender,
+        subject=parsed.subject,
+        attachments=len(parsed.attachments),
+        in_reply_to=parsed.in_reply_to,
+        message_id=parsed.message_id,
+    )
+    result = await platform.dispatcher.inbound(
+        inbound_dict["channel"],
+        inbound_dict["identity"],
+        text=inbound_dict["text"],
+        attachments=inbound_dict["attachments"],
+        data=inbound_dict["data"] or None,
+        message_id=inbound_dict["message_id"],
+    )
+    if result is None:
+        return JSONResponse(status_code=200, content={"deduped": True})
     return RunStatusDTO.from_result(result)
 
 

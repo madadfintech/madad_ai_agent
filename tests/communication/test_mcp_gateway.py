@@ -74,6 +74,40 @@ async def test_email_send_with_subject_uses_supplied_subject() -> None:
     assert sent_payload["subject"] == "Madad — Welcome Back"
 
 
+async def test_email_send_threads_in_reply_to_from_metadata() -> None:
+    """A reply email — conversation already has ``external_thread_ref``
+    pointing at the first outbound's Message-ID — must carry it as
+    ``in_reply_to`` in the tool payload so Ishan's email tool can stamp
+    the ``In-Reply-To`` / ``References`` headers."""
+    caller = InMemoryMCPClient(handlers={Tools.EXT_SEND_EMAIL_TEXT: lambda p: {"accepted": True}})
+    gateway = McpCommunicationGateway(caller)
+
+    msg = _msg(Channel.EMAIL)
+    msg.metadata = {
+        "subject": "Re: Your application",
+        "in_reply_to": "outbound.001@madad",
+    }
+    await gateway.send(msg)
+
+    sent_payload = caller.calls[0][1]
+    assert sent_payload["in_reply_to"] == "outbound.001@madad"
+
+
+async def test_email_send_without_in_reply_to_omits_field() -> None:
+    """First-outbound case — no thread anchor exists yet. The payload
+    must NOT carry an empty ``in_reply_to`` because Ishan's email tool
+    will (correctly) reject it as an invalid header value."""
+    caller = InMemoryMCPClient(handlers={Tools.EXT_SEND_EMAIL_TEXT: lambda p: {"accepted": True}})
+    gateway = McpCommunicationGateway(caller)
+
+    msg = _msg(Channel.EMAIL)
+    msg.metadata = {"subject": "Welcome"}
+    await gateway.send(msg)
+
+    sent_payload = caller.calls[0][1]
+    assert "in_reply_to" not in sent_payload
+
+
 async def test_email_send_without_subject_falls_back_and_emits_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

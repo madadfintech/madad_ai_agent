@@ -213,6 +213,19 @@ class CommunicationService:
         merged_metadata = dict(request.metadata or {})
         if rendered_subject and "subject" not in merged_metadata:
             merged_metadata["subject"] = rendered_subject
+        # Email threading (UAT 2026-06-28, item 3 of email-completeness).
+        # When the conversation already has a root Message-ID
+        # (``external_thread_ref``), surface it on metadata so the gateway
+        # can pass it as ``in_reply_to`` to the email MCP tool — which in
+        # turn stamps the ``In-Reply-To`` / ``References`` headers, so the
+        # SME's inbox sees one continuous thread instead of fresh emails.
+        # WhatsApp ignores this. Caller-supplied value always wins.
+        if (
+            request.channel is Channel.EMAIL
+            and conversation.external_thread_ref
+            and "in_reply_to" not in merged_metadata
+        ):
+            merged_metadata["in_reply_to"] = conversation.external_thread_ref
         message = Message(
             conversation_id=conversation.conversation_id,
             channel=request.channel,

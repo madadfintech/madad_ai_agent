@@ -1,5 +1,24 @@
 # Madad log monitor
 
+> **🔒 FROZEN SNAPSHOT — DO NOT EDIT IN PLACE**
+>
+> This directory is a **frozen snapshot** of the AEGIS log-monitor sidecar
+> as it existed at AEGIS commit `3e72019` (2026-06-29). It ships with the
+> MADAD agent so the staging deploy keeps working without external
+> dependencies.
+>
+> **Canonical source lives at:** https://github.com/JathishNamboothiri/aegis
+>
+> If you find a bug or want a new rule, fix it in the AEGIS repo. If MADAD
+> needs the fix, re-sync this directory from a tagged AEGIS release. Do NOT
+> patch this directory directly — your changes will diverge silently from
+> the canonical version every other deployment uses.
+>
+> The AEGIS platform is evolving independently; MADAD gets this snapshot
+> as-is for free, with no commitment to future feature parity.
+
+---
+
 A small diagnostic sidecar that tails docker logs for every `madad_*`
 container, filters lines through a configurable rule set, and writes
 matches to a host-mounted issues log file plus an admin HTTP API.

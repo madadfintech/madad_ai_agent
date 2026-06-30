@@ -103,6 +103,13 @@ from .ports import (
 from .state import JourneyStatus, OnboardingState, is_no, is_yes, reply_attachments, reply_text
 from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
 
+# Prod cutover: the portal link in agent messages is env-driven so production
+# sends the PROD portal, not UAT. ``PORTAL_URL`` is the full URL; ``PORTAL_HOST``
+# the bare host used inside message copy ("log in to <host> …"). Defaults to the
+# prod portal; set PORTAL_URL in the environment to override (e.g. UAT).
+PORTAL_URL = os.getenv("PORTAL_URL", "https://portal.madadfintech.com").rstrip("/")
+PORTAL_HOST = PORTAL_URL.split("://", 1)[-1]
+
 # QAR 6,000 is the current monetization onboarding fee (Madad ops M-5 may
 # vary it by segment later — the workflow falls back to whatever the
 # products tool reports; this is the safety default if no products land).
@@ -998,7 +1005,7 @@ def _format_limit_answer(currency: str, limit: Any, available: Any) -> str:
     if limit is None and available is None:
         return (
             "I don't have your credit line details to hand right now. Please "
-            "log in to uat-portal.madadfintech.com to see your approved "
+            f"log in to {PORTAL_HOST} to see your approved "
             "limit, or call us on +974 3017 3888."
         )
     pieces: list[str] = []
@@ -1024,7 +1031,7 @@ def _format_disbursed_answer(total: int, currency: str) -> str:
         f"💸 Total disbursed so far: {_fmt_qar(total, currency)} "
         "(this number reflects what I've seen come through this chat). "
         "For the authoritative figure across all invoices, check "
-        "uat-portal.madadfintech.com."
+        f"{PORTAL_HOST}."
     )
 
 
@@ -1035,7 +1042,7 @@ def _format_due_answer(
         return (
             "I don't have an outstanding balance recorded yet — once a "
             "repayment update arrives I'll have the number ready. You can "
-            "also check uat-portal.madadfintech.com any time."
+            f"also check {PORTAL_HOST} any time."
         )
     pieces: list[str] = []
     if outstanding is not None:
@@ -2875,7 +2882,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         SCENARIO_BY_ROUTE: dict[str, str] = {
             "portal_login_required": (
                 "Your application is being managed on the Madad portal. "
-                "Please log in at uat-portal.madadfintech.com to continue."
+                f"Please log in at {PORTAL_HOST} to continue."
             ),
             "invoice_discounting": (
                 "🎉 Your credit line is already active — send any invoice "
@@ -2889,7 +2896,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             ),
             "offers_available": (
                 "🎉 Your financing offers are ready to review. Log in at "
-                "uat-portal.madadfintech.com to compare them side by side "
+                f"{PORTAL_HOST} to compare them side by side "
                 "and pick the one you want."
             ),
             "payment_received": (
@@ -2900,7 +2907,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             "payment_link": (
                 "You're qualified for financing — please complete the QAR "
                 "6,000 onboarding fee to forward your application to the "
-                "banks. Log in at uat-portal.madadfintech.com to pay or "
+                f"banks. Log in at {PORTAL_HOST} to pay or "
                 "reply 'pay' and I'll re-send the link."
             ),
             "continue_step": (
@@ -3080,7 +3087,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "answer": (
                     "Your application is open — we need a little more "
                     "information to proceed. Please log in to the Madad portal "
-                    "at uat-portal.madadfintech.com to see what's required, or "
+                    f"at {PORTAL_HOST} to see what's required, or "
                     "contact support@madadfintech.com and our team will help."
                 ),
                 "next_step": "",

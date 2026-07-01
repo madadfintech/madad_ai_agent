@@ -125,7 +125,7 @@ class McpSettings(BaseModel):
     """
 
     enabled: bool = False
-    endpoint: str = "https://madad-mcp-cluster-626656664233.me-central1.run.app/mcp"
+    endpoint: str = "https://madad-mcp-server-716716760991.me-central1.run.app/mcp"
     transport: str = "streamable-http"  # informational; only one transport today
     protocol_version: str = "2025-06-18"  # MCP spec version we target
 

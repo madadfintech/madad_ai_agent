@@ -1,7 +1,7 @@
 """Central registry of MCP tool names — single source of truth for the catalog.
 
 Mirrors the deployed catalog at
-``https://madad-mcp-cluster-626656664233.me-central1.run.app/mcp`` (Ishan's
+``https://madad-mcp-server-716716760991.me-central1.run.app/mcp`` (Ishan's
 ``madadfintech/madad_ai_mcp_cluster`` repo, ``main`` branch). Tool names below
 are stable and validated against ``tools/list`` on the live server.
 

@@ -226,7 +226,7 @@ Highlights (see `.env.example` for the full list):
 The platform interacts with Madad backend systems **only** through the MCP
 cluster: [`madadfintech/madad_ai_mcp_cluster`](https://github.com/madadfintech/madad_ai_mcp_cluster).
 
-- **Deployed at:** `https://madad-mcp-cluster-626656664233.me-central1.run.app/mcp`
+- **Deployed at:** `https://madad-mcp-server-716716760991.me-central1.run.app/mcp`
 - **Transport:** official MCP JSON-RPC over Streamable HTTP (Anthropic `fastmcp` SDK)
 - **Catalog:** 59 tools across six groups (auth, external communications, MCP
   agent orchestration, KYC, offers, monetization payments)

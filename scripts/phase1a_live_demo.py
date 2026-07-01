@@ -24,7 +24,7 @@ Usage::
         --base-url        http://34.18.50.97:8001 \\
         --jwt-secret      "$AGENT_JWT_SECRET" \\
         --webhook-secret  "$AGENT_WEBHOOK_SECRET" \\
-        --mcp-endpoint    https://madad-mcp-cluster-626656664233.me-central1.run.app/mcp \\
+        --mcp-endpoint    https://madad-mcp-server-716716760991.me-central1.run.app/mcp \\
         --mcp-token       "$MCP_AUTH_TOKEN" \\
         --your-phone      +919497191690 \\
         --your-email      jathish.namboothiri@gmail.com \\

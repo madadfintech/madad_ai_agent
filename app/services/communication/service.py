@@ -297,6 +297,19 @@ class CommunicationService:
             message.sent_at = utcnow()
             self._transition(message, MessageStatus.SENT)
             await self._messages.save(message)
+            # Rotate the conversation's thread ref so the next agent-initiated
+            # email inherits ``in_reply_to`` = this send's Message-ID and stays
+            # visually stitched in the SME's inbox. Only for email (WhatsApp
+            # threads on identity, not on message-id). Only when the provider
+            # returned a message id — if Ishan's tool response omits it, we
+            # fall through and the next send has no in_reply_to. Once his
+            # 2026-07-01 update lands, this rotates every send.
+            if (
+                message.channel is Channel.EMAIL
+                and result.provider_message_id
+            ):
+                conversation.external_thread_ref = result.provider_message_id
+                await self._conversations.save(conversation)
             await self._emit(CommunicationEventType.MESSAGE_SENT, conversation, message)
             await self._audit.record(
                 conversation.conversation_id,

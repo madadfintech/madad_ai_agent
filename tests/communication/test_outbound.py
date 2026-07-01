@@ -109,3 +109,49 @@ async def test_retry_exhaustion_marks_failed(make_harness):
     assert message.status == MessageStatus.FAILED
     assert message.last_error is not None
     assert CommunicationEventType.MESSAGE_FAILED in harness.event_types()
+
+
+async def test_email_send_rotates_conversation_thread_ref(harness):
+    """After a successful email send, ``conversation.external_thread_ref`` is
+    set to the send's ``provider_message_id`` so the NEXT agent-initiated
+    email inherits ``in_reply_to`` and stays visually stitched in the SME's
+    inbox. WhatsApp deliberately does NOT rotate — threads by identity."""
+
+    first = await harness.service.send(
+        OutboundMessageRequest(
+            channel=Channel.EMAIL, identity="sme@example.qa", text="Hi"
+        )
+    )
+    assert first.status == MessageStatus.SENT
+    assert first.provider_message_id is not None
+
+    conversation = await harness.service._conversations.get(first.conversation_id)
+    assert conversation.external_thread_ref == first.provider_message_id
+
+    second = await harness.service.send(
+        OutboundMessageRequest(
+            channel=Channel.EMAIL, identity="sme@example.qa", text="Follow-up"
+        )
+    )
+    assert second.provider_message_id != first.provider_message_id
+
+    # Gateway saw the second send carry in_reply_to = first send's id.
+    second_call = harness.gateway.sent[-1]
+    assert second_call.metadata is not None
+    assert second_call.metadata.get("in_reply_to") == first.provider_message_id
+
+    # And the conversation now points at the LATEST send.
+    conversation = await harness.service._conversations.get(first.conversation_id)
+    assert conversation.external_thread_ref == second.provider_message_id
+
+
+async def test_whatsapp_send_does_not_rotate_thread_ref(harness):
+    """WhatsApp does not thread by message-id; ``external_thread_ref`` stays
+    None (the initial conversation state) after send."""
+
+    message = await harness.service.send(
+        OutboundMessageRequest(channel=WA, identity=IDENTITY, text="hi")
+    )
+    assert message.status == MessageStatus.SENT
+    conversation = await harness.service._conversations.get(message.conversation_id)
+    assert conversation.external_thread_ref is None

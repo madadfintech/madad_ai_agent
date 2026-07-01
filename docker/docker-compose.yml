@@ -217,8 +217,16 @@ services:
     container_name: madad_nginx
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      # Let's Encrypt cert store — populated by host-level certbot.
+      # Contains a self-signed placeholder on first boot so nginx can
+      # bind 443 before certbot has issued the real cert.
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # ACME HTTP-01 challenge webroot — shared with certbot so nginx
+      # serves the proof files certbot writes here.
+      - /var/www/certbot:/var/www/certbot:ro
     ports:
       - "80:80"
+      - "443:443"
     depends_on:
       - workflow
       - communication

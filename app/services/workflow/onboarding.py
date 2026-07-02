@@ -110,10 +110,12 @@ from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
 PORTAL_URL = os.getenv("PORTAL_URL", "https://portal.madadfintech.com").rstrip("/")
 PORTAL_HOST = PORTAL_URL.split("://", 1)[-1]
 
-# QAR 6,000 is the current monetization onboarding fee (Madad ops M-5 may
-# vary it by segment later — the workflow falls back to whatever the
-# products tool reports; this is the safety default if no products land).
-ONBOARDING_FEE_QAR = 6000
+# The SME payment amount is ALWAYS resolved from the monetization products
+# (ACTIVE + chargedParty=SME) and the backend's authoritative payableAmount on
+# create — there is intentionally NO hardcoded fee fallback. If no SME product
+# resolves, the payment step does NOT proceed rather than charge a made-up
+# number (user 2026-07-02: "the amount MUST be exactly from the products and
+# nowhere else").
 
 TEMPLATE_KEYS = [
     "onboarding.campaign.intro",
@@ -1229,6 +1231,12 @@ _SMART_SYSTEM_PROMPT = (
     "handled right here in this chat. If they ask which documents are still "
     "needed or which they've already sent, answer from the document list provided "
     "in the step context below (do NOT redirect them elsewhere).\n\n"
+    "THE ONE EXCEPTION — SELECTING A FINANCING OFFER: choosing/accepting a final "
+    "offer is done ONLY on the Madad platform, never in this chat. If the user "
+    "asks how to pick, select, choose, accept or confirm an offer, tell them to "
+    "log in to their Madad account at madadfintech.com to compare the full terms "
+    "and finalise their selection. You can still answer questions ABOUT the offers "
+    "here, but the actual selection happens after they log in.\n\n"
     "CRITICAL — STAY IN YOUR LANE: Answer ONLY the question the user asked, then "
     "STOP. Do NOT tell the user what to do next, do NOT ask them to upload, share "
     "or provide anything, do NOT ask follow-up questions, and do NOT describe, "
@@ -4683,7 +4691,24 @@ class OnboardingWorkflow(WorkflowDefinition):
                 )
                 if isinstance(backend_type, str):
                     resolved = _workflow_doc_type(backend_type)
-            return True, resolved
+            # A doc the backend did NOT persist must never be claimed as ✅
+            # validated. The tool RAISES on hard failures (caught above); this
+            # additionally flips to ⏳ on an EXPLICIT failure signal in the
+            # ``upload`` sub-result, so a 200-with-failed-upload can't
+            # masquerade as validated and silently lose the document.
+            uploaded_ok = True
+            if isinstance(classify_response, dict):
+                up = classify_response.get("upload")
+                if isinstance(up, dict):
+                    ok_flag = up.get("success", up.get("uploaded", True))
+                    status = str(up.get("status", "")).lower()
+                    if (
+                        ok_flag is False
+                        or up.get("error")
+                        or status in {"failed", "error", "rejected"}
+                    ):
+                        uploaded_ok = False
+            return uploaded_ok, resolved
 
         if non_zip:
             classify_results = await asyncio.gather(
@@ -5437,7 +5462,11 @@ class OnboardingWorkflow(WorkflowDefinition):
                 None,
             )
             or (sme_active[0] if sme_active else None)
-            or (products[0] if products else {})
+            # NEVER fall back to products[0] — that may be a LENDER-charged
+            # product (e.g. "Onboarding charges" QAR 6,000). The SME amount
+            # comes ONLY from an ACTIVE SME product; if none exists we leave it
+            # unresolved (payment won't proceed) rather than bill a wrong fee.
+            or {}
         )
         product_id = (
             product.get("product_id")
@@ -5500,7 +5529,19 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         token, refresh, expires = await self._live_token(state, ctx)
-        if not (token and state.business_details_id and state.payment_product_id):
+        if not (
+            token
+            and state.business_details_id
+            and state.payment_product_id
+            and state.payment_amount_qar
+        ):
+            # No resolved SME product amount → do NOT create a payment with a
+            # fabricated fee. Park; the amount must come from the products only.
+            if token and state.business_details_id and state.payment_product_id:
+                ctx.logger.warning(
+                    "payment_create.no_resolved_amount",
+                    product_id=state.payment_product_id,
+                )
             return self._step(
                 "payment_create", ctx,
                 access_token=token, refresh_token=refresh, token_expires_at=expires,
@@ -5511,14 +5552,14 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx, "payment_create.request",
             business_details_id=state.business_details_id,
             product_id=state.payment_product_id,
-            amount_qar_requested=state.payment_amount_qar or ONBOARDING_FEE_QAR,
+            amount_qar_requested=state.payment_amount_qar,
             idempotency_key=key,
         )
         result = await self._pay.create_monetization_payment(
             access_token=token,
             business_details_id=state.business_details_id,
             product_id=state.payment_product_id,
-            amount_qar=state.payment_amount_qar or ONBOARDING_FEE_QAR,
+            amount_qar=state.payment_amount_qar,
             idempotency_key=key,
         )
         # [TEMP-DBG]
@@ -5603,7 +5644,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         # backend's send-monetization-payment-link tool (it routes through
         # an upstream notification provider that has been flaky in UAT and
         # adds no value over our own send).
-        amount = f"{(state.payment_amount_qar or ONBOARDING_FEE_QAR):,}"
+        amount = f"{state.payment_amount_qar:,}" if state.payment_amount_qar else ""
         # Never fabricate a Madad score. When the backend has not sent a
         # real score, omit the entire score line (blank > hardcoded --
         # user 2026-06-19). This also drops the fixed "Strong" label,
@@ -5627,7 +5668,6 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx, "payment_send_link.render",
             amount_rendered=amount,
             amount_qar_state=state.payment_amount_qar,
-            amount_qar_default=ONBOARDING_FEE_QAR,
             score=score,
             has_payment_link=bool(state.payment_link),
         )

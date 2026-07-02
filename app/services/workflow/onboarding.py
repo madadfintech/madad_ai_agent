@@ -8653,11 +8653,36 @@ class OnboardingWorkflow(WorkflowDefinition):
         # after YES still gets a live token instead of a 401. (Root cause of
         # docs silently not persisting, 2026-06-12.)
         try:
-            session = await self._identity.open_session(
-                channel=_channel(ctx),
-                identifier=ctx.identity,
-                create_onboarding_token=False,
-            )
+            # Re-mint against an identity that MATCHES the account — NEVER the
+            # transient per-phone placeholder email. The placeholder is only
+            # valid before the user provides a real email; the moment they do,
+            # the account is re-keyed to that email and the placeholder goes
+            # stale, so re-minting via it misses the user -> 401 -> documents
+            # silently never persist (root cause, non-Qatar/returning leads).
+            #   * Real email captured+cleared -> mint via that email.
+            #   * Otherwise -> mint via the real WhatsApp phone. Passing
+            #     create_user_if_missing keeps the real phone (Qatar OR
+            #     non-Qatar) instead of diverting to the placeholder, and never
+            #     forks a new user (the backend resolves the existing account
+            #     by phone first).
+            real_email = (state.business_email or "").strip()
+            if (
+                real_email
+                and "@" in real_email
+                and state.business_email_status == "proceed"
+            ):
+                session = await self._identity.open_session(
+                    channel=Channel.EMAIL,
+                    identifier=real_email,
+                    create_onboarding_token=False,
+                )
+            else:
+                session = await self._identity.open_session(
+                    channel=_channel(ctx),
+                    identifier=ctx.identity,
+                    create_onboarding_token=False,
+                    create_user_if_missing=True,
+                )
             ctx.logger.info(
                 "token.minted",
                 had_cached_token=bool(token),

@@ -5877,6 +5877,25 @@ class OnboardingWorkflow(WorkflowDefinition):
                 payment_confirmed_sent=True,
                 application_ref=ref or state.application_ref,
             )
+        # Off-script free-text at the payment gate. Prod 2026-07-02
+        # (+918287611995): the SME asked "why is payment being asked?" and got
+        # NO reply — the message matched no help keyword, no status query, no
+        # journey event, so it fell straight through to the silent re-park
+        # below and read as the bot being broken. Any genuine user message that
+        # reaches here (real ``text`` — NOT a synthetic poll/status/webhook
+        # resume, which carry no user text) is now answered in context by the
+        # LLM and the payment step is re-stated, exactly like the help-keyword
+        # branch at the top. System resumes still fall through untouched.
+        if isinstance(result, dict) and str(result.get("text") or "").strip():
+            await self._smart_contextual(
+                ctx, state, result,
+                "That's the one-time qualification fee to move your application "
+                "forward to our partner banks for financing offers. As soon as "
+                "it's settled I'll forward your file right away — just let me "
+                "know if you have any other questions! 🙂",
+            )
+            await self._send(ctx, state, "onboarding.payment.awaiting")
+            return self._step("payment_await", ctx, paid=paid)
         return self._step("payment_await", ctx, paid=paid)
 
     async def _fetch_banks_to_send(

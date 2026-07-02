@@ -1469,6 +1469,164 @@ def _extract_email(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+_BARE_EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}$")
+
+# Words that signal the message is a QUESTION / off-script rather than the user
+# handing over their own address — used only as the conservative fallback when
+# the LLM is unavailable, so we NEVER lift an email out of a question like
+# "what is contactus@madadfintech.com?".
+_EMAIL_QUESTION_MARKERS = (
+    "?", "what", "why", "how", "who", "where", "when", "which", "whose",
+    "is ", "are ", "do ", "does ", "did ", "can ", "could ", "should ",
+    "would ", "contact", "support", "example", "e.g", "eg ", "mean",
+    "help", "your ", "yours", "madad", "cost", "fee", "charge", "difference",
+)
+
+
+def _looks_like_email_question(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if "?" in t:
+        return True
+    padded = f" {t} "
+    return any(
+        t.startswith(m) or (f" {m}" in padded) for m in _EMAIL_QUESTION_MARKERS
+    )
+
+
+def _bare_email(text: str) -> str | None:
+    """Return the address only when the WHOLE trimmed reply is one valid email
+    (optionally ``mailto:``-prefixed / angle-bracketed / quoted). This is the
+    robust fast-path — no LLM needed for the overwhelmingly common case where
+    the SME just types their address."""
+    t = (text or "").strip().strip("<>").strip().strip('"’\'')
+    t = t[7:].strip() if t.lower().startswith("mailto:") else t
+    return t if _BARE_EMAIL_RE.match(t) else None
+
+
+async def _llm_email_intent(text: str) -> tuple[bool | None, str | None]:
+    """Ask the LLM whether the user is PROVIDING their own business email.
+
+    Returns ``(providing, email)``. ``providing`` is ``None`` when no LLM is
+    configured / it errors — the caller then falls back to a deterministic
+    heuristic. The onboarding flow must never break on this call.
+    """
+
+    text = (text or "").strip()
+    if not text:
+        return (False, None)
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if groq_key:
+        api_key = groq_key
+        base_url = (
+            os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+            .strip().rstrip("/")
+        )
+        model = (
+            os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+            or "llama-3.3-70b-versatile"
+        )
+    else:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        base_url = (
+            os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+        )
+        model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    if not api_key:
+        return (None, None)
+    try:
+        timeout = float(os.getenv("LLM_TIMEOUT", os.getenv("OPENAI_TIMEOUT", "15")) or "15")
+    except ValueError:
+        timeout = 15.0
+    system = (
+        "You parse a single WhatsApp reply from a user who was just asked to "
+        "provide THEIR OWN business email address to set up their account. "
+        "Decide if the reply is the user giving their own email, or something "
+        "else — a question, a request for help, or a message that merely "
+        "mentions some other address (e.g. a support/contact email). "
+        "Respond with ONLY a compact JSON object, no prose:\n"
+        '{"providing": true|false, "email": "<their address or null>"}\n'
+        "providing=true ONLY when they are offering their own address to sign "
+        'up. If they ask a question such as "what is support@madad.com" then '
+        "providing=false and email=null."
+    )
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 120,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Reply: {text[:500]}"},
+        ],
+    }
+    try:
+        import json as _json
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        content = (data["choices"][0]["message"]["content"] or "").strip()
+        blob = re.search(r"\{.*\}", content, re.DOTALL)
+        obj = _json.loads(blob.group(0) if blob else content)
+        providing = bool(obj.get("providing"))
+        email = obj.get("email") if providing else None
+        return (providing, email if isinstance(email, str) else None)
+    except Exception:  # noqa: BLE001 — never break the flow on an LLM hiccup
+        return (None, None)
+
+
+async def _smart_extract_email(text: str) -> tuple[str | None, bool]:
+    """Resolve an SME's business email from a free-text reply, intelligently.
+
+    Returns ``(email, is_offscript)``:
+      * ``email``       — the user's validated address when they are genuinely
+                          providing it, else ``None``.
+      * ``is_offscript``— ``True`` when the reply is a question / anything other
+                          than the user handing over their address, so the
+                          caller answers in context and re-asks.
+
+    Robustness ladder (email is the ONLY free-text step in the flow, so this is
+    the one place a wrong grab could poison an account):
+      1. A bare address (whole reply is one email) is accepted with no LLM.
+      2. A sentence that contains an address is classified by the LLM — it must
+         confirm the user is providing THEIR OWN email before we accept it, so
+         "what is contactus@madadfintech.com" is treated as a question, never a
+         sign-up.
+      3. If the LLM is unavailable we fall back to a conservative heuristic that
+         accepts an email ONLY from a short, non-question reply — and otherwise
+         re-asks rather than risk grabbing the wrong address.
+    """
+
+    raw = (text or "").strip()
+    if not raw:
+        return (None, True)
+    bare = _bare_email(raw)
+    if bare:
+        return (bare, False)
+    candidates = re.findall(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", raw)
+    if not candidates:
+        return (None, True)  # no address at all → off-script / question
+    providing, email = await _llm_email_intent(raw)
+    if providing is True:
+        chosen = _extract_email(email or "") or (
+            candidates[0] if not _looks_like_email_question(raw) else None
+        )
+        return (chosen, False) if chosen else (None, True)
+    if providing is False:
+        return (None, True)  # LLM: it's a question / mentions another address
+    # LLM unavailable → conservative deterministic fallback.
+    if _looks_like_email_question(raw):
+        return (None, True)
+    if len(candidates) == 1 and len(raw.split()) <= 6:
+        return (candidates[0], False)
+    return (None, True)
+
+
 def _parse_buyer_text(text: str) -> dict[str, Any]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
@@ -2913,10 +3071,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "they respond (typically 3–5 business days)."
             ),
             "payment_link": (
-                "You're qualified for financing — please complete the QAR "
-                "6,000 onboarding fee to forward your application to the "
-                f"banks. Log in at {PORTAL_HOST} to pay or "
-                "reply 'pay' and I'll re-send the link."
+                "You're qualified for financing — please complete your "
+                "onboarding fee to forward your application to the banks. "
+                f"Log in at {PORTAL_HOST} to pay or reply 'pay' and I'll "
+                "re-send the payment link with the exact amount."
             ),
             "continue_step": (
                 "Picking up where you left off — share the next document "
@@ -3351,9 +3509,18 @@ class OnboardingWorkflow(WorkflowDefinition):
             if reply.get("last_status_source") in {"poll", "webhook"}:
                 if not reply.get("text") and not reply.get("attachments"):
                     return self._step("business_email_await", ctx)
-        email = _extract_email(reply_text(reply))
+        # Smart email capture. This is the ONLY step where the SME types free
+        # text (everywhere else is buttons / file upload), so a naive "grab the
+        # first email in the message" is dangerous: "what is
+        # contactus@madadfintech.com?" would sign them up with the support
+        # address. _smart_extract_email uses the LLM to confirm the user is
+        # actually providing THEIR OWN email before we accept it, with a
+        # conservative no-LLM fallback that re-asks rather than mis-grab.
+        email, _is_offscript = await _smart_extract_email(reply_text(reply))
         if not email:
-            # Off-script / not an email — clarify in context and keep waiting.
+            # Off-script / a question / not clearly their address — answer in
+            # context (the LLM handles "why do you need my email?", "what is
+            # X@Y.com", etc.) and keep waiting for the real address.
             await self._smart_contextual(
                 ctx, state, reply,
                 "Please reply with your business email (e.g. name@company.com) "

@@ -278,9 +278,15 @@ _TEMPLATE_BODIES = {
         "I'll notify you as soon as the next update is available. You can also "
         "track your status at uat-portal.madadfintech.com. For queries call +974 3017 3888."
     ),
+    # Re-state nudge (fires when the SME asks a question / re-pings while the
+    # payment is still open). NO hardcoded amount — the exact, dynamic fee is
+    # already on the "Pay QAR {{ amount }} →" button/link from
+    # onboarding.payment.request(.button), so this only points them back to it.
+    # (Prod 2026-07-02: a hardcoded "QAR 6,000" here contradicted the real
+    # product amount shown on the link.)
     "onboarding.payment.awaiting": (
         "Your application is ready to move forward. Please complete the secure "
-        "QAR 6,000 onboarding and assessment fee payment using the link shared above.\n\n"
+        "onboarding and assessment fee payment using the link shared above.\n\n"
         "Once payment is received, your application will be forwarded immediately."
     ),
     # PDF Step 6 — fires from _payment_await on paid=True. Bank list comes from

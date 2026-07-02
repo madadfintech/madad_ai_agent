@@ -116,7 +116,7 @@ _TEMPLATE_BODIES = {
         "🔗 Privacy Policy: https://www.madadfintech.com/en/privacy-policy\n"
         "🔒 Terms & Conditions: https://www.madadfintech.com/en/terms-and-conditions\n"
         "📄 Data and Credit Bureau Consent: "
-        "https://uat-portal.madadfintech.com/financialsConsent\n\n"
+        "https://portal.madadfintech.com/financialsConsent\n\n"
         "By sharing your CR you agree to the above. Please go ahead and share "
         "your CR document as a PDF or photo in this chat.\n\n"
         "Any questions? Reply here or call us on +974 3017 3888."
@@ -163,7 +163,7 @@ _TEMPLATE_BODIES = {
         "Perfect! 🙌\n\n"
         "You will receive your pre-qualification result within 24 hours.\n\n"
         "Meanwhile, your account has been created on Madad with reference number "
-        "#{{ ref }}. You can login at uat-portal.madadfintech.com and track your status anytime."
+        "#{{ ref }}. You can login at portal.madadfintech.com and track your status anytime."
     ),
     "onboarding.documents.checklist": (
         "🎉 Congratulations! Your business is pre-qualified for financing.\n\n"
@@ -187,7 +187,7 @@ _TEMPLATE_BODIES = {
         "11. QID   12. Passport\n\n"
         "ℹ️ Optional: Shareholder Proof of Address — send if you have it, "
         "but not required to proceed.\n\n"
-        "📤 Share the documents here or login at uat-portal.madadfintech.com to complete "
+        "📤 Share the documents here or login at portal.madadfintech.com to complete "
         "your application.\n\n"
         "Please share your documents to move forward!"
     ),
@@ -276,7 +276,7 @@ _TEMPLATE_BODIES = {
     "onboarding.status.pending": (
         "Hi! Your application is currently under review with Madad. 👍\n\n"
         "I'll notify you as soon as the next update is available. You can also "
-        "track your status at uat-portal.madadfintech.com. For queries call +974 3017 3888."
+        "track your status at portal.madadfintech.com. For queries call +974 3017 3888."
     ),
     # Re-state nudge (fires when the SME asks a question / re-pings while the
     # payment is still open). NO hardcoded amount — the exact, dynamic fee is
@@ -297,7 +297,7 @@ _TEMPLATE_BODIES = {
         "{{ banks }}.\n\n"
         "We will update you as soon as financing offers are received — typically "
         "within 3–5 business days. 📲\n\n"
-        "Track your status at uat-portal.madadfintech.com (Ref: {{ ref }})"
+        "Track your status at portal.madadfintech.com (Ref: {{ ref }})"
     ),
     # UAT 2026-06-17 RCA fix: sent when the admin marks the user as
     # ``qualified.waived`` (qualified + onboarding fee waived). Replaces
@@ -388,7 +388,7 @@ _TEMPLATE_BODIES = {
         "🏦 {{ lender }} · 💰 {{ limit }} · 📈 {{ rate }} · ⏱ {{ tenure }}\n\n"
         "You can now submit invoices for financing right here — send a single "
         "PDF or multiple invoices at once. 📄\n\n"
-        "Track at uat-portal.madadfintech.com (Ref: {{ ref }})"
+        "Track at portal.madadfintech.com (Ref: {{ ref }})"
     ),
     # Returning-SME re-greeting (UAT 2026-06-28). The agent fills two slots
     # from the route detected by ``madad_mcp_check_registration``:
@@ -629,23 +629,23 @@ _NUDGE_TEMPLATE_BODIES = {
     "nudge.financials_pending.3": (
         "Final reminder: your Madad application will be marked inactive if "
         "we don't receive your Audited Financial Statement soon. Reply here "
-        "or visit uat-portal.madadfintech.com to continue."
+        "or visit portal.madadfintech.com to continue."
     ),
     # Nudge — Partial Documents
     "nudge.incomplete_docs.1": (
         "Hi! You're almost there. 🚀\n\n"
         "Still needed: {{ documents }}.\n\n"
-        "Share here or at uat-portal.madadfintech.com to keep moving."
+        "Share here or at portal.madadfintech.com to keep moving."
     ),
     "nudge.incomplete_docs.2": (
         "Quick reminder — we still need: {{ documents }}.\n\n"
         "Reply here with the documents attached, or upload via "
-        "uat-portal.madadfintech.com. Need help? Call +974 3017 3888."
+        "portal.madadfintech.com. Need help? Call +974 3017 3888."
     ),
     "nudge.incomplete_docs.3": (
         "Final reminder — your application is at risk of being marked "
         "inactive. Missing: {{ documents }}. Please complete soon at "
-        "uat-portal.madadfintech.com or by replying here."
+        "portal.madadfintech.com or by replying here."
     ),
     # Nudge — Payment Not Received  (link re-sent every step per PDF spec)
     "nudge.payment_pending.1": (

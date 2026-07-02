@@ -245,8 +245,24 @@ _TEMPLATE_BODIES = {
     # Immediate ack the instant a valid CR attachment arrives — guarantees the
     # user always sees a response even if the downstream upload + financials
     # prompt fails (QA Bug #1 + Ishan handover §9 / 2026-06-09).
+    # Neutral wording (prod 2026-07-02): we ack the upload BEFORE the classifier
+    # decides, so we must NOT claim "Got your CR" yet — a non-CR (e.g. a random
+    # screenshot) would then get contradicted by the reupload prompt. On a real
+    # CR the flow proceeds to the financials request; on a non-CR it asks for a
+    # proper re-upload (onboarding.cr.reupload).
     "onboarding.cr.received": (
-        "📄 Got your CR — processing it now…"
+        "📄 Got it — checking your document now…"
+    ),
+    # Sent when the classifier RAN and confidently decided the upload is NOT a
+    # Commercial Registration. Nudges a proper re-upload. Capped in code
+    # (_CR_MAX_REUPLOAD_NUDGES) so a genuine CR the classifier can't read still
+    # gets through afterwards — the SME is never trapped.
+    "onboarding.cr.reupload": (
+        "Hmm — I couldn't verify that document as a Commercial Registration (CR). 📄\n\n"
+        "Please re-upload a clear copy of your CR as a PDF or a well-lit photo "
+        "showing the full document. If you're sure this is your CR, just send it "
+        "again and we'll continue.\n\n"
+        "For any query call us on +974 3017 3888."
     ),
     # UAT 2026-06-16 (PM): same pattern for the audited financial
     # statement — the upload + account-create round-trip used to be

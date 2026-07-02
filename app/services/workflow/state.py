@@ -135,6 +135,14 @@ class OnboardingState(WorkflowState):
     # timeout/uncertainty never produces a false Qatar claim (user 2026-06-14:
     # uploading a logo still triggered the line under the old default-True).
     cr_verified: bool = False
+    # CR reupload gate (prod 2026-07-02): when the classifier RUNS and confidently
+    # returns a non-CR type (e.g. a random screenshot classified as
+    # COMMERCIAL_CREDIT_REPORT), we nudge the SME to re-upload a proper CR instead
+    # of silently accepting it. cr_reject_count caps the nudges so a genuine CR the
+    # classifier simply can't read is NEVER trapped — after the cap we fail open and
+    # proceed (backend extraction + admin review remain the real gate).
+    cr_reject_count: int = 0
+    cr_needs_reupload: bool = False
 
     # Step 3–4: eligibility + financials.
     eligibility_form_data: dict[str, Any] = Field(default_factory=dict)

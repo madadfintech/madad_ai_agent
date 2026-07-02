@@ -110,6 +110,16 @@ from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
 PORTAL_URL = os.getenv("PORTAL_URL", "https://portal.madadfintech.com").rstrip("/")
 PORTAL_HOST = PORTAL_URL.split("://", 1)[-1]
 
+# How many times we nudge the SME to re-upload when the classifier RUNS and
+# confidently says the document is NOT a Commercial Registration, before we
+# FAIL OPEN and let them proceed anyway. Kept low on purpose: it catches the
+# obvious wrong-document mistake without trapping a real SME whose genuine CR
+# the classifier happens to misread (prod 2026-07-02). Tunable via env.
+try:
+    _CR_MAX_REUPLOAD_NUDGES = max(0, int(os.getenv("CR_MAX_REUPLOAD_NUDGES", "2")))
+except ValueError:
+    _CR_MAX_REUPLOAD_NUDGES = 2
+
 # The SME payment amount is ALWAYS resolved from the monetization products
 # (ACTIVE + chargedParty=SME) and the backend's authoritative payableAmount on
 # create — there is intentionally NO hardcoded fee fallback. If no SME product
@@ -142,6 +152,7 @@ TEMPLATE_KEYS = [
     "onboarding.documents.complete",
     "onboarding.upload.required",
     "onboarding.cr.received",
+    "onboarding.cr.reupload",
     "onboarding.financials.received",
     "onboarding.documents.processing",
     "onboarding.documents.more_docs_prompt",
@@ -2527,8 +2538,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         # Spec Step 2: straight after the CR we ask for the audited financials.
         # The quick eligibility questionnaire is NOT in the PDF — we treat the
         # business as eligible (Qatar registration is verified from the CR) and
-        # skip it entirely.
-        graph.add_edge("cr_upload_base64", "financials_send")
+        # skip it entirely. EXCEPT: if the classifier confidently said the upload
+        # is not a CR, route BACK to the upload wait so the SME can re-send a
+        # proper CR (capped — see _cr_upload_base64 / _route_cr_upload).
+        graph.add_conditional_edges(
+            "cr_upload_base64",
+            self._route_cr_upload,
+            {"reupload": "consent_await", "proceed": "financials_send"},
+        )
 
         graph.add_edge("financials_send", "financials_await")
         graph.add_conditional_edges(
@@ -3666,6 +3683,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         # Qatar claim. The actual CR upload stays the fast forced upload below
         # (lands it in the CR slot; backend extracts CR#/Qatar in background).
         cr_verified = False
+        # ``classifier_said_not_cr`` is True ONLY when the classify call RAN
+        # cleanly (returned a usable dict, no error) and did NOT confirm a CR —
+        # e.g. a random screenshot that classifies as COMMERCIAL_CREDIT_REPORT
+        # (prod 2026-07-02). A classifier crash / timeout / error-dict leaves it
+        # False, so infra failure ALWAYS falls through to "proceed" — we never
+        # trap the SME because our own classifier broke.
+        classifier_said_not_cr = False
         if token and state.cr_ref:
             try:
                 cls = await self._kyc.classify_document_base64(
@@ -3675,27 +3699,76 @@ class OnboardingWorkflow(WorkflowDefinition):
                     mime_type=state.cr_mime_type,
                 )
                 if isinstance(cls, dict):
-                    backend_type = (
+                    backend_type = str(
                         cls.get("document_type")
                         or cls.get("classification_label")
                         or ""
-                    )
-                    resolved = _workflow_doc_type(str(backend_type))
+                    ).strip()
+                    resolved = _workflow_doc_type(backend_type)
                     combined = f"{backend_type} {resolved}".lower()
                     cr_verified = (
                         "commercial_registration" in combined
                         and cls.get("classified") is not False
                     )
+                    # A clean run that named a (non-CR) type OR explicitly said
+                    # "couldn't classify" is a POSITIVE not-a-CR signal. An
+                    # error/empty dict is an infra hiccup → treat as "no verdict"
+                    # → proceed (fail-open), never a reject.
+                    has_error = bool(cls.get("error")) or str(
+                        cls.get("status") or ""
+                    ).lower() in {"error", "failed"}
+                    if (
+                        not cr_verified
+                        and not has_error
+                        and (backend_type or cls.get("classified") is False)
+                    ):
+                        classifier_said_not_cr = True
                     ctx.logger.info(
                         "cr_upload.classified",
-                        backend_type=str(backend_type),
+                        backend_type=backend_type,
                         resolved=resolved,
                         cr_verified=cr_verified,
+                        not_cr=classifier_said_not_cr,
                     )
-            except Exception as exc:  # noqa: BLE001 — gate degrades to no-affirmation
+            except Exception as exc:  # noqa: BLE001 — classifier down ⇒ fail open
                 ctx.logger.warning(
                     "cr_upload.classify_failed", error=str(exc)[:200],
+                    note="classifier errored — proceeding without a CR gate",
                 )
+
+        # ── Reject-and-reupload gate ──────────────────────────────────────────
+        # The classifier ran and confidently said this is NOT a CR. Nudge the SME
+        # to send a proper CR instead of silently accepting a wrong document —
+        # but only up to _CR_MAX_REUPLOAD_NUDGES times. After that we FAIL OPEN
+        # and let them through (cr_verified stays False, so no false Qatar claim;
+        # the backend CR extraction + admin review are the real gate). This means
+        # a genuine CR the classifier can't read is NEVER permanently trapped.
+        if classifier_said_not_cr and not cr_verified:
+            if state.cr_reject_count < _CR_MAX_REUPLOAD_NUDGES:
+                await self._send(ctx, state, "onboarding.cr.reupload")
+                ctx.logger.info(
+                    "cr_upload.rejected_not_cr",
+                    attempt=state.cr_reject_count + 1,
+                    max_nudges=_CR_MAX_REUPLOAD_NUDGES,
+                )
+                # Do NOT upload the wrong doc to the CR slot and do NOT advance —
+                # route back to the upload wait for a fresh attempt.
+                return self._step(
+                    "cr_upload_base64", ctx,
+                    cr_needs_reupload=True,
+                    cr_reject_count=state.cr_reject_count + 1,
+                    cr_verified=False,
+                    access_token=token, refresh_token=refresh,
+                    token_expires_at=expires,
+                )
+            ctx.logger.info(
+                "cr_upload.failopen_after_nudges",
+                attempts=state.cr_reject_count,
+                note="proceeding despite non-CR classification — user must not be trapped",
+            )
+
+        # ── Proceed: confirmed CR, classifier crash/uncertain, or fail-open. ──
+        if token and state.cr_ref:
             # Forced CR upload (fast — lands the CR in the CR slot; backend
             # extracts CR#/Qatar validation in the background). Kept separate
             # from the classify so we never block on extraction.
@@ -3724,6 +3797,8 @@ class OnboardingWorkflow(WorkflowDefinition):
         return self._step(
             "cr_upload_base64", ctx,
             cr_verified=cr_verified,
+            cr_needs_reupload=False,
+            cr_reject_count=0,  # reset once we advance past the CR step
             access_token=token, refresh_token=refresh, token_expires_at=expires,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
@@ -8658,6 +8733,13 @@ class OnboardingWorkflow(WorkflowDefinition):
 
     def _route_consent_upload(self, state: OnboardingState) -> str:
         return "uploaded" if state.consent and state.cr_ref else "missing"
+
+    def _route_cr_upload(self, state: OnboardingState) -> str:
+        # "reupload" = classifier confidently said the doc isn't a CR and we're
+        # still within the nudge budget → back to the upload wait. Otherwise
+        # proceed to the financials step (confirmed CR, classifier failure, or
+        # fail-open after the nudges are exhausted).
+        return "reupload" if state.cr_needs_reupload else "proceed"
 
     def _route_eligibility_status(self, state: OnboardingState) -> str:
         return "eligible" if state.eligible else "ineligible"

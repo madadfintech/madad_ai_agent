@@ -4555,6 +4555,10 @@ class OnboardingWorkflow(WorkflowDefinition):
 
         # Pass 1 — process ZIPs server-side. Anything that isn't a ZIP or
         # whose server-side classify fails falls through to pass 2.
+        # Track whether ANY attachment was successfully uploaded to the backend
+        # this batch, so a saved-but-off-checklist/duplicate doc is NEVER
+        # reported to the SME as "couldn't process" (false-negative fix).
+        batch_upload_ok = False
         non_zip: list[dict[str, Any]] = []
         for att in attachments:
             if not _is_zip_attachment(att):
@@ -4597,6 +4601,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 non_zip.extend(expanded)
                 continue
             saw_zip = True
+            batch_upload_ok = True  # the ZIP classify+upload round-trip succeeded
             # Per-file checklist shape per Ishan's docstring:
             # ``[{file_name, document_type, confidently_classified}, ...]``.
             # camelCase + snake_case + body-envelope all tolerated.
@@ -4745,6 +4750,8 @@ class OnboardingWorkflow(WorkflowDefinition):
         # land in ``unprocessed`` and get a contradictory "⏳ received" after its
         # "✅ validated" (and Audited Report got ⏳'d on every wave). Acknowledge
         # each doc type EXACTLY ONCE across the whole upload phase.
+        # A single-file upload that returned without error is also a real save.
+        batch_upload_ok = batch_upload_ok or any(ok for ok, _ in classify_results)
         already_acked = set(state.docs_acked)
         new_validated = [d for d in validated if d not in already_acked]
         new_unprocessed = [
@@ -4757,6 +4764,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx, state, new_validated, new_unprocessed,
             saw_zip=saw_zip,
             missing_after=list(pending),
+            batch_upload_ok=batch_upload_ok,
         )
         # Remaining = required docs this batch did not land. Tracked locally so
         # generic-filename uploads reliably complete the checklist (we do not
@@ -4921,6 +4929,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         *,
         saw_zip: bool,
         missing_after: list[str],
+        batch_upload_ok: bool = False,
     ) -> None:
         """Send a brief per-document receipt for this batch.
 
@@ -4949,23 +4958,44 @@ class OnboardingWorkflow(WorkflowDefinition):
         still_missing = list(missing_after)
         already_validated = [d for d in all_required if d not in still_missing]
 
-        # Bug #1b (2026-06-09): if literally NOTHING has ever validated
-        # AND this batch produced nothing either, the upload genuinely
-        # failed end-to-end — send the honest "couldn't process" fallback.
-        if not validated and not unprocessed and not already_validated:
-            try:
-                await self._send(ctx, state, "onboarding.documents.upload_failed")
-            except Exception as exc:  # noqa: BLE001
-                ctx.logger.warning(
-                    "documents_upload_failed_ack.failed", error=str(exc)[:200]
-                )
-            return
-
-        # Edge: every upload in this batch was a duplicate of an
-        # already-validated doc. Stay silent (the SME will hear the next
-        # ack when they send a NEW doc) — they can ask "what's missing?"
-        # anytime to get the full state.
+        # Nothing NEW landed on the checklist this batch. Choose the message
+        # by whether the upload actually SUCCEEDED at the backend — a saved
+        # document must NEVER be reported as "couldn't process" (false-negative
+        # fix, 2026-07-02: a re-sent audited report / off-checklist doc uploaded
+        # fine (backend 201) but produced no new checklist entry and wrongly hit
+        # the upload_failed fallback).
         if not validated and not unprocessed:
+            if batch_upload_ok:
+                # Uploaded fine, but a duplicate or off-checklist doc (e.g.
+                # re-sending the audited report collected earlier). Honest
+                # positive receipt — never "couldn't process".
+                try:
+                    await self._send(
+                        ctx, state, "onboarding.documents.single_received",
+                        {
+                            "results": (
+                                "📩 Received — thanks! We've got it and our "
+                                "team will review it."
+                            )
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning(
+                        "documents_receipt_ack.failed", error=str(exc)[:200]
+                    )
+                return
+            if not already_validated:
+                # Genuine end-to-end failure: nothing uploaded AND nothing ever
+                # validated → honest "couldn't process" fallback.
+                try:
+                    await self._send(ctx, state, "onboarding.documents.upload_failed")
+                except Exception as exc:  # noqa: BLE001
+                    ctx.logger.warning(
+                        "documents_upload_failed_ack.failed", error=str(exc)[:200]
+                    )
+                return
+            # Duplicate of an already-validated doc, nothing newly uploaded —
+            # stay silent; the SME hears the next ack when they send a NEW doc.
             return
 
         batch_rows = [f"✅ {_label(d)} — Received & Validated" for d in validated]

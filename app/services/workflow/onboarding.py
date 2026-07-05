@@ -6600,17 +6600,31 @@ class OnboardingWorkflow(WorkflowDefinition):
                 if not reply.get("text") and not reply.get("attachments"):
                     return self._step("invoice_collect_await", ctx)
 
+        # Email/quoted-reply fix (prod 2026-07-05): a genuine invoice upload can
+        # arrive with quoted Gmail text ("On ... wrote: Your application is still
+        # in progress …"). That quoted text must NOT be classified as a Q&A /
+        # status query before we even see the attachment — the same class of bug
+        # that dropped CR/financials uploads over email. When a valid upload is
+        # present (and it isn't an edited CSV for a pending batch / a reply to a
+        # pending confirm card, both handled below), skip the free-text intent
+        # checks and fall straight through to attachment processing.
+        _fresh_invoice_upload = (
+            bool(_valid_upload_attachments(reply))
+            and not state.pending_invoice_batch
+            and state.pending_invoice_draft is None
+        )
+
         # Self-service Q&A intents (UAT 2026-06-16 #9). Take precedence
         # over the broader status-query path because "what's my limit?"
         # could otherwise be misdetected as a status query and lose the
         # structured answer.
-        intent = _qa_intent(reply)
+        intent = None if _fresh_invoice_upload else _qa_intent(reply)
         if intent is not None:
             return await self._handle_invoice_qa(state, ctx, intent)
 
         # Status-query path so the SME can ask "any update?" without
         # us misinterpreting it as chit-chat.
-        if _is_invoice_status_query(reply):
+        if not _fresh_invoice_upload and _is_invoice_status_query(reply):
             token, refresh, expires = await self._live_token(state, ctx)
             invoices: list[dict[str, Any]] = []
             if token:

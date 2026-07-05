@@ -172,6 +172,35 @@ async def test_cr_upload_asks_for_financials_not_questionnaire(harness):
     assert "onboarding.eligibility.intake.request" not in templates
 
 
+async def test_cr_upload_with_quoted_portal_text_still_advances(harness):
+    """Gmail replies include the previous consent email body. A real attachment
+    must win over quoted portal-link text so CR uploads are not misread as
+    portal/status questions."""
+
+    runtime = harness.platform.runtime
+    await runtime.start("onboarding", WA, IDENTITY, input={"trigger": "campaign"})
+    await runtime.resume(WA, IDENTITY, message={"text": "YES"})
+    await runtime.resume(WA, IDENTITY, message={"text": "biz@example.com"})
+
+    result = await runtime.resume(
+        WA,
+        IDENTITY,
+        message={
+            "text": (
+                "On Sun, Madad Support wrote:\n"
+                "> Data and Credit Bureau Consent: "
+                "https://portal.madadfintech.com/financialsConsent"
+            ),
+            "attachments": [{"filename": "CR.pdf", "content_base64": DOC}],
+        },
+    )
+
+    assert result.prompt == {"waiting_for": "upload", "step": "financials"}
+    templates = harness.messenger.templates()
+    assert "onboarding.financials.request" in templates
+    assert templates.count("onboarding.help.contextual") == 0
+
+
 async def test_qualify_mid_docs_fast_forwards_through_payment_wait(harness):
     """Bug #12 (UAT 2026-06-09, Ishan diagnosis): backend only fires
     ``madad_score.ready`` once. When it arrives mid-docs-loop, the SAME

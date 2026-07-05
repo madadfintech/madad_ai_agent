@@ -3612,6 +3612,22 @@ class OnboardingWorkflow(WorkflowDefinition):
             if reply.get("last_status_source") in {"poll", "webhook"}:
                 if not reply.get("text") and not reply.get("attachments"):
                     return self._step("consent_await", ctx, consent=False)
+        attachments = _valid_upload_attachments(reply)
+        if attachments:
+            first = attachments[0]
+            try:
+                await self._send(ctx, state, "onboarding.cr.received")
+            except Exception as exc:  # noqa: BLE001 - ack failure must not kill the run
+                ctx.logger.warning("cr_received_ack.failed", error=str(exc)[:200])
+            return self._step(
+                "consent_await",
+                ctx,
+                consent=True,
+                cr_ref=first.get("filename"),
+                cr_filename=first.get("filename"),
+                cr_content_base64=first.get("content_base64") or "",
+                cr_mime_type=first.get("mime_type"),
+            )
         help_template = _off_script_template(reply)
         if help_template is not None:
             await self._send(
@@ -3640,7 +3656,6 @@ class OnboardingWorkflow(WorkflowDefinition):
                 {"answer": "I’m here and ready to help.", "next_step": _next_step_hint(state)},
             )
             return self._step("consent_await", ctx, consent=False)
-        attachments = _valid_upload_attachments(reply)
         if not attachments:
             # No document — it's a question or chit-chat. Answer it in context
             # (Groq), falling back to the upload nudge. (user 2026-06-14)
@@ -3983,6 +3998,24 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "financials"})
+        attachments = _valid_upload_attachments(reply)
+        if attachments:
+            await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
+            first = attachments[0]
+            try:
+                await self._send(ctx, state, "onboarding.financials.received")
+            except Exception as exc:  # noqa: BLE001 - ack failure must not kill the run
+                ctx.logger.warning(
+                    "financials_received_ack.failed", error=str(exc)[:200],
+                )
+            return self._step(
+                "financials_await",
+                ctx,
+                financials_received=True,
+                financials_content_base64=first.get("content_base64") or "",
+                financials_filename=first.get("filename") or "",
+                financials_mime_type=first.get("mime_type"),
+            )
         help_template = _off_script_template(reply)
         if help_template is not None:
             await self._send(
@@ -4011,7 +4044,6 @@ class OnboardingWorkflow(WorkflowDefinition):
                 {"answer": "I’m here and ready to help.", "next_step": _next_step_hint(state)},
             )
             return self._step("financials_await", ctx, financials_received=False)
-        attachments = _valid_upload_attachments(reply)
         await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
         if not attachments:
             # No document — answer the question/chat in context (Groq), falling

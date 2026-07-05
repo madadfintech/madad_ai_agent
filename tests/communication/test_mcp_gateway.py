@@ -108,6 +108,39 @@ async def test_email_send_without_in_reply_to_omits_field() -> None:
     assert "in_reply_to" not in sent_payload
 
 
+async def test_email_send_uses_configured_reply_to(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Email replies must route back through SendGrid inbound parse, not the
+    normal support inbox. The deployed env supplies that inbound Reply-To."""
+    monkeypatch.setenv("COMMUNICATION_EMAIL_REPLY_TO", "agent@reply.uat.madadfintech.com")
+    caller = InMemoryMCPClient(handlers={Tools.EXT_SEND_EMAIL_TEXT: lambda p: {"accepted": True}})
+    gateway = McpCommunicationGateway(caller)
+
+    msg = _msg(Channel.EMAIL)
+    msg.metadata = {"subject": "Welcome"}
+    await gateway.send(msg)
+
+    sent_payload = caller.calls[0][1]
+    assert sent_payload["reply_to"] == "agent@reply.uat.madadfintech.com"
+
+
+async def test_email_send_reply_to_metadata_overrides_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COMMUNICATION_EMAIL_REPLY_TO", "agent@reply.uat.madadfintech.com")
+    caller = InMemoryMCPClient(handlers={Tools.EXT_SEND_EMAIL_TEXT: lambda p: {"accepted": True}})
+    gateway = McpCommunicationGateway(caller)
+
+    msg = _msg(Channel.EMAIL)
+    msg.metadata = {
+        "subject": "Welcome",
+        "reply_to": "agent@reply.madadfintech.com",
+    }
+    await gateway.send(msg)
+
+    sent_payload = caller.calls[0][1]
+    assert sent_payload["reply_to"] == "agent@reply.madadfintech.com"
+
+
 async def test_email_send_without_subject_falls_back_and_emits_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

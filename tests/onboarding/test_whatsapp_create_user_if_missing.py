@@ -50,6 +50,11 @@ async def test_email_new_lead_still_uses_complete_onboarding(make_harness) -> No
     identity_calls = [name for name, _ in harness.identity.calls]
     # Email new-lead still goes through complete_onboarding.
     assert "complete_onboarding" in identity_calls
+    complete_payload = next(
+        kwargs for name, kwargs in harness.identity.calls if name == "complete_onboarding"
+    )
+    assert complete_payload["email"] == EMAIL_ID
+    assert complete_payload["phone_number"].startswith("+9749")
     open_session_payloads = [
         kwargs for name, kwargs in harness.identity.calls if name == "open_session"
     ]

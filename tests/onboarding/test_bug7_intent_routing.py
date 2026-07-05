@@ -76,3 +76,6 @@ async def test_portal_question_at_prequal_wait_gets_portal_answer(harness) -> No
     last = sent[-1]["variables"]["answer"]
     # Should NOT be the generic prequal fallback.
     assert "pre-qualification result will be ready" not in last
+    assert "admin" not in last.lower()
+    assert "lender" not in last.lower()
+    assert "madadfintech.com" in last

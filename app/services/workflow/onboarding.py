@@ -2267,6 +2267,13 @@ def _looks_done_with_docs(value: Any) -> bool:
     ))
 
 
+def _placeholder_phone_for_email(email: str) -> str:
+    """Stable Qatar-format phone placeholder for email-only onboarding leads."""
+    digest = hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()
+    suffix = int(digest[:8], 16) % 10_000_000
+    return f"+9749{suffix:07d}"
+
+
 class OnboardingWorkflow(WorkflowDefinition):
     name = "onboarding"
     version = 1
@@ -3438,6 +3445,8 @@ class OnboardingWorkflow(WorkflowDefinition):
             state.onboarding_phone_override
             or (ctx.identity if ctx.channel is Channel.WHATSAPP else None)
         )
+        if phone is None and ctx.channel is Channel.EMAIL:
+            phone = _placeholder_phone_for_email(ctx.identity)
         digits = re.sub(r"\D", "", phone or ctx.identity or "") or "demo"
         placeholder_email = f"wa{digits}@wa.madadfintech.com"
         email = (

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -372,8 +373,41 @@ class OnboardingState(WorkflowState):
 
 def reply_text(value: Any) -> str:
     if isinstance(value, dict):
-        return str(value.get("text") or "").strip()
-    return str(value or "").strip()
+        return clean_email_quoted_reply(str(value.get("text") or "")).strip()
+    return clean_email_quoted_reply(str(value or "")).strip()
+
+
+def clean_email_quoted_reply(value: str) -> str:
+    """Keep the SME's reply and drop common quoted email thread tails."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    quote_patterns = (
+        r"\r?\nOn .{0,240}? wrote:\s*",
+        r"\sOn .{0,240}? wrote:\s*>?",
+        r"\r?\nFrom:\s",
+        r"\r?\nSent:\s",
+        r"\r?\nTo:\s",
+        r"\r?\nSubject:\s",
+        r"\r?\n[-_]{2,}\s*Original Message\s*[-_]{2,}",
+    )
+    for pattern in quote_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            text = text[: match.start()].strip()
+            break
+
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            break
+        if stripped == "--":
+            break
+        lines.append(line)
+
+    return "\n".join(lines).strip()
 
 
 def reply_attachments(value: Any) -> list[dict[str, Any]]:

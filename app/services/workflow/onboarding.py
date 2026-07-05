@@ -8951,10 +8951,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             except Exception:  # noqa: BLE001
                 pass
         prefix = f"Your Madad ID is {unique_id}. " if unique_id else ""
-        return (
-            f"{prefix}For security, I can only share the SME-facing Madad portal: "
-            "madadfintech.com. I cannot share admin or lender portal links in this chat."
-        )
+        return f"{prefix}You can continue through the Madad portal at madadfintech.com."
 
     async def _live_token(
         self, state: OnboardingState, ctx: WorkflowContext

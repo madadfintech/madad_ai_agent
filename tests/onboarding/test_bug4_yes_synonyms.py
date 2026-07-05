@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.workflow.state import is_no, is_yes
+from app.services.workflow.state import clean_email_quoted_reply, is_no, is_yes
 from app.shared.workflow import Channel
 
 WA = Channel.WHATSAPP
@@ -66,6 +66,18 @@ def test_expanded_yes_synonyms(text: str) -> None:
 )
 def test_expanded_no_synonyms(text: str) -> None:
     assert is_no(text), f"{text!r} should be recognised as NO"
+
+
+def test_gmail_quoted_yes_reply_is_recognised() -> None:
+    text = (
+        "YES\n\n"
+        "On Sun, Jul 5, 2026 at 3:19 PM Madad Support wrote:\n"
+        "> Are you interested in financing for your business?\n"
+        "> Please reply YES or NO."
+    )
+
+    assert clean_email_quoted_reply(text) == "YES"
+    assert is_yes(text)
 
 
 async def test_campaign_accepts_ok_as_yes(make_harness) -> None:

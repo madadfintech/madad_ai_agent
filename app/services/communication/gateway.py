@@ -12,6 +12,7 @@ through and adapters for it. We never call Meta/SendGrid directly.
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -82,6 +83,7 @@ _TOOL_BY_CHANNEL: dict[Channel, str] = {
 # Default subject for agent-driven email when the message carries none in its
 # metadata. Per-step subjects can be supplied via message.metadata["subject"].
 _DEFAULT_EMAIL_SUBJECT = "Madad Financing — update on your application"
+_EMAIL_REPLY_TO_ENV = "COMMUNICATION_EMAIL_REPLY_TO"
 
 
 class McpCommunicationGateway(CommunicationGateway):
@@ -268,5 +270,10 @@ def _build_outbound_payload(channel: Channel, message: Message) -> dict[str, Any
         in_reply_to = (message.metadata or {}).get("in_reply_to") if message.metadata else None
         if in_reply_to:
             payload["in_reply_to"] = str(in_reply_to)
+        reply_to = (message.metadata or {}).get("reply_to") if message.metadata else None
+        if not reply_to:
+            reply_to = os.getenv(_EMAIL_REPLY_TO_ENV)
+        if reply_to:
+            payload["reply_to"] = str(reply_to)
         return payload
     return {"to": message.identity, "body": message.text or ""}

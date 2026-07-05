@@ -216,6 +216,7 @@ Highlights (see `.env.example` for the full list):
 | `CELERY__BROKER_URL`, `CELERY__RESULT_BACKEND` | Redis logical DBs 1 and 2 |
 | `MCP__ENABLED` | `false` (default — uses in-memory MCP fakes) / `true` (calls the real cluster) |
 | `MCP__ENDPOINT` | MCP cluster base URL |
+| `COMMUNICATION_EMAIL_REPLY_TO` | Reply-To address for agent emails, routed to SendGrid Inbound Parse (`agent@reply.uat.madadfintech.com` in UAT, `agent@reply.madadfintech.com` in prod) |
 | `SECURITY__JWT_SECRET` | Public-API bearer JWT — required in prod |
 | `SECURITY__WEBHOOK_SECRET` | HMAC over Madad-platform callback bodies — required in prod |
 | `ADMIN_API_TOKEN` | Admin bearer (CMS + Operational Visibility panels) |

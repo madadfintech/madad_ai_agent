@@ -3714,6 +3714,13 @@ class OnboardingWorkflow(WorkflowDefinition):
         # False, so infra failure ALWAYS falls through to "proceed" — we never
         # trap the SME because our own classifier broke.
         classifier_said_not_cr = False
+        if state.cr_ref and not token:
+            ctx.logger.warning(
+                "cr_upload.no_token",
+                filename=state.cr_ref,
+                note="CR upload cannot persist without an access token; retrying node",
+            )
+            raise RuntimeError("Cannot upload CR without a live access token")
         if token and state.cr_ref:
             try:
                 cls = await self._kyc.classify_document_base64(
@@ -3814,8 +3821,9 @@ class OnboardingWorkflow(WorkflowDefinition):
             except Exception as exc:  # noqa: BLE001 — degrade in staging
                 ctx.logger.warning(
                     "cr_upload.forced_failed", error=str(exc)[:200],
-                    note="forced CR upload failed; CR not recorded — surface to ops",
+                    note="forced CR upload failed; retrying node instead of advancing",
                 )
+                raise RuntimeError("CR upload failed") from exc
         # Step 2 — CR uploaded (backend journey_status: INCOMPLETE).
         progress_step = await self._update_progress(state, ctx, step=2)
         return self._step(
@@ -4077,7 +4085,15 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _financials_upload_base64(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        if state.access_token and state.financials_received:
+        token, refresh, expires = await self._live_token(state, ctx)
+        if state.financials_received and not token:
+            ctx.logger.warning(
+                "financials_upload.no_token",
+                filename=state.financials_filename or "audited_report.pdf",
+                note="Audited financials cannot persist without an access token; retrying node",
+            )
+            raise RuntimeError("Cannot upload audited financials without a live access token")
+        if token and state.financials_received:
             # [TEMP-DBG] obs.kyc.upload
             ctx.logger.info(
                 "[TEMP-DBG] obs.kyc.upload",
@@ -4089,22 +4105,23 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             try:
                 await self._kyc.upload_audited_financial_report(
-                    access_token=state.access_token,
+                    access_token=token,
                     content_base64=state.financials_content_base64 or "",
                     filename=state.financials_filename or "audited_report.pdf",
                     mime_type=state.financials_mime_type,
                 )
-            except Exception as exc:  # noqa: BLE001 — degrade in staging
+            except Exception as exc:  # noqa: BLE001
                 ctx.logger.warning(
                     "financials_upload.failed", error=str(exc)[:200],
-                    note="staging-tolerant: continuing without financials uploaded",
+                    note="audited financials not recorded; retrying node instead of advancing",
                 )
+                raise RuntimeError("Audited financials upload failed") from exc
         # Spec Step 3: right after the audited report, confirm the account is
         # created and share the Madad reference number, before pre-qualification.
         ref = ""
-        if state.access_token:
+        if token:
             try:
-                info = await self._identity.me(access_token=state.access_token)
+                info = await self._identity.me(access_token=token)
                 if isinstance(info, dict):
                     nested = info.get("user")
                     user = nested if isinstance(nested, dict) else info
@@ -4122,6 +4139,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         return self._step(
             "financials_upload_base64",
             ctx,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
 
@@ -9066,6 +9084,18 @@ class OnboardingWorkflow(WorkflowDefinition):
                     identifier=real_email,
                     create_onboarding_token=False,
                 )
+                if not session.access_token:
+                    ctx.logger.warning(
+                        "token.email_mint_empty",
+                        email=real_email,
+                        note="falling back to verified channel identity",
+                    )
+                    session = await self._identity.open_session(
+                        channel=_channel(ctx),
+                        identifier=ctx.identity,
+                        create_onboarding_token=False,
+                        create_user_if_missing=True,
+                    )
             else:
                 session = await self._identity.open_session(
                     channel=_channel(ctx),

@@ -120,6 +120,28 @@ try:
 except ValueError:
     _CR_MAX_REUPLOAD_NUDGES = 2
 
+# P0-1 doc-loss fix (2026-07-07): per-call budget for the KYC classify/upload
+# round-trips in the CR gate and the documents-upload loop. The classifier +
+# extractor Cloud Run services now run scale-to-zero, so the first call after
+# an idle period pays a 1-3 minute cold start; the previous 50s caps turned
+# every first-after-idle batch into a false "upload failed". Mirrors the
+# invoice path's 180-240s budgets. Env-overridable, floored at 60s so a typo
+# can never make uploads flakier than the old behaviour.
+try:
+    _DOC_CLASSIFY_UPLOAD_TIMEOUT_SECONDS = max(
+        60.0, float(os.getenv("DOC_CLASSIFY_UPLOAD_TIMEOUT_SECONDS", "240"))
+    )
+except ValueError:
+    _DOC_CLASSIFY_UPLOAD_TIMEOUT_SECONDS = 240.0
+
+# P0-1: dedupe window for the honest "we hit a snag saving your document"
+# notice. A raising upload node is retried 3x by the runtime (and revived on
+# the next inbound), re-running the whole node each time — without this window
+# the SME would get the same failure notice up to 3 times in a minute. Kept
+# in-process (keyed by run_id + site): a raising node cannot persist state, so
+# a checkpointed flag is not an option here.
+_UPLOAD_FAILURE_NOTICE_TTL_SECONDS = 300.0
+
 # The SME payment amount is ALWAYS resolved from the monetization products
 # (ACTIVE + chargedParty=SME) and the backend's authoritative payableAmount on
 # create — there is intentionally NO hardcoded fee fallback. If no SME product
@@ -2328,6 +2350,9 @@ class OnboardingWorkflow(WorkflowDefinition):
         # webhook retry races a still-running node. Optional: when None,
         # the InMemory fallback gives correct single-process behaviour.
         self._dedupe: WebhookDedupe = dedupe or InMemoryWebhookDedupe()
+        # P0-1: last time the honest upload-failure notice was sent, keyed by
+        # (run_id, site). See _UPLOAD_FAILURE_NOTICE_TTL_SECONDS.
+        self._upload_failure_notice_at: dict[tuple[str, str], float] = {}
 
     # -- graph wiring ---------------------------------------------------------
 
@@ -3714,6 +3739,23 @@ class OnboardingWorkflow(WorkflowDefinition):
         # False, so infra failure ALWAYS falls through to "proceed" — we never
         # trap the SME because our own classifier broke.
         classifier_said_not_cr = False
+        # P0-1 doc-loss fix: no live token means NOTHING below can persist the
+        # CR. The old code silently skipped classify+upload and still advanced
+        # to step 2 — the SME had already seen "Got it — checking…" and their
+        # CR was gone. Tell them honestly and RAISE so the runtime's 3x retry
+        # (and revive-on-next-inbound) re-runs this node with the checkpointed
+        # cr_content_base64 intact.
+        if state.cr_ref and not token:
+            ctx.logger.warning(
+                "cr_upload.no_token",
+                filename=state.cr_ref,
+                note="CR cannot persist without an access token; retrying node",
+            )
+            await self._notify_upload_failure(
+                ctx, state, site="cr_upload",
+                doc_hint="Commercial Registration (CR)",
+            )
+            raise RuntimeError("Cannot upload CR without a live access token")
         if token and state.cr_ref:
             try:
                 cls = await self._kyc.classify_document_base64(
@@ -3811,11 +3853,20 @@ class OnboardingWorkflow(WorkflowDefinition):
                     filename=state.cr_ref,
                     mime_type=state.cr_mime_type,
                 )
-            except Exception as exc:  # noqa: BLE001 — degrade in staging
+            except Exception as exc:  # noqa: BLE001 — notify, then re-raise
+                # P0-1 doc-loss fix: the CR did NOT persist. Never advance to
+                # step 2 past the "Got it — checking…" ack with a lost CR —
+                # send the honest notice and raise so the runtime retries this
+                # node (checkpointed cr_content_base64 intact).
                 ctx.logger.warning(
                     "cr_upload.forced_failed", error=str(exc)[:200],
-                    note="forced CR upload failed; CR not recorded — surface to ops",
+                    note="forced CR upload failed; retrying node instead of advancing",
                 )
+                await self._notify_upload_failure(
+                    ctx, state, site="cr_upload",
+                    doc_hint="Commercial Registration (CR)",
+                )
+                raise RuntimeError("CR upload failed") from exc
         # Step 2 — CR uploaded (backend journey_status: INCOMPLETE).
         progress_step = await self._update_progress(state, ctx, step=2)
         return self._step(
@@ -4077,7 +4128,30 @@ class OnboardingWorkflow(WorkflowDefinition):
     async def _financials_upload_base64(
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
-        if state.access_token and state.financials_received:
+        # P0-1 doc-loss fix: this was the ONLY upload node still gated on the
+        # raw ``state.access_token`` (900s TTL) — an audited report sent >15
+        # minutes after YES hit a 401, the except below logged
+        # "continuing without financials uploaded", and the flow STILL sent
+        # "account created" + set the backend step-3 gate. Mint a live token
+        # like every other upload node, and on mint-empty or upload failure
+        # notify honestly and RAISE so the runtime's 3x retry (and
+        # revive-on-next-inbound) re-runs with the checkpointed
+        # financials_content_base64 intact.
+        token, refresh, expires = await self._live_token(state, ctx)
+        if state.financials_received and not token:
+            ctx.logger.warning(
+                "financials_upload.no_token",
+                filename=state.financials_filename or "audited_report.pdf",
+                note="financials cannot persist without an access token; retrying node",
+            )
+            await self._notify_upload_failure(
+                ctx, state, site="financials_upload",
+                doc_hint="audited financial statement",
+            )
+            raise RuntimeError(
+                "Cannot upload audited financials without a live access token"
+            )
+        if token and state.financials_received:
             # [TEMP-DBG] obs.kyc.upload
             ctx.logger.info(
                 "[TEMP-DBG] obs.kyc.upload",
@@ -4089,22 +4163,27 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             try:
                 await self._kyc.upload_audited_financial_report(
-                    access_token=state.access_token,
+                    access_token=token,
                     content_base64=state.financials_content_base64 or "",
                     filename=state.financials_filename or "audited_report.pdf",
                     mime_type=state.financials_mime_type,
                 )
-            except Exception as exc:  # noqa: BLE001 — degrade in staging
+            except Exception as exc:  # noqa: BLE001 — notify, then re-raise
                 ctx.logger.warning(
                     "financials_upload.failed", error=str(exc)[:200],
-                    note="staging-tolerant: continuing without financials uploaded",
+                    note="financials not recorded; retrying node instead of advancing",
                 )
+                await self._notify_upload_failure(
+                    ctx, state, site="financials_upload",
+                    doc_hint="audited financial statement",
+                )
+                raise RuntimeError("Audited financials upload failed") from exc
         # Spec Step 3: right after the audited report, confirm the account is
         # created and share the Madad reference number, before pre-qualification.
         ref = ""
-        if state.access_token:
+        if token:
             try:
-                info = await self._identity.me(access_token=state.access_token)
+                info = await self._identity.me(access_token=token)
                 if isinstance(info, dict):
                     nested = info.get("user")
                     user = nested if isinstance(nested, dict) else info
@@ -4122,6 +4201,7 @@ class OnboardingWorkflow(WorkflowDefinition):
         return self._step(
             "financials_upload_base64",
             ctx,
+            access_token=token, refresh_token=refresh, token_expires_at=expires,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
         )
 
@@ -4850,6 +4930,11 @@ class OnboardingWorkflow(WorkflowDefinition):
         # this batch, so a saved-but-off-checklist/duplicate doc is NEVER
         # reported to the SME as "couldn't process" (false-negative fix).
         batch_upload_ok = False
+        # P0-1: count only CONFIRMED persists toward docs_uploaded_count (the
+        # count-based loop exit). Failed files must never arm the exit — the
+        # old ``+ len(attachments)`` advanced the flow to payment even when
+        # zero documents reached the backend.
+        zip_persisted_count = 0
         non_zip: list[dict[str, Any]] = []
         for att in attachments:
             if not _is_zip_attachment(att):
@@ -4869,18 +4954,20 @@ class OnboardingWorkflow(WorkflowDefinition):
             )
             try:
                 # Hard wall-clock cap so a hung Cloud-Run ZIP processor
-                # can't trap the node behind the workflow runtime's own
-                # 60s-per-attempt budget (Bug #1b 2026-06-09 forensic:
+                # can't trap the node forever (Bug #1b 2026-06-09 forensic:
                 # one ZIP call hung 3 minutes before the run timed out
-                # silently). 25s is enough for normal traffic and falls
-                # back to the local-unzip + per-file path on overrun.
+                # silently); overrun falls back to the local-unzip +
+                # per-file path. P0-1 (2026-07-07): budget raised to cover
+                # the scale-to-zero classifier/extractor cold start (1-3
+                # min) — the old 50s cap failed every first-after-idle
+                # batch. See _DOC_CLASSIFY_UPLOAD_TIMEOUT_SECONDS.
                 zip_response = await asyncio.wait_for(
                     self._kyc.classify_and_upload_zip_base64(
                         access_token=token,
                         content_base64=att.get("content_base64") or "",
                         filename=att.get("filename") or "",
                     ),
-                    timeout=50.0,
+                    timeout=_DOC_CLASSIFY_UPLOAD_TIMEOUT_SECONDS,
                 )
             except Exception as exc:  # noqa: BLE001 — fall back to local unzip
                 ctx.logger.warning(
@@ -4893,6 +4980,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 continue
             saw_zip = True
             batch_upload_ok = True  # the ZIP classify+upload round-trip succeeded
+            zip_persisted_count += 1  # P0-1: confirmed server-side persist
             # Per-file checklist shape per Ishan's docstring:
             # ``[{file_name, document_type, confidently_classified}, ...]``.
             # camelCase + snake_case + body-envelope all tolerated.
@@ -4955,14 +5043,17 @@ class OnboardingWorkflow(WorkflowDefinition):
                         filename=filename,
                         mime_type=att.get("mime_type"),
                     ),
-                    timeout=50.0,
+                    # P0-1: cover the scale-to-zero classifier/extractor
+                    # cold start (1-3 min); the old 50s cap failed every
+                    # first-after-idle batch.
+                    timeout=_DOC_CLASSIFY_UPLOAD_TIMEOUT_SECONDS,
                 )
-            except Exception as exc:  # noqa: BLE001 — degrade in staging
+            except Exception as exc:  # noqa: BLE001 — per-file isolation
                 ctx.logger.warning(
                     "classify_and_upload.failed",
                     filename=filename,
                     error=str(exc)[:200],
-                    note="staging-tolerant: continuing without this doc",
+                    note="doc did NOT persist; SME will be asked to resend it",
                 )
                 return False, None
             resolved: str | None = None
@@ -5000,10 +5091,22 @@ class OnboardingWorkflow(WorkflowDefinition):
         else:
             classify_results = []
 
+        # P0-1 doc-loss fix: files the backend never persisted (classify+upload
+        # raised / timed out / no token / explicit upload-failure flag) must
+        # NOT be acked as "received" — the old code bucketed them into
+        # ``unprocessed`` (⏳ "received, our team will review it"), a false
+        # receipt for a lost document. Collect them and ask for a resend; a
+        # persisted file whose type we can't infer gets an explicit
+        # "couldn't recognize it" ack instead of the old silent drop.
+        failed_files: list[str] = []
+        unrecognized_files: list[str] = []
         for att, (uploaded_ok, resolved_doc_type) in zip(
             non_zip, classify_results, strict=False
         ):
             filename = att.get("filename") or ""
+            if not uploaded_ok:
+                failed_files.append(filename or "one of your documents")
+                continue
             # QA #3 refinement (2026-06-09): two failure modes from the
             # classifier need different handling:
             #
@@ -5032,12 +5135,18 @@ class OnboardingWorkflow(WorkflowDefinition):
                     # re-bucket if needed.
                     doc_type = pending[0]
             if not doc_type:
+                # P0-1: the file DID persist (uploaded_ok) but we can't tell
+                # what it is and there's no pending slot to assign. The old
+                # code silently dropped it (no ack at all) — now the SME gets
+                # an explicit "couldn't recognize it" receipt below.
+                unrecognized_files.append(filename or "one of your documents")
                 continue
             # Bug #10b: only docs on the asked-for list earn ✅. Backend
             # picked a wrong type? → land as ⏳ "received, team will
             # review". The SME sees an honest receipt, never a false
-            # validation that fast-forwards the checklist.
-            if uploaded_ok and doc_type in expected:
+            # validation that fast-forwards the checklist. (uploaded_ok is
+            # guaranteed True here — failures were collected above.)
+            if doc_type in expected:
                 if doc_type in pending:
                     pending.remove(doc_type)
                 if doc_type not in validated:
@@ -5074,6 +5183,33 @@ class OnboardingWorkflow(WorkflowDefinition):
             missing_after=list(pending),
             batch_upload_ok=batch_upload_ok,
         )
+        # P0-1: honest per-file failure receipt — name exactly which files did
+        # NOT reach us so the SME knows what to resend (they are not counted
+        # below and their checklist slots stay pending). Best-effort send: the
+        # rest of the batch's bookkeeping must land regardless.
+        if failed_files or unrecognized_files:
+            rows = [
+                f"⚠️ {name} — we couldn't save this one. Please resend it."
+                for name in dict.fromkeys(failed_files)
+            ]
+            rows += [
+                (
+                    f"❓ {name} — received, but we couldn't recognize the "
+                    "document type. Our team will review it; if it was one of "
+                    "the required documents, please resend a clearer copy or "
+                    "tell me which document it is."
+                )
+                for name in dict.fromkeys(unrecognized_files)
+            ]
+            try:
+                await self._send(
+                    ctx, state, "onboarding.documents.single_received",
+                    {"results": "\n".join(rows)},
+                )
+            except Exception as exc:  # noqa: BLE001
+                ctx.logger.warning(
+                    "documents_failed_files_ack.failed", error=str(exc)[:200]
+                )
         # Remaining = required docs this batch did not land. Tracked locally so
         # generic-filename uploads reliably complete the checklist (we do not
         # re-query the backend's requested-docs list, which kept returning the
@@ -5086,7 +5222,19 @@ class OnboardingWorkflow(WorkflowDefinition):
         # ``_route_documents`` exits when the cumulative count meets the
         # required count regardless of pending slots. Mirrors the doc-
         # service's count-based unblock (PR #4, commit 6c05b1c).
-        new_uploaded_count = state.docs_uploaded_count + len(attachments)
+        # P0-1 doc-loss fix: count ONLY confirmed persists. The old
+        # ``+ len(attachments)`` also counted files whose classify+upload
+        # FAILED, arming the count-based exit and advancing the flow to
+        # payment with zero documents on the backend. Capped at
+        # ``len(attachments)`` so a locally-expanded ZIP (1 attachment → N
+        # members) can never count for MORE than the old behaviour and
+        # fast-forward the exit.
+        persisted_count = zip_persisted_count + sum(
+            1 for ok, _ in classify_results if ok
+        )
+        new_uploaded_count = state.docs_uploaded_count + min(
+            len(attachments), persisted_count
+        )
         more_docs_prompt_at = state.more_docs_prompt_at
         last_upload_at = now.isoformat()
         if not missing:
@@ -9066,6 +9214,21 @@ class OnboardingWorkflow(WorkflowDefinition):
                     identifier=real_email,
                     create_onboarding_token=False,
                 )
+                if not session.access_token:
+                    # P0-1: an email-keyed mint that comes back EMPTY (account
+                    # re-keyed / email mismatch) must not strand the upload —
+                    # fall back to the verified channel identity, same as the
+                    # default path below.
+                    ctx.logger.warning(
+                        "token.email_mint_empty",
+                        note="falling back to verified channel identity",
+                    )
+                    session = await self._identity.open_session(
+                        channel=_channel(ctx),
+                        identifier=ctx.identity,
+                        create_onboarding_token=False,
+                        create_user_if_missing=True,
+                    )
             else:
                 session = await self._identity.open_session(
                     channel=_channel(ctx),
@@ -9280,6 +9443,50 @@ class OnboardingWorkflow(WorkflowDefinition):
             "onboarding.help.contextual",
             {"answer": answer, "next_step": next_step},
         )
+
+    async def _notify_upload_failure(
+        self,
+        ctx: WorkflowContext,
+        state: OnboardingState,
+        *,
+        site: str,
+        doc_hint: str,
+    ) -> None:
+        """P0-1: honest notice that a document did NOT persist, before raising.
+
+        Mirrors the invoice path's failure UX ("we hit a snag — resend") instead
+        of the old silent warn-and-continue that told the SME their doc was
+        received when it was lost. Deduped per (run, site) within
+        ``_UPLOAD_FAILURE_NOTICE_TTL_SECONDS`` because the caller raises right
+        after and the runtime re-runs the whole node up to 3 times. Send
+        failures are swallowed — the raise (and the runtime retry it drives) is
+        the load-bearing part, the notice is best-effort.
+        """
+
+        key = (ctx.run_id, site)
+        now_ts = ctx.clock.now().timestamp()
+        last = self._upload_failure_notice_at.get(key)
+        if last is not None and now_ts - last < _UPLOAD_FAILURE_NOTICE_TTL_SECONDS:
+            return
+        self._upload_failure_notice_at[key] = now_ts
+        try:
+            await self._send(
+                ctx,
+                state,
+                "onboarding.help.contextual",
+                {
+                    "answer": (
+                        f"⚠️ We hit a snag saving your {doc_hint} on our side — "
+                        "we're retrying now. If you don't get a confirmation "
+                        "shortly, please resend it. 🙏"
+                    ),
+                    "next_step": _next_step_hint(state),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — notice is best-effort
+            ctx.logger.warning(
+                "upload_failure_notice.failed", site=site, error=str(exc)[:200]
+            )
 
     async def _send(
         self,

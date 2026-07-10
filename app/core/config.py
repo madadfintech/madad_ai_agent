@@ -237,7 +237,14 @@ class WorkflowSettings(BaseModel):
     # the node (zip pass + per-file fallback) needs headroom under this budget —
     # otherwise the backend finishes the upload but the agent times out at the
     # old 60s step cap and wrongly reports the docs as still missing.
-    step_timeout_seconds: float = 120.0
+    # Raised 120→300 (P0-1, 2026-07-07): the classifier/extractor Cloud Run
+    # services are scale-to-zero (1-3 min cold start) — per-call budgets for
+    # KYC classify/upload and invoice extract are now 180-240s
+    # (mcp.provider tool_timeouts + _DOC_CLASSIFY_UPLOAD_TIMEOUT_SECONDS), so
+    # the step budget needs headroom above them or the executor kills the
+    # node mid-upload and the SME's document is lost. Real work is still
+    # bounded by the per-call MCP timeouts; this is only the outer kill-switch.
+    step_timeout_seconds: float = 300.0
     # How long a session may wait for inbound input before it is considered
     # lapsed (drives nudge/timeout sweeps). 0 disables.
     session_ttl_seconds: int = 60 * 60 * 24 * 14  # 14 days

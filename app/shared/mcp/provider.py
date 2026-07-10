@@ -57,11 +57,18 @@ def _default_tool_timeouts() -> dict[str, float]:
         Tools.INVOICES_EXTRACT_INVOICE: 180.0,
         Tools.INVOICES_SUBMIT_INVOICE_BASE64: 120.0,
         Tools.INVOICES_SUBMIT_INVOICE: 120.0,
-        # KYC classify path is also OCR-heavy; the docs loop already wraps
-        # it in its own 50s wait_for but the underlying MCP layer should
-        # not pre-empt that with a 30s cap.
-        Tools.KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64: 90.0,
-        Tools.KYC_CLASSIFY_AND_UPLOAD_ZIP_BASE64: 180.0,
+        # KYC classify path is also OCR-heavy. P0-1 (2026-07-07): the
+        # classifier/extractor Cloud Run services now run scale-to-zero, so
+        # the first call after idle pays a 1-3 minute cold start — the old
+        # 90s/180s budgets (and the 30s global cap on the classify-only
+        # tool) turned every first-after-idle batch into a false "upload
+        # failed" and lost the SME's documents. Budgets now match the
+        # invoice path (>=180s); the docs loop's outer wait_for is
+        # _DOC_CLASSIFY_UPLOAD_TIMEOUT_SECONDS (default 240s) in
+        # onboarding.py. Env-overridable via MCP__TOOL_TIMEOUTS.
+        Tools.KYC_CLASSIFY_DOCUMENT_BASE64: 180.0,
+        Tools.KYC_CLASSIFY_AND_UPLOAD_DOCUMENT_BASE64: 240.0,
+        Tools.KYC_CLASSIFY_AND_UPLOAD_ZIP_BASE64: 240.0,
     }
 
 

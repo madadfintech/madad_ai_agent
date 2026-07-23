@@ -1361,6 +1361,19 @@ async def _llm_answer(user_text: str, step_hint: str) -> str | None:
         return None
 
 
+def _sha256_of_b64(content_base64: str | None) -> str | None:
+    """SHA-256 hex of the raw bytes behind a base64 string, for exact-duplicate
+    detection (the same CR re-sent at the audited-report step). Returns None on
+    empty/invalid input so callers simply skip the dedupe check."""
+    if not content_base64:
+        return None
+    try:
+        raw = base64.b64decode(content_base64, validate=False)
+    except Exception:  # noqa: BLE001
+        return None
+    return hashlib.sha256(raw).hexdigest() if raw else None
+
+
 def _valid_upload_attachments(value: Any) -> list[dict[str, Any]]:
     """Return only attachments with actual bytes for backend upload.
 
@@ -3651,6 +3664,7 @@ class OnboardingWorkflow(WorkflowDefinition):
                 cr_ref=first.get("filename"),
                 cr_filename=first.get("filename"),
                 cr_content_base64=first.get("content_base64") or "",
+                cr_content_sha256=_sha256_of_b64(first.get("content_base64") or ""),
                 cr_mime_type=first.get("mime_type"),
             )
         help_template = _off_script_template(reply)
@@ -3704,6 +3718,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             cr_ref=first.get("filename"),
             cr_filename=first.get("filename"),
             cr_content_base64=first.get("content_base64") or "",
+            cr_content_sha256=_sha256_of_b64(first.get("content_base64") or ""),
             cr_mime_type=first.get("mime_type"),
         )
 
@@ -4051,8 +4066,31 @@ class OnboardingWorkflow(WorkflowDefinition):
         reply = await_input({"waiting_for": "upload", "step": "financials"})
         attachments = _valid_upload_attachments(reply)
         if attachments:
-            await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
             first = attachments[0]
+            # Dup-CR guard (Naseer/Tawfeeq 2026-07): a byte-identical re-send of
+            # the CR at the audited-report step must NOT be stored as the audited
+            # financial report. Reject-only — we already hold the CR — nudge for
+            # the real financials and stay in await. Only an EXACT content match
+            # trips this, so a genuine audit report (any format) is never rejected.
+            if (
+                state.cr_content_sha256
+                and _sha256_of_b64(first.get("content_base64") or "")
+                == state.cr_content_sha256
+            ):
+                await self._send(
+                    ctx, state, "onboarding.help.contextual",
+                    {
+                        "answer": (
+                            "That looks like the Commercial Registration you already "
+                            "shared — we have it on file. 👍 To continue, please send "
+                            "your latest Audited Financial Statement (PDF or a clear "
+                            "photo)."
+                        ),
+                        "next_step": _next_step_hint(state),
+                    },
+                )
+                return self._step("financials_await", ctx, financials_received=False)
+            await self._reminders.suppress(target_ref=state.madad_user_id or ctx.session_id)
             try:
                 await self._send(ctx, state, "onboarding.financials.received")
             except Exception as exc:  # noqa: BLE001 - ack failure must not kill the run

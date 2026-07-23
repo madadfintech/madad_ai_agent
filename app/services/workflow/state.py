@@ -128,6 +128,11 @@ class OnboardingState(WorkflowState):
     cr_ref: str | None = None
     cr_filename: str | None = None
     cr_content_base64: str | None = None
+    # SHA-256 (hex) of the CR's raw bytes, captured at CR upload. Used ONLY to
+    # detect the customer re-sending the exact same CR file at the audited-report
+    # step (Naseer/Tawfeeq 2026-07): a byte-identical match is rejected as a
+    # duplicate CR instead of being stored as the audited financial report.
+    cr_content_sha256: str | None = None
     cr_mime_type: str | None = None
     # Whether the document uploaded at the CR step CONFIRMED as a Commercial
     # Registration. Gates the "registered in Qatar — all good" affirmation:

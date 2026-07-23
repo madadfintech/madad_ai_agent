@@ -5621,6 +5621,16 @@ class OnboardingWorkflow(WorkflowDefinition):
         # result will be ready soon" line every poll cycle (UAT 2026-06-13).
         if _is_inert_system_resume(payload):
             return self._step("prequalify_wait_await", ctx, prequalified=False)
+        # Additional-doc capture (user 2026-07-23): a doc sent while awaiting
+        # pre-qualification is NOT the audit report we asked for — store it as an
+        # ADDITIONAL_DOCUMENT so it is never lost (this is where Naseer's real
+        # audit report was dropped). Text-only replies fall through to the smart
+        # off-script answer below.
+        captured = await self._capture_additional_documents(state, ctx, payload)
+        if captured is not None:
+            return self._step(
+                "prequalify_wait_await", ctx, prequalified=False, **captured
+            )
         # Bug #7+#8 (2026-06-09): intent-route every off-script reply so each
         # type of question gets a meaningful answer instead of the same
         # canned "still pending" fallback every time the LLM is unavailable
@@ -5697,6 +5707,15 @@ class OnboardingWorkflow(WorkflowDefinition):
         # after the coffee message (UAT 2026-06-13).
         if _is_inert_system_resume(payload):
             return self._step("payment_wait_await", ctx, payment_ready=False)
+        # Additional-doc capture (user 2026-07-23): a doc sent while awaiting the
+        # Madad assessment/score is supplementary — store it as an
+        # ADDITIONAL_DOCUMENT so it is never lost. Text-only replies fall through
+        # to the smart off-script answer below.
+        captured = await self._capture_additional_documents(state, ctx, payload)
+        if captured is not None:
+            return self._step(
+                "payment_wait_await", ctx, payment_ready=False, **captured
+            )
         await self._contextual_off_script(
             ctx,
             state,
@@ -9481,6 +9500,79 @@ class OnboardingWorkflow(WorkflowDefinition):
             "onboarding.help.contextual",
             {"answer": answer, "next_step": next_step},
         )
+
+    async def _capture_additional_documents(
+        self, state: OnboardingState, ctx: WorkflowContext, payload: Any
+    ) -> dict[str, Any] | None:
+        """Idle-wait additional-doc capture (user 2026-07-23).
+
+        At the two IDLE wait states — awaiting pre-qualification and awaiting the
+        Madad assessment — the SME is NOT being asked for a specific document, so
+        ANY doc they send is stored as an ADDITIONAL_DOCUMENT and acknowledged
+        ("submitted to the team for review"), never lost. This is where Naseer's
+        real audit report was dropped. Deliberately OFF at active-collection steps
+        (CR / audit / checklist) so a required doc is never downgraded to
+        additional, and OFF once QUALIFIED / in offers / activated (those have
+        their own handling).
+
+        Returns a state-delta dict when >=1 attachment was captured (caller returns
+        it and stays parked); None when there were no attachments (caller proceeds
+        to its normal off-script / smart-answer handling). RAISES on a hard persist
+        failure so the runtime's retry + revive-on-next-inbound re-runs with the
+        checkpointed bytes rather than silently dropping the document.
+        """
+        attachments = _valid_upload_attachments(payload)
+        if not attachments:
+            return None
+        token, refresh, expires = await self._live_token(state, ctx)
+        if not token:
+            await self._notify_upload_failure(
+                ctx, state, site="additional_capture", doc_hint="document",
+            )
+            raise RuntimeError(
+                "Cannot store additional document without a live access token"
+            )
+        stored = 0
+        for att in attachments:
+            content = att.get("content_base64") or ""
+            if not content:
+                continue
+            try:
+                await self._kyc.upload_document_base64(
+                    access_token=token,
+                    content_base64=content,
+                    filename=att.get("filename") or "document.pdf",
+                    mime_type=att.get("mime_type"),
+                    document_type="ADDITIONAL_DOCUMENT",
+                )
+                stored += 1
+            except Exception as exc:  # noqa: BLE001 — notify + retry, never drop
+                await self._notify_upload_failure(
+                    ctx, state, site="additional_capture", doc_hint="document",
+                )
+                raise RuntimeError("Additional-document capture failed") from exc
+        if stored == 0:
+            return None
+        await self._reminders.suppress(
+            target_ref=state.madad_user_id or ctx.session_id
+        )
+        await self._send(
+            ctx, state, "onboarding.help.contextual",
+            {
+                "answer": (
+                    "Thanks — I've saved your document and submitted it to our "
+                    "team for review. 📄 You don't need to do anything else right "
+                    "now; we'll keep you posted as your application progresses. "
+                    "For any query, call +974 3017 3888."
+                ),
+                "next_step": "",
+            },
+        )
+        return {
+            "access_token": token,
+            "refresh_token": refresh,
+            "token_expires_at": expires,
+        }
 
     async def _notify_upload_failure(
         self,

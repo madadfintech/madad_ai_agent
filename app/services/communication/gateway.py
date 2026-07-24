@@ -151,6 +151,40 @@ class McpCommunicationGateway(CommunicationGateway):
                 raw=response,
             )
 
+        # Document attachment (EMAIL): the SAME ``document`` block, delivered as a
+        # SendGrid attachment via the email tool instead of dropped (email had no
+        # file path before). Reuses _build_outbound_payload for subject +
+        # threading + reply_to, then adds the attachment. NEW sibling branch — the
+        # WhatsApp document path above is untouched.
+        if (
+            message.channel is Channel.EMAIL
+            and isinstance(doc, dict)
+            and doc.get("content_base64")
+        ):
+            tool = Tools.EXT_SEND_EMAIL_TEXT
+            email_doc_payload = _build_outbound_payload(Channel.EMAIL, message)
+            caption = doc.get("caption")
+            if caption and not (message.text or "").strip():
+                email_doc_payload["body_text"] = caption
+            email_doc_payload["attachments"] = [
+                {
+                    "filename": doc.get("filename") or "document",
+                    "content_base64": doc["content_base64"],
+                    **({"mime_type": doc["mime_type"]} if doc.get("mime_type") else {}),
+                }
+            ]
+            try:
+                response = await self._tools.call_tool(tool, email_doc_payload)
+            except Exception as exc:  # noqa: BLE001 - normalize transport errors
+                raise GatewayError(
+                    f"MCP tool {tool!r} failed: {exc}", details={"tool": tool}
+                ) from exc
+            return OutboundDispatchResult(
+                accepted=bool(response.get("accepted", True)),
+                provider_message_id=response.get("provider_message_id"),
+                raw=response,
+            )
+
         # Interactive CTA-URL button (WhatsApp): a tappable "Pay QAR 6,000 →"
         # button instead of a raw link. Selected when the outbound message
         # carries a ``cta`` block in its metadata.

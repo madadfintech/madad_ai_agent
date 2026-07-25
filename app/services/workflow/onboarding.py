@@ -79,7 +79,6 @@ from datetime import datetime
 from typing import Any
 
 import httpx
-from langgraph.types import Command
 
 from app.services.document.checklist import ChecklistProvider
 from app.shared.workflow import (
@@ -245,28 +244,6 @@ _EMAIL_SUPPRESSED_ACKS = frozenset(
         "onboarding.invoice.bulk.processing",
     }
 )
-
-# Monotonic journey order of the resume-router labels. The cross-channel resync
-# guard reroutes a stale wait-node ONLY when the live status maps STRICTLY AHEAD
-# of it (forward-only) — so it can never bounce a run backward. Terminal end-states
-# sit above every active step so a genuine terminal reached on the other channel
-# still surfaces. Unknown labels default to no-reroute (see _is_forward).
-_ADVANCE_ORDER = {
-    "welcome": 0,
-    "email": 1,
-    "consent": 2,
-    "financials": 3,
-    "documents": 4,
-    "payment": 5,
-    "offers": 6,
-    "offer_confirmed": 7,
-    "activated": 8,
-    "rejected": 9,
-    "offer_expired": 9,
-    "application_open": 9,
-    "ineligible": 9,
-    "unqualified": 9,
-}
 
 # Default values for the seven KYC_UPDATE_ELIGIBILITY fields when the
 # operator-supplied form data doesn't include them. Chosen so the staging
@@ -3266,51 +3243,6 @@ class OnboardingWorkflow(WorkflowDefinition):
             account_has_email=has_email,
         )
 
-    @staticmethod
-    def _label_for_status(
-        s: "JourneyStatus | None", account_has_email: bool | None
-    ) -> str:
-        """Pure journey-status → resume-label map (16-status reference). Shared by
-        the resume router AND the cross-channel resync guard so both agree on where
-        a status routes — no drift."""
-        JS = JourneyStatus
-        if s is None:
-            return "welcome"
-        elif s in (JS.SIGN_UP, JS.ONBOARDED):
-            return "consent" if account_has_email else "email"
-        elif s == JS.ELIGIBLE:
-            return "financials"
-        elif s in (JS.INCOMPLETE, JS.UNVERIFIED, JS.VERIFIED, JS.PRE_QUALIFIED):
-            return "documents"
-        elif s == JS.QUALIFIED:
-            return "payment"
-        elif s == JS.ACCEPTED:
-            return "offers"
-        elif s == JS.OFFER_ACCEPTED:
-            return "offer_confirmed"
-        elif s == JS.OFFER_EXPIRED:
-            return "offer_expired"
-        elif s == JS.ACTIVATED:
-            return "activated"
-        elif s == JS.NOT_ACCEPTED:
-            return "rejected"
-        elif s == JS.OPEN:
-            return "application_open"
-        elif s == JS.IN_ELIGIBLE:
-            return "ineligible"
-        elif s == JS.UNQUALIFIED:
-            return "unqualified"
-        return "welcome"
-
-    @staticmethod
-    def _is_forward(here_label: str, target_label: str) -> bool:
-        """True only when target_label is STRICTLY ahead of here_label in the
-        journey. Unknown target → -1 (never ahead); unknown here → 999 (nothing
-        ahead). So an unrecognised label always yields no-reroute (safe)."""
-        return _ADVANCE_ORDER.get(target_label, -1) > _ADVANCE_ORDER.get(
-            here_label, 999
-        )
-
     def _route_resume_by_status(self, state: OnboardingState) -> str:
         """Map the canonical journey status → the node that re-enters the SME's
         current step. Spec confirmed with the user (2026-06-12), aligned to the
@@ -3318,99 +3250,42 @@ class OnboardingWorkflow(WorkflowDefinition):
         VERIFIED/PRE_QUALIFIED are all the document-submission phase (the loop
         asks for missing docs or shows the under-review message); payment is
         triggered at QUALIFIED, not before."""
-        decision = self._label_for_status(
-            state.journey_status, state.account_has_email
-        )
+        s = state.journey_status
+        JS = JourneyStatus
+        decision: str
+        if s is None:
+            decision = "welcome"
+        elif s in (JS.SIGN_UP, JS.ONBOARDED):
+            decision = "consent" if state.account_has_email else "email"
+        elif s == JS.ELIGIBLE:
+            decision = "financials"
+        elif s in (JS.INCOMPLETE, JS.UNVERIFIED, JS.VERIFIED, JS.PRE_QUALIFIED):
+            decision = "documents"
+        elif s == JS.QUALIFIED:
+            decision = "payment"
+        elif s == JS.ACCEPTED:
+            decision = "offers"
+        elif s == JS.OFFER_ACCEPTED:
+            decision = "offer_confirmed"
+        elif s == JS.OFFER_EXPIRED:
+            decision = "offer_expired"
+        elif s == JS.ACTIVATED:
+            decision = "activated"
+        elif s == JS.NOT_ACCEPTED:
+            decision = "rejected"
+        elif s == JS.OPEN:
+            decision = "application_open"
+        elif s == JS.IN_ELIGIBLE:
+            decision = "ineligible"
+        elif s == JS.UNQUALIFIED:
+            decision = "unqualified"
+        else:
+            decision = "welcome"
         # [TEMP-DBG] To find exact bug - Temp Logs
         return self._dbg_route(
             "_route_resume_by_status", state, decision,
             account_has_email=state.account_has_email,
         )
-
-    async def _resync_if_advanced(
-        self,
-        state: OnboardingState,
-        ctx: WorkflowContext,
-        reply: Any,
-        here_label: str,
-    ) -> Command | None:
-        """Cross-channel resync (2026-07-26 safe rebuild). A run parked on one
-        channel doesn't know the SME advanced on the OTHER channel. On a GENUINE
-        inbound at a wait-node, read the LIVE status; if it now routes STRICTLY
-        AHEAD of this node, acknowledge the other-channel action and bounce through
-        resume_status_fetch to the correct step. FORWARD-ONLY + live-token-gated: it
-        can never reroute backward (worst case: no-op), so the live flow gains no
-        new failure mode; and it fires only on real user text/uploads (never on
-        poll/webhook/payment event resumes), so it never preempts a node's own
-        event handlers.
-        """
-        # 1. Genuine user inbound only. Any typed event (payment / status_update /
-        #    docs_settle / phase1b_event / forced_status …) or a content-less
-        #    poll/webhook resume is left for the node's own handlers.
-        if isinstance(reply, dict):
-            if reply.get("type"):
-                return None
-            if (
-                reply.get("last_status_source") in {"poll", "webhook"}
-                and not reply.get("text")
-                and not reply.get("attachments")
-            ):
-                return None
-        # 2. Mint a LIVE token so the poll is real. The checkpoint strips tokens on
-        #    resume, so without this _poll_journey_status returns the STALE cached
-        #    status — the exact defect the first attempt shipped.
-        try:
-            fresh = (await self._live_token(state, ctx))[0]
-            if fresh:
-                state.access_token = fresh
-        except Exception as exc:  # noqa: BLE001 — tolerate; no reroute on failure
-            ctx.logger.warning(
-                "cross_channel.resync.token_failed", error=str(exc)[:200]
-            )
-            return None
-        # 3. Live status → forward-only decision.
-        try:
-            live = await self._poll_journey_status(state)
-        except Exception as exc:  # noqa: BLE001
-            ctx.logger.warning(
-                "cross_channel.resync.poll_failed", error=str(exc)[:200]
-            )
-            return None
-        if live is None:
-            return None
-        target = self._label_for_status(live, state.account_has_email)
-        if not self._is_forward(here_label, target):
-            return None
-        # 4. Advanced elsewhere → acknowledge the other channel + reroute to the
-        #    correct step (resume_status_fetch re-sends that step's prompt).
-        other = "email" if ctx.channel is Channel.WHATSAPP else "WhatsApp"
-        ctx.logger.info(
-            "cross_channel.resync",
-            here=here_label,
-            target=target,
-            status=str(live),
-            other=other,
-        )
-        state.journey_status = live  # live, not stale, for the ack's next-step hint
-        try:
-            await self._send(
-                ctx,
-                state,
-                "onboarding.help.contextual",
-                {
-                    "answer": (
-                        f"Good news — we've already received your documents on {other} "
-                        f"and moved your application forward, so there's no need to "
-                        f"resend them here."
-                    ),
-                    "next_step": _next_step_hint(state),
-                },
-            )
-        except Exception as exc:  # noqa: BLE001 — ack is best-effort
-            ctx.logger.warning(
-                "cross_channel.resync.ack_failed", error=str(exc)[:200]
-            )
-        return Command(goto="resume_status_fetch")
 
     async def _resume_rejected(
         self, state: OnboardingState, ctx: WorkflowContext
@@ -3779,10 +3654,6 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "consent_cr"})
-        # Cross-channel resync: if the SME advanced on the other channel, ack + reroute.
-        _resync = await self._resync_if_advanced(state, ctx, reply, "consent")
-        if _resync is not None:
-            return _resync
         # UAT 2026-06-16 nudge-spam RCA (Madad explicit ask): same
         # synthetic-resume guard as invoice_collect_await + campaign_await.
         # Without this, an orphaned-run poll OR a backend status_update
@@ -4208,10 +4079,6 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "financials"})
-        # Cross-channel resync: if the SME advanced on the other channel, ack + reroute.
-        _resync = await self._resync_if_advanced(state, ctx, reply, "financials")
-        if _resync is not None:
-            return _resync
         attachments = _valid_upload_attachments(reply)
         if attachments:
             first = attachments[0]
@@ -4731,10 +4598,6 @@ class OnboardingWorkflow(WorkflowDefinition):
         self, state: OnboardingState, ctx: WorkflowContext
     ) -> dict[str, Any]:
         reply = await_input({"waiting_for": "upload", "step": "documents"})
-        # Cross-channel resync: if the SME advanced on the other channel, ack + reroute.
-        _resync = await self._resync_if_advanced(state, ctx, reply, "documents")
-        if _resync is not None:
-            return _resync
         # UAT 2026-06-17 (RCA on +919497191690): ``qualified.waived`` can
         # land here if the admin waived the fee while the SME was still in
         # the docs loop. We previously advanced silently on the assumption

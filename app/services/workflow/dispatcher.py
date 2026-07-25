@@ -367,7 +367,41 @@ class OnboardingDispatcher:
                         )
                     except Exception:  # noqa: BLE001
                         pass
-        return await self._runtime.start(self._workflow, channel, identity, input=payload)
+        result = await self._runtime.start(
+            self._workflow, channel, identity, input=payload
+        )
+        # Cross-channel document continuation (2026-07-25). When the FIRST inbound
+        # on this channel CREATES the run and it parks ASKING for a document upload,
+        # but that same inbound ALREADY carried the document — e.g. a WhatsApp lead
+        # who gets frustrated, switches to email and sends their CR / audited
+        # financials / checklist in that first email — the run-creation flow would
+        # otherwise route to the step, send the "please upload X" prompt and drop
+        # the attachment. Replay the inbound ONCE as a resume so the parked upload
+        # step ingests the document (identically to how an already-waiting run would
+        # have processed it), landing the SME on the correct next step.
+        #
+        # Guarded tightly: only a fresh start (never a resume) that (a) is waiting,
+        # (b) actually carried attachments, and (c) parked on an "upload" prompt.
+        # A plain YES / text-only channel switch has no attachments → untouched;
+        # WhatsApp's first message is the YES/NO campaign ("reply" prompt) → untouched.
+        if (
+            result is not None
+            and result.waiting
+            and bool(payload.get("attachments"))
+            and isinstance(result.prompt, dict)
+            and result.prompt.get("waiting_for") == "upload"
+        ):
+            from app.core.logging import get_logger
+
+            get_logger(__name__).info(
+                "cross_channel.doc_replay_on_switch",
+                channel=str(channel),
+                identity=identity,
+                step=result.prompt.get("step"),
+                attachment_count=len(payload.get("attachments") or []),
+            )
+            return await self._runtime.resume(channel, identity, message=payload)
+        return result
 
 
 class UnknownEventTypeError(Exception):

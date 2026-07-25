@@ -231,6 +231,20 @@ TEMPLATE_KEYS = [
     "onboarding.repayment.overdue",
 ]
 
+# Intermediate "got it, processing now…" acks. On WhatsApp (live chat) they set
+# expectations; on EMAIL they are noise — a "checking now" email followed by the
+# real result is two emails where one suffices. _send suppresses these on the
+# EMAIL channel so email carries only completed-result messages (user 2026-07-26).
+_EMAIL_SUPPRESSED_ACKS = frozenset(
+    {
+        "onboarding.cr.received",
+        "onboarding.financials.received",
+        "onboarding.documents.processing",
+        "onboarding.invoice.processing",
+        "onboarding.invoice.bulk.processing",
+    }
+)
+
 # Default values for the seven KYC_UPDATE_ELIGIBILITY fields when the
 # operator-supplied form data doesn't include them. Chosen so the staging
 # demo against a known-eligible test account submits a passing record
@@ -9629,6 +9643,14 @@ class OnboardingWorkflow(WorkflowDefinition):
         locale: str | None = None,
     ) -> None:
         variables = variables or {}
+        # Email is not a live chat (user 2026-07-26): an intermediate "got it,
+        # checking now…" ack followed by the real result is two emails where one
+        # suffices. On the EMAIL channel we suppress these processing acks so email
+        # only carries completed-result messages; WhatsApp keeps them (chat UX).
+        # Best-effort ack — the node continues regardless, so there is no flow
+        # impact beyond not sending the intermediate email.
+        if ctx.channel is Channel.EMAIL and template_key in _EMAIL_SUPPRESSED_ACKS:
+            return
         # 24h-window fix: status messages can land outside Meta's customer-care
         # window, where free text is silently dropped. Approved templates are
         # valid in AND out of the window, so for mapped status keys we always

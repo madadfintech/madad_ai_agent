@@ -21,7 +21,25 @@ from typing import Any
 from app.shared.workflow import Channel, ExecutionResult, WorkflowRuntime
 from app.shared.workflow.enums import TERMINAL_STATUSES, RunStatus
 
+from .ports import MadadIdentityClient
 from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
+
+
+def _canon_whatsapp_identity(identity: str) -> str:
+    """Canonicalise a phone into the same E.164 form the inbound bridge keys
+    WhatsApp sessions by, so an email→phone resolution matches the SME's live
+    WhatsApp session key. Mirrors ``main._canon_event_identity`` (Qatar local
+    ``66563022`` → ``+97466563022``); duplicated here to avoid a dispatcher↔main
+    import cycle."""
+
+    if not identity:
+        return identity
+    digits = "".join(c for c in identity if c.isdigit())
+    if not digits:
+        return identity
+    if len(digits) == 8:  # Qatar local number -> prepend country code
+        digits = "974" + digits
+    return "+" + digits
 
 DEFAULT_WORKFLOW = "onboarding"
 
@@ -168,10 +186,16 @@ class OnboardingDispatcher:
         workflow: str = DEFAULT_WORKFLOW,
         dedupe: WebhookDedupe | None = None,
         allowed_event_types: frozenset[str] | set[str] | None = None,
+        identity: MadadIdentityClient | None = None,
     ) -> None:
         self._runtime = runtime
         self._workflow = workflow
         self._dedupe = dedupe or InMemoryWebhookDedupe()
+        # Cross-channel unify (2026-07-26): read-only registration lookups to map
+        # an inbound on one channel to the SME's single canonical run on the
+        # OTHER channel. Optional — when None (older wiring / some tests) the
+        # dispatcher behaves EXACTLY as before (no cross-channel resolution).
+        self._identity = identity
         self._allowed = frozenset(
             allowed_event_types if allowed_event_types is not None else ALL_BACKEND_EVENTS
         )
@@ -338,6 +362,66 @@ class OnboardingDispatcher:
                 channel, identity, payload, message_id=message_id
             )
 
+    async def _resolve_canonical_run(
+        self, channel: Channel, identity: str
+    ) -> tuple[Channel, str] | None:
+        """Cross-channel unify (2026-07-26). This inbound arrived on a channel
+        that has NO usable run of its own. If it belongs to an SME whose SINGLE
+        canonical run is live on the OTHER channel (they switched WhatsApp↔email),
+        return that run's ``(channel, identity)`` so the caller resumes THAT run —
+        replying back on THIS inbound's channel via ``io_channel``/``io_identity``
+        — instead of forking a second, drifting run.
+
+        Deliberately conservative: returns ``None`` (⇒ today's exact fresh-start
+        path) whenever ANYTHING is uncertain — no identity client, not registered,
+        no complementary phone/email on file, no active run on the other channel,
+        or any error. That conservatism is precisely what keeps the WhatsApp-only
+        real SME and every test member on their existing, unchanged path (a
+        WhatsApp inbound with a live WhatsApp run never even reaches here — the
+        same-channel branch in ``_dispatch_locked`` returns first).
+        """
+
+        if self._identity is None:
+            return None
+        try:
+            reg = await self._identity.check_registration(
+                identifier=identity, channel=channel
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(reg, dict) or not reg.get("registered"):
+            return None
+
+        # The complementary channel this SME could already be running on.
+        if channel is Channel.EMAIL:
+            phone = reg.get("phoneNumber")
+            if not phone:
+                return None
+            other_channel, other_identity = (
+                Channel.WHATSAPP,
+                _canon_whatsapp_identity(str(phone)),
+            )
+        elif channel is Channel.WHATSAPP:
+            email = reg.get("email")
+            if not email:
+                return None
+            other_channel, other_identity = Channel.EMAIL, str(email)
+        else:
+            return None
+
+        # Never resolve to this same inbound (defensive against a phone that
+        # canonicalises back to its own identity).
+        if other_channel is channel and other_identity == identity:
+            return None
+
+        session = await self._runtime.sessions.get(other_channel, other_identity)
+        if session is None or not session.active_run_id:
+            return None
+        run = await self._runtime.run_store.get_or_none(session.active_run_id)
+        if run is None or run.status in TERMINAL_STATUSES:
+            return None
+        return other_channel, other_identity
+
     async def _dispatch_locked(
         self,
         channel: Channel,
@@ -367,6 +451,58 @@ class OnboardingDispatcher:
                         )
                     except Exception:  # noqa: BLE001
                         pass
+
+        # Cross-channel unify (2026-07-26). No usable run keyed on THIS inbound's
+        # own (channel, identity). Before forking a fresh run, check whether the
+        # SME already has their single canonical run live on the OTHER channel
+        # (they switched WhatsApp↔email). If so, resume THAT run and reply back on
+        # THIS channel via io_channel/io_identity — one SME, one state, two
+        # channels. `_resolve_canonical_run` is fully conservative: any
+        # uncertainty returns None and we fall through to today's fresh start.
+        canonical = await self._resolve_canonical_run(channel, identity)
+        if canonical is not None:
+            canon_channel, canon_identity = canonical
+            # The per-identity lock we already hold (from `_dispatch`) is keyed on
+            # THIS inbound's channel; take the CANONICAL run's own lock too so a
+            # near-simultaneous send on the other channel can't drive two
+            # concurrent resumes against the same parked run (Bug #11). The two
+            # keys always differ (guarded in `_resolve_canonical_run`), so this
+            # never re-enters the lock we hold.
+            canon_lock = await self._identity_lock(canon_channel, canon_identity)
+            from app.core.logging import get_logger
+
+            try:
+                async with canon_lock:
+                    get_logger(__name__).info(
+                        "cross_channel.unify_resume",
+                        inbound_channel=str(channel),
+                        inbound_identity=identity,
+                        canonical_channel=str(canon_channel),
+                        canonical_identity=canon_identity,
+                    )
+                    return await self._runtime.resume(
+                        canon_channel,
+                        canon_identity,
+                        message=payload,
+                        io_channel=channel,
+                        io_identity=identity,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # TOCTOU (mirrors the revivable-run branch above): between
+                # `_resolve_canonical_run` confirming the canonical run was live
+                # and this resume, a concurrent same-channel resume could have
+                # completed/failed it, or the session could have been reset —
+                # `resume` then raises (SessionNotFound / already-terminal).
+                # Degrade to today's fresh-start path below instead of erroring
+                # the inbound, so the SME is never left stuck.
+                get_logger(__name__).warning(
+                    "cross_channel.unify_resume_failed_fallthrough",
+                    inbound_channel=str(channel),
+                    inbound_identity=identity,
+                    canonical_channel=str(canon_channel),
+                    error=str(exc)[:200],
+                )
+
         result = await self._runtime.start(
             self._workflow, channel, identity, input=payload
         )

@@ -73,9 +73,13 @@ def build_onboarding_platform(
     # invoice inflight guard (UAT 2026-06-19: slow OCR causes webhook
     # retries to race the still-running node).
     shared_dedupe = dedupe or InMemoryWebhookDedupe()
+    # Resolve the identity client ONCE so the workflow and the dispatcher share
+    # the SAME instance — the dispatcher uses it for cross-channel canonical-run
+    # resolution (email→phone), the workflow for its onboarding lookups.
+    identity_client = identity or InMemoryMadadIdentityClient()
     workflow = OnboardingWorkflow(
         messenger=messenger or RecordingMessenger(),
-        identity=identity or InMemoryMadadIdentityClient(),
+        identity=identity_client,
         kyc=kyc or InMemoryKycClient(required_documents=DEFAULT_REQUIRED_DOCS),
         payments=payments or InMemoryMonetizationPaymentClient(),
         reminders=reminders or RecordingReminders(),
@@ -90,6 +94,7 @@ def build_onboarding_platform(
         runtime,
         dedupe=shared_dedupe,
         allowed_event_types=allowed_event_types or ALL_BACKEND_EVENTS,
+        identity=identity_client,
     )
     return OnboardingPlatform(runtime=runtime, workflow=workflow, dispatcher=dispatcher)
 

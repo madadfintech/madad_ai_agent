@@ -154,8 +154,15 @@ class WorkflowExecutor:
         *,
         message: Any = None,
         correlation_id: str | None = None,
+        io_channel: Channel | None = None,
+        io_identity: str | None = None,
     ) -> ExecutionResult:
         """Resume the active run for a channel-identity with an inbound message.
+
+        ``channel``/``identity`` KEY the session/run (canonical, one per user).
+        ``io_channel``/``io_identity`` optionally carry the ACTUAL inbound medium
+        when it differs (cross-channel switch) so the reply lands on that channel;
+        both default to the run's own values (no change for same-channel traffic).
 
         This is the reconnect path: an inbound WhatsApp/email message resolves the
         session, finds its waiting run, and feeds the message in as the resume
@@ -183,7 +190,9 @@ class WorkflowExecutor:
         await self._transitions.transition(run, RunStatus.RUNNING, action="resume")
         await self._sessions.mark_active(session)
 
-        ctx = self._build_context(run)
+        ctx = self._build_context(
+            run, io_channel=io_channel, io_identity=io_identity
+        )
         await ctx.emit(WorkflowEventType.RUN_RESUMED, {})
         return await self._drive(
             compiled,
@@ -347,15 +356,27 @@ class WorkflowExecutor:
 
     # -- helpers --------------------------------------------------------------
 
-    def _build_context(self, run: WorkflowRun) -> WorkflowContext:
+    def _build_context(
+        self,
+        run: WorkflowRun,
+        *,
+        io_channel: Channel | None = None,
+        io_identity: str | None = None,
+    ) -> WorkflowContext:
+        # Unified cross-channel (2026-07-26): the run is KEYED by its canonical
+        # (channel, identity) — one run per user — but a given inbound may arrive
+        # on a DIFFERENT channel (the SME switched WhatsApp↔email). io_channel /
+        # io_identity carry that actual inbound medium so the reply goes back on it,
+        # while session/checkpoint keying stays on run.channel/run.identity. Both
+        # default to the run's own values, so every existing caller is unchanged.
         return WorkflowContext(
             run_id=run.run_id,
             session_id=run.session_id,
             thread_id=run.thread_id,
             workflow=run.workflow,
             version=run.version,
-            channel=run.channel,
-            identity=run.identity,
+            channel=io_channel if io_channel is not None else run.channel,
+            identity=io_identity if io_identity is not None else run.identity,
             clock=self._clock,
             events=self._events,
             logger=self._log,

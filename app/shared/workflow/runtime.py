@@ -106,9 +106,16 @@ class WorkflowRuntime:
         *,
         message: Any = None,
         correlation_id: str | None = None,
+        io_channel: Channel | None = None,
+        io_identity: str | None = None,
     ) -> ExecutionResult:
         return await self.executor.resume(
-            channel, identity, message=message, correlation_id=correlation_id
+            channel,
+            identity,
+            message=message,
+            correlation_id=correlation_id,
+            io_channel=io_channel,
+            io_identity=io_identity,
         )
 
     async def revive_failed_run(self, run: Any) -> None:

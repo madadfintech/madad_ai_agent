@@ -21,7 +21,7 @@ from typing import Any
 from app.shared.workflow import Channel, ExecutionResult, WorkflowRuntime
 from app.shared.workflow.enums import TERMINAL_STATUSES, RunStatus
 
-from .ports import MadadIdentityClient
+from .ports import MadadIdentityClient, Messenger
 from .webhook_dedupe import InMemoryWebhookDedupe, WebhookDedupe
 
 
@@ -187,6 +187,7 @@ class OnboardingDispatcher:
         dedupe: WebhookDedupe | None = None,
         allowed_event_types: frozenset[str] | set[str] | None = None,
         identity: MadadIdentityClient | None = None,
+        messenger: Messenger | None = None,
     ) -> None:
         self._runtime = runtime
         self._workflow = workflow
@@ -196,6 +197,10 @@ class OnboardingDispatcher:
         # OTHER channel. Optional — when None (older wiring / some tests) the
         # dispatcher behaves EXACTLY as before (no cross-channel resolution).
         self._identity = identity
+        # Cross-channel switch-progress ping (user 2026-07-26): when the SME
+        # switches channels, notify the ORIGIN channel that their application
+        # continued on the other one. Optional — None ⇒ no ping.
+        self._messenger = messenger
         self._allowed = frozenset(
             allowed_event_types if allowed_event_types is not None else ALL_BACKEND_EVENTS
         )
@@ -422,6 +427,68 @@ class OnboardingDispatcher:
             return None
         return other_channel, other_identity
 
+    async def _maybe_switch_ping(
+        self,
+        *,
+        home_channel: Channel,
+        home_identity: str,
+        inbound_channel: Channel,
+        result: ExecutionResult | None,
+    ) -> None:
+        """Cross-channel switch-progress ping (user 2026-07-26): tell the SME's
+        ORIGIN/home channel that their application just continued over the other
+        channel and is in sync. Fires at most once per (home, inbound-channel) per
+        dedupe window so a burst of emails doesn't spam WhatsApp. Entirely
+        best-effort: no messenger, a dedupe hit, or a send error is swallowed —
+        the resume already succeeded and must never be affected.
+
+        NOTE: a ping to WhatsApp is free text, so Meta may drop it if the SME's
+        WhatsApp 24h window has closed; in the common flow they were just active on
+        WhatsApp so the window is open. Milestone content itself is covered
+        separately by the in-workflow milestone mirror."""
+
+        if self._messenger is None:
+            return
+        try:
+            claim_key = (
+                f"switch_ping:{home_channel.value}:{home_identity}:{inbound_channel.value}"
+            )
+            if not await self._dedupe.claim(claim_key):
+                return
+            step = None
+            prompt = getattr(result, "prompt", None)
+            if isinstance(prompt, dict):
+                step = prompt.get("step")
+            other_label = "email" if inbound_channel is Channel.EMAIL else "WhatsApp"
+            step_line = (
+                f" You're now at: {str(step).replace('_', ' ')}." if step else ""
+            )
+            answer = (
+                f"📲 Quick update — your Madad application just continued over "
+                f"{other_label}, and it's fully in sync here too.{step_line} You can "
+                f"reply on WhatsApp or email anytime."
+            )
+            await self._messenger.send(
+                channel=home_channel,
+                identity=home_identity,
+                template_key="onboarding.help.contextual",
+                variables={"answer": answer, "next_step": ""},
+                locale="en",
+            )
+            from app.core.logging import get_logger
+
+            get_logger(__name__).info(
+                "cross_channel.switch_ping_sent",
+                home_channel=home_channel.value,
+                inbound_channel=inbound_channel.value,
+            )
+        except Exception as exc:  # noqa: BLE001 — ping is best-effort
+            from app.core.logging import get_logger
+
+            get_logger(__name__).warning(
+                "cross_channel.switch_ping_failed", error=str(exc)[:200]
+            )
+
     async def _dispatch_locked(
         self,
         channel: Channel,
@@ -480,13 +547,24 @@ class OnboardingDispatcher:
                         canonical_channel=str(canon_channel),
                         canonical_identity=canon_identity,
                     )
-                    return await self._runtime.resume(
+                    result = await self._runtime.resume(
                         canon_channel,
                         canon_identity,
                         message=payload,
                         io_channel=channel,
                         io_identity=identity,
                     )
+                # Switch-progress ping: the SME just moved from their home channel
+                # (canonical) to `channel`; let the home channel know their
+                # application continued elsewhere and is in sync. Best-effort, run
+                # OUTSIDE the lock (a ping failure must never affect the resume).
+                await self._maybe_switch_ping(
+                    home_channel=canon_channel,
+                    home_identity=canon_identity,
+                    inbound_channel=channel,
+                    result=result,
+                )
+                return result
             except Exception as exc:  # noqa: BLE001
                 # TOCTOU (mirrors the revivable-run branch above): between
                 # `_resolve_canonical_run` confirming the canonical run was live

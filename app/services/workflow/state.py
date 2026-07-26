@@ -5,13 +5,26 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
 from app.shared.workflow.state import WorkflowState
 
 from .ports import ChannelSession, ContactCheckResult, SessionType
+
+
+def _channel_union(existing: list[str], incoming: list[str]) -> list[str]:
+    """Reducer: accumulate the DISTINCT I/O channels the SME has been seen on,
+    across every node transition, order-preserving. Two+ entries ⇒ the SME has
+    used both WhatsApp and email (cross-channel), which gates milestone mirroring
+    (send the same milestone on both channels) — see [[cross-channel-onboarding-feature]]."""
+
+    out = list(existing or [])
+    for ch in incoming or []:
+        if ch and ch not in out:
+            out.append(ch)
+    return out
 
 StatusSource = Literal["webhook", "poll", "chat"]
 
@@ -167,6 +180,11 @@ class OnboardingState(WorkflowState):
     # entity NEVER loses a customer document, on WhatsApp or email. Each entry:
     # {filename, content_base64, mime_type}.
     pending_extra_documents: list[dict[str, Any]] = Field(default_factory=list)
+    # Cross-channel sync (user 2026-07-26): the DISTINCT I/O channels this SME has
+    # been seen on (reducer-accumulated by _step every transition). len>=2 means
+    # they've used BOTH WhatsApp and email — the gate for mirroring a milestone
+    # message to the other channel so context stays in sync on both.
+    channels_seen: Annotated[list[str], _channel_union] = Field(default_factory=list)
 
     # Step 5–6: dynamic checklist + counterparties.
     missing_documents: list[str] = []

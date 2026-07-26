@@ -77,8 +77,9 @@ def build_onboarding_platform(
     # the SAME instance — the dispatcher uses it for cross-channel canonical-run
     # resolution (email→phone), the workflow for its onboarding lookups.
     identity_client = identity or InMemoryMadadIdentityClient()
+    messenger_client = messenger or RecordingMessenger()
     workflow = OnboardingWorkflow(
-        messenger=messenger or RecordingMessenger(),
+        messenger=messenger_client,
         identity=identity_client,
         kyc=kyc or InMemoryKycClient(required_documents=DEFAULT_REQUIRED_DOCS),
         payments=payments or InMemoryMonetizationPaymentClient(),
@@ -95,6 +96,7 @@ def build_onboarding_platform(
         dedupe=shared_dedupe,
         allowed_event_types=allowed_event_types or ALL_BACKEND_EVENTS,
         identity=identity_client,
+        messenger=messenger_client,
     )
     return OnboardingPlatform(runtime=runtime, workflow=workflow, dispatcher=dispatcher)
 

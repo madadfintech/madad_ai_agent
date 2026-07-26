@@ -70,11 +70,16 @@ async def test_email_switch_resumes_whatsapp_run_and_replies_on_email(harness) -
 
     # (1) The reply went back out on EMAIL, addressed to the email — not WhatsApp.
     new_sends = harness.messenger.sent[before:]
-    assert new_sends, "expected at least one outbound after the email inbound"
-    assert all(s["channel"] is EMAIL for s in new_sends), (
-        f"reply must route on EMAIL, got {[s['channel'] for s in new_sends]}"
-    )
-    assert all(s["identity"] == EMAIL_ADDR for s in new_sends)
+    email_sends = [s for s in new_sends if s["channel"] is EMAIL]
+    assert email_sends, "the document reply must route on EMAIL"
+    assert all(s["identity"] == EMAIL_ADDR for s in email_sends)
+    # A WhatsApp switch-progress ping (Component C) is also expected — the only
+    # allowed non-EMAIL send is that ping, to the canonical WhatsApp identity.
+    for s in new_sends:
+        if s["channel"] is not EMAIL:
+            assert s["channel"] is WA and s["identity"] == PHONE, (
+                f"unexpected non-email send: {s['channel']}/{s['identity']}"
+            )
 
     # (2) The SAME canonical WhatsApp run advanced — NOT a forked new run.
     wa_session = await harness.platform.runtime.sessions.get(WA, PHONE)

@@ -245,6 +245,36 @@ _EMAIL_SUPPRESSED_ACKS = frozenset(
     }
 )
 
+# Cross-channel milestone mirror (user 2026-07-26): application-PROGRESS messages
+# — status transitions the SME would want wherever they look. When the SME has
+# used BOTH channels (``channels_seen`` >= 2), _send delivers these on the OTHER
+# channel too (same template + variables ⇒ byte-identical message), so a
+# pre-qualified / offer / payment / disbursement update reaches WhatsApp AND
+# email. Deliberately EXCLUDES conversational acks/prompts (those stay on the
+# channel the SME is actively using) — only genuine milestones mirror.
+_MILESTONE_TEMPLATES = frozenset(
+    {
+        "onboarding.documents.checklist",   # 🎉 pre-qualified → upload checklist
+        "onboarding.not_pre_qualified",
+        "onboarding.not_qualified",
+        "onboarding.qualified.waived",
+        "onboarding.activated",
+        "onboarding.account.created",
+        "onboarding.payment.request",
+        "onboarding.payment.request.button",
+        "onboarding.payment.awaiting",
+        "onboarding.payment.confirmed",
+        "onboarding.offers.preview",
+        "onboarding.offer.confirmed",
+        "onboarding.disbursement.received",
+        "onboarding.repayment.received",
+        "onboarding.repayment.partially_paid",
+        "onboarding.repayment.closed",
+        "onboarding.repayment.due_soon",
+        "onboarding.repayment.overdue",
+    }
+)
+
 # Default values for the seven KYC_UPDATE_ELIGIBILITY fields when the
 # operator-supplied form data doesn't include them. Chosen so the staging
 # demo against a known-eligible test account submits a passing record
@@ -2274,7 +2304,14 @@ def _next_step_hint(state: OnboardingState) -> str:
         return f"Right now I need these documents:\n{_format_documents(state.missing_documents)}"
     if step in {"payment_send_link", "payment_await"}:
         return "Right now your payment link is ready. Once payment is complete, we will forward your application."  # noqa: E501
-    if step in {"documents_complete", "journey_wait_await", "lender_wait_await"}:
+    if step in {
+        "documents_complete",
+        "journey_wait_await",
+        "lender_wait_await",
+        # Awaiting the pre-qualification result — nothing is needed from the SME
+        # right now, so the status headline carries the message (user 2026-07-26).
+        "prequalify_wait_await",
+    }:
         # (user 2026-06-21) no canned "under review" line — it was wrongly
         # appended to every answer, incl. at the offer step. Stay silent here.
         return ""
@@ -2283,6 +2320,40 @@ def _next_step_hint(state: OnboardingState) -> str:
                 "financing here anytime. Submitted invoices are reviewed by "
                 "our team and you’ll get an update here once disbursed.")
     return "I’ll guide you step by step through the application."
+
+
+def _status_headline(state: OnboardingState, status: str | None) -> str:
+    """A human, stage-aware headline for a "what's my status?" question — from
+    WHERE the SME is in the journey, not the raw backend enum (which read as a
+    flat "status is UNVERIFIED"). Pairs with _next_step_hint for the next action
+    and the cross-channel sync note (user 2026-07-26)."""
+
+    step = state.history[-1].step if state.history else ""
+    if step in {"prequalify_wait_await", "prequalification_send"}:
+        return (
+            "Your documents are in and we're preparing your pre-qualification "
+            "result — usually within 24 hours. Nothing is needed from you right now."
+        )
+    if step == "not_pre_qualified":
+        return "We've completed the pre-qualification review of your application."
+    if step in {"payment_await", "payment_send_link"}:
+        return "🎉 You're pre-qualified! The next step is the one-time processing fee."
+    if step in {"journey_wait_await", "documents_complete"}:
+        return "Your application is submitted and with our team for review."
+    if step == "lender_wait_await":
+        return "Your application is being reviewed by our lending partners."
+    if step in {"invoice_collect_await", "invoice_collect_send"}:
+        return (
+            "Your credit line is active — you can submit invoices for financing "
+            "anytime."
+        )
+    if step in {"campaign_await", "campaign_send"}:
+        return "We're just getting started with your application."
+    if step:  # actively collecting a document / details
+        return "Your application is in progress."
+    if status:
+        return f"Your application is in progress (current stage: {status})."
+    return "Your application is in progress."
 
 
 def _is_conflict_error(exc: BaseException) -> bool:
@@ -9273,9 +9344,21 @@ class OnboardingWorkflow(WorkflowDefinition):
                     )
             except Exception:
                 pass
-        if status:
-            return f"Your Madad application status is {status}. I’ll keep guiding you here as the next step becomes available."  # noqa: E501
-        return "Your Madad application is in progress. I’ll keep guiding you here as the next step becomes available."  # noqa: E501
+        # A meaningful, human headline based on WHERE the SME actually is in the
+        # journey (not the raw backend enum), plus the concrete next action, plus a
+        # cross-channel note when they've used both channels — so "what's my
+        # status?" gets a real answer (user 2026-07-26).
+        headline = _status_headline(state, status)
+        parts = [headline]
+        hint = _next_step_hint(state)
+        if hint and hint != "I’ll guide you step by step through the application.":
+            parts.append(hint)
+        if len({c for c in (state.channels_seen or []) if c}) >= 2:
+            parts.append(
+                "Your WhatsApp and email are kept in sync — you can continue on "
+                "whichever is easiest."
+            )
+        return " ".join(p for p in parts if p)
 
     async def _safe_portal_answer(self, state: OnboardingState) -> str:
         unique_id = None
@@ -9768,6 +9851,53 @@ class OnboardingWorkflow(WorkflowDefinition):
         # impact beyond not sending the intermediate email.
         if ctx.channel is Channel.EMAIL and template_key in _EMAIL_SUPPRESSED_ACKS:
             return
+        # Primary send — on the channel this turn is running on.
+        await self._send_on(
+            ctx, state, _channel(ctx), ctx.identity, template_key, variables, locale
+        )
+        # Cross-channel milestone mirror (user 2026-07-26): if this is an
+        # application-PROGRESS milestone and the SME has used BOTH channels, deliver
+        # the SAME message (same template + variables ⇒ byte-identical) on the OTHER
+        # channel too, so context stays in sync. Best-effort — a mirror failure never
+        # affects the primary send or the run.
+        if template_key in _MILESTONE_TEMPLATES:
+            target = _mirror_target(state, ctx)
+            if target is not None:
+                other_channel, other_identity = target
+                if not (
+                    other_channel is Channel.EMAIL
+                    and template_key in _EMAIL_SUPPRESSED_ACKS
+                ):
+                    try:
+                        await self._send_on(
+                            ctx, state, other_channel, other_identity,
+                            template_key, variables, locale,
+                        )
+                        ctx.logger.info(
+                            "cross_channel.milestone_mirrored",
+                            template_key=template_key,
+                            to_channel=other_channel.value,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — mirror is best-effort
+                        ctx.logger.warning(
+                            "cross_channel.mirror_failed",
+                            template_key=template_key, error=str(exc)[:200],
+                        )
+
+    async def _send_on(
+        self,
+        ctx: WorkflowContext,
+        state: OnboardingState,
+        channel: Channel,
+        identity: str,
+        template_key: str,
+        variables: dict[str, Any],
+        locale: str | None,
+    ) -> None:
+        """Deliver one templated message to a specific ``(channel, identity)``.
+        Shared by the primary send and the cross-channel milestone mirror so both
+        get the 24h-safe WhatsApp-template-vs-free-text handling identically."""
+
         # 24h-window fix: status messages can land outside Meta's customer-care
         # window, where free text is silently dropped. Approved templates are
         # valid in AND out of the window, so for mapped status keys we always
@@ -9775,12 +9905,12 @@ class OnboardingWorkflow(WorkflowDefinition):
         # falls through to the original free-text send below — so behaviour is
         # unchanged for every other message and there is no regression.
         tpl = _STATUS_TEMPLATES.get(template_key)
-        if tpl and ctx.channel is Channel.WHATSAPP:
+        if tpl and channel is Channel.WHATSAPP:
             try:
                 comps = _status_components(template_key, variables, state)
                 if comps is not None and await self._msg.send_template(
-                    channel=_channel(ctx),
-                    identity=ctx.identity,
+                    channel=channel,
+                    identity=identity,
                     template_name=tpl,
                     template_key=template_key,
                     language_code=locale or state.locale,
@@ -9793,8 +9923,8 @@ class OnboardingWorkflow(WorkflowDefinition):
                     "status_template.failed", key=template_key, error=str(exc)[:200]
                 )
         await self._msg.send(
-            channel=_channel(ctx),
-            identity=ctx.identity,
+            channel=channel,
+            identity=identity,
             template_key=template_key,
             variables=variables,
             locale=locale or state.locale,
@@ -9846,6 +9976,11 @@ class OnboardingWorkflow(WorkflowDefinition):
     @staticmethod
     def _step(name: str, ctx: WorkflowContext, **fields: Any) -> dict[str, Any]:
         entry = HistoryEntry(step=name, at=ctx.clock.now().isoformat())
+        # Cross-channel sync: record the I/O channel of this turn so the state
+        # accumulates the DISTINCT channels the SME has used (union reducer). The
+        # caller may override channels_seen explicitly; only stamp when it didn't.
+        if "channels_seen" not in fields and ctx.channel is not None:
+            fields = {"channels_seen": [ctx.channel.value], **fields}
         return {"history": [entry], **fields}
 
     # -- [TEMP-DBG] To find exact bug - Temp Logs -----------------------------
@@ -9956,6 +10091,32 @@ class OnboardingWorkflow(WorkflowDefinition):
 def _channel(ctx: WorkflowContext) -> Channel:
     assert ctx.channel is not None
     return ctx.channel
+
+
+def _mirror_target(
+    state: OnboardingState, ctx: WorkflowContext
+) -> tuple[Channel, str] | None:
+    """Cross-channel milestone mirror (user 2026-07-26): the ``(channel, identity)``
+    to ALSO deliver a milestone to — or ``None``. Returns a target ONLY when the SME
+    has provably used BOTH channels (``channels_seen`` has 2+ distinct entries) and
+    we know the OTHER channel's address. The WhatsApp address is the run's canonical
+    identity; the email is the captured ``business_email`` (or the identity for an
+    email-home run). Never targets the same channel the message is already going to."""
+
+    if ctx.channel is None:
+        return None
+    seen = {str(c).lower() for c in (state.channels_seen or []) if c}
+    if len(seen) < 2:
+        return None
+    home = str(getattr(state.channel, "value", state.channel) or "").lower()
+    wa_addr = state.identity if home == "whatsapp" else None
+    email_addr = state.business_email or (state.identity if home == "email" else None)
+    current = str(getattr(ctx.channel, "value", ctx.channel) or "").lower()
+    if current == "whatsapp" and email_addr:
+        return (Channel.EMAIL, email_addr)
+    if current == "email" and wa_addr:
+        return (Channel.WHATSAPP, wa_addr)
+    return None
 
 
 # ── 24h-safe status templates ────────────────────────────────────────────────

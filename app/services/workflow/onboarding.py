@@ -3257,10 +3257,13 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "they respond (typically 3–5 business days)."
             ),
             "payment_link": (
-                "You're qualified for financing — please complete your "
-                "onboarding fee to forward your application to the banks. "
-                f"Log in at {PORTAL_HOST} to pay or reply 'pay' and I'll "
-                "re-send the payment link with the exact amount."
+                # Route fires for PRE_QUALIFIED and QUALIFIED alike, so the copy
+                # must NOT claim "qualified" (misleads a pre-qualified SME). Focus
+                # on the ACTION (user 2026-07-26).
+                "Your application has progressed 🎉 — the next step is your "
+                "one-time onboarding fee, which forwards your application to our "
+                f"partner banks. Log in at {PORTAL_HOST} to pay, or reply 'pay' "
+                "and I'll re-send the payment link with the exact amount."
             ),
             "continue_step": (
                 "Picking up where you left off — share the next document "

@@ -158,6 +158,15 @@ class OnboardingState(WorkflowState):
     financials_content_base64: str | None = None
     financials_mime_type: str | None = None
     application_ref: str | None = None  # Madad account ref (e.g. #7388266)
+    # Doc-preservation (user 2026-07-26): a customer can attach SEVERAL files in
+    # one message at a SINGLE-doc step (CR / audited financials). The intended doc
+    # takes its slot; every OTHER file's bytes are stashed here and uploaded as an
+    # ADDITIONAL_DOCUMENT right after the intended doc's upload node runs (where a
+    # live token + application target are guaranteed). The bytes live in the
+    # checkpoint and are removed ONLY once they actually persist — so a regulated
+    # entity NEVER loses a customer document, on WhatsApp or email. Each entry:
+    # {filename, content_base64, mime_type}.
+    pending_extra_documents: list[dict[str, Any]] = Field(default_factory=list)
 
     # Step 5–6: dynamic checklist + counterparties.
     missing_documents: list[str] = []

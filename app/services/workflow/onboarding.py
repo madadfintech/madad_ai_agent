@@ -1406,6 +1406,44 @@ def _valid_upload_attachments(value: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _extra_documents_to_stash(
+    attachments: list[dict[str, Any]],
+    *,
+    intended: dict[str, Any] | None,
+    cr_sha: str | None = None,
+) -> list[dict[str, Any]]:
+    """Doc-preservation (user 2026-07-26): at a SINGLE-doc step ONE file takes the
+    intended slot; every OTHER file is returned here (reduced to bytes) to be
+    persisted later as an ADDITIONAL_DOCUMENT, so a regulated entity never loses a
+    document. Deliberately DROPS: empty attachments, the intended file itself, a
+    re-sent CR (``cr_sha`` — we already hold it), and byte-identical duplicates —
+    so no document is ever stored twice. Empty result for the common single-file
+    case, so nothing is stashed unless the customer really sent extras."""
+
+    seen: set[str] = set()
+    if cr_sha:
+        seen.add(cr_sha)
+    if intended is not None:
+        seen.add(_sha256_of_b64(str(intended.get("content_base64") or "")))
+    extras: list[dict[str, Any]] = []
+    for att in attachments:
+        content = str(att.get("content_base64") or "").strip()
+        if not content:
+            continue
+        sha = _sha256_of_b64(content)
+        if sha in seen:
+            continue
+        seen.add(sha)
+        extras.append(
+            {
+                "filename": att.get("filename") or "document.pdf",
+                "content_base64": content,
+                "mime_type": att.get("mime_type"),
+            }
+        )
+    return extras
+
+
 def _is_zip_attachment(attachment: dict[str, Any]) -> bool:
     """True if the attachment is a ZIP archive (by mime type or extension)."""
 
@@ -3681,6 +3719,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                 cr_content_base64=first.get("content_base64") or "",
                 cr_content_sha256=_sha256_of_b64(first.get("content_base64") or ""),
                 cr_mime_type=first.get("mime_type"),
+                # Doc-preservation: any files sent ALONGSIDE the CR are stashed and
+                # persisted as ADDITIONAL_DOCUMENT after cr_upload runs — never lost.
+                pending_extra_documents=(state.pending_extra_documents or [])
+                + _extra_documents_to_stash(attachments, intended=first),
             )
         help_template = _off_script_template(reply)
         if help_template is not None:
@@ -3897,6 +3939,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                     doc_hint="Commercial Registration (CR)",
                 )
                 raise RuntimeError("CR upload failed") from exc
+        # Doc-preservation: the CR is now persisted (application target exists),
+        # so drain any files the customer sent ALONGSIDE the CR into ADDITIONAL
+        # documents. Best-effort — unpersisted ones stay in the checkpoint.
+        remaining_extras = await self._drain_pending_extras(state, ctx, token)
         # Step 2 — CR uploaded (backend journey_status: INCOMPLETE).
         progress_step = await self._update_progress(state, ctx, step=2)
         return self._step(
@@ -3906,6 +3952,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             cr_reject_count=0,  # reset once we advance past the CR step
             access_token=token, refresh_token=refresh, token_expires_at=expires,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
+            pending_extra_documents=remaining_extras,
         )
 
     # -- Step 3: eligibility intake ------------------------------------------
@@ -4081,17 +4128,24 @@ class OnboardingWorkflow(WorkflowDefinition):
         reply = await_input({"waiting_for": "upload", "step": "financials"})
         attachments = _valid_upload_attachments(reply)
         if attachments:
-            first = attachments[0]
-            # Dup-CR guard (Naseer/Tawfeeq 2026-07): a byte-identical re-send of
-            # the CR at the audited-report step must NOT be stored as the audited
-            # financial report. Reject-only — we already hold the CR — nudge for
-            # the real financials and stay in await. Only an EXACT content match
-            # trips this, so a genuine audit report (any format) is never rejected.
-            if (
-                state.cr_content_sha256
-                and _sha256_of_b64(first.get("content_base64") or "")
-                == state.cr_content_sha256
-            ):
+            # Dup-CR guard (Naseer/Tawfeeq 2026-07) + multi-doc preservation
+            # (2026-07-26): the customer may attach SEVERAL files at once, and one
+            # may be a byte-identical RE-SEND of the CR — which we already hold and
+            # must NOT store as the audited report. Pick the intended audited report
+            # = the FIRST attachment that is NOT a CR re-send; every other non-CR
+            # file is preserved as an additional document (never lost). Only an
+            # EXACT content match counts as a CR, so a genuine report is never
+            # skipped, whatever its format.
+            cr_sha = state.cr_content_sha256
+            first: dict[str, Any] | None = None
+            for att in attachments:
+                if cr_sha and _sha256_of_b64(att.get("content_base64") or "") == cr_sha:
+                    continue
+                first = att
+                break
+            if first is None:
+                # EVERY file was a re-sent CR → nudge for the real audited report.
+                # Nothing to stash (a duplicate CR is redundant — we hold it).
                 await self._send(
                     ctx, state, "onboarding.help.contextual",
                     {
@@ -4119,6 +4173,10 @@ class OnboardingWorkflow(WorkflowDefinition):
                 financials_content_base64=first.get("content_base64") or "",
                 financials_filename=first.get("filename") or "",
                 financials_mime_type=first.get("mime_type"),
+                # Doc-preservation: every OTHER file (non-CR, non-duplicate) is
+                # persisted as ADDITIONAL_DOCUMENT after the upload node — never lost.
+                pending_extra_documents=(state.pending_extra_documents or [])
+                + _extra_documents_to_stash(attachments, intended=first, cr_sha=cr_sha),
             )
         help_template = _off_script_template(reply)
         if help_template is not None:
@@ -4246,6 +4304,10 @@ class OnboardingWorkflow(WorkflowDefinition):
         if not ref:
             ref = (re.sub(r"\D", "", ctx.identity or "")[-8:] or "MADAD")
         await self._send(ctx, state, "onboarding.account.created", {"ref": ref})
+        # Doc-preservation: the audited report + account now exist, so drain any
+        # files the customer sent ALONGSIDE the report into ADDITIONAL documents.
+        # (This is the exact step where the multi-attachment email dropped extras.)
+        remaining_extras = await self._drain_pending_extras(state, ctx, token)
         # Step 3 — CRITICAL GATE. Per Ishan (2026-06-07): backend hard-gates
         # the pre-qualified document checklist on step >= 3. Without this call
         # the prequalification.completed webhook either won't fire or won't
@@ -4256,6 +4318,7 @@ class OnboardingWorkflow(WorkflowDefinition):
             ctx,
             access_token=token, refresh_token=refresh, token_expires_at=expires,
             onboarding_progress_step=progress_step or state.onboarding_progress_step,
+            pending_extra_documents=remaining_extras,
         )
 
     # -- Step 5-6: admin-requested documents + counterparties ----------------
@@ -9516,6 +9579,56 @@ class OnboardingWorkflow(WorkflowDefinition):
             {"answer": answer, "next_step": next_step},
         )
 
+    async def _drain_pending_extras(
+        self, state: OnboardingState, ctx: WorkflowContext, token: str | None
+    ) -> list[dict[str, Any]]:
+        """Upload any stashed extra documents as ADDITIONAL_DOCUMENT; return the
+        ones that STILL did not persist (kept in the checkpoint for a later retry).
+
+        Doc-preservation (user 2026-07-26): a customer can attach several files in
+        ONE message at a single-doc step (CR / audited financials). The intended
+        doc takes its slot; every other file is preserved here so NOTHING is ever
+        lost — on WhatsApp or email, even if extraction later fails. Only files
+        that actually persisted are dropped from the pending list, so the
+        checkpointed bytes survive until they truly land. Never raises: a failed
+        extra is simply retained and retried at the next drain point, so it can't
+        crash the run or re-upload the already-persisted intended doc."""
+
+        pending = list(state.pending_extra_documents or [])
+        if not pending or not token:
+            return pending
+        still_pending: list[dict[str, Any]] = []
+        saved = 0
+        for doc in pending:
+            content = str(doc.get("content_base64") or "").strip()
+            if not content:
+                continue  # nothing to persist — drop the empty placeholder
+            try:
+                await self._kyc.upload_document_base64(
+                    access_token=token,
+                    content_base64=content,
+                    filename=doc.get("filename") or "document.pdf",
+                    mime_type=doc.get("mime_type"),
+                    document_type="ADDITIONAL_DOCUMENT",
+                )
+                saved += 1
+            except Exception as exc:  # noqa: BLE001 — keep for retry, NEVER drop
+                ctx.logger.warning(
+                    "extra_document.persist_failed",
+                    filename=doc.get("filename"),
+                    error=str(exc)[:200],
+                    note="retained in checkpoint for retry; document not lost",
+                )
+                still_pending.append(doc)
+        if saved:
+            ctx.logger.info(
+                "extra_documents.persisted",
+                count=saved,
+                remaining=len(still_pending),
+                identity=ctx.identity,
+            )
+        return still_pending
+
     async def _capture_additional_documents(
         self, state: OnboardingState, ctx: WorkflowContext, payload: Any
     ) -> dict[str, Any] | None:
@@ -9583,10 +9696,14 @@ class OnboardingWorkflow(WorkflowDefinition):
                 "next_step": "",
             },
         )
+        # Backstop: also retry any extras stashed at an earlier single-doc step
+        # that hadn't persisted yet — so a leftover never lingers unsaved.
+        remaining_extras = await self._drain_pending_extras(state, ctx, token)
         return {
             "access_token": token,
             "refresh_token": refresh,
             "token_expires_at": expires,
+            "pending_extra_documents": remaining_extras,
         }
 
     async def _notify_upload_failure(

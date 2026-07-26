@@ -455,18 +455,14 @@ class OnboardingDispatcher:
             )
             if not await self._dedupe.claim(claim_key):
                 return
-            step = None
-            prompt = getattr(result, "prompt", None)
-            if isinstance(prompt, dict):
-                step = prompt.get("step")
+            # Customer-facing: NO internal step/terminology (user 2026-07-26) — this
+            # is an FYI, there's nothing for them to do, so just reassure them it's
+            # in sync. The channel they're actively on drives what to do next.
             other_label = "email" if inbound_channel is Channel.EMAIL else "WhatsApp"
-            step_line = (
-                f" You're now at: {str(step).replace('_', ' ')}." if step else ""
-            )
             answer = (
-                f"📲 Quick update — your Madad application just continued over "
-                f"{other_label}, and it's fully in sync here too.{step_line} You can "
-                f"reply on WhatsApp or email anytime."
+                f"📲 We noticed you're continuing over {other_label} — just letting "
+                f"you know your Madad application is fully in sync across WhatsApp and "
+                f"email. Nothing to do here; you can reply on whichever is easier."
             )
             await self._messenger.send(
                 channel=home_channel,

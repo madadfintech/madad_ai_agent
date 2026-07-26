@@ -48,9 +48,13 @@ async def test_switch_ping_fires_to_home_channel(make_harness) -> None:
     pings = [
         s for s in msg.sent[before:]
         if s["channel"] is WA
-        and "continued over" in str((s.get("variables") or {}).get("answer", "")).lower()
+        and "in sync" in str((s.get("variables") or {}).get("answer", "")).lower()
     ]
     assert pings, "expected a switch-progress ping on WhatsApp after the email switch"
+    # Customer-facing: the ping must NOT leak internal step terminology.
+    for s in pings:
+        ans = str((s.get("variables") or {}).get("answer", "")).lower()
+        assert "financ" not in ans and "await" not in ans, f"ping leaked internal term: {ans}"
 
 
 async def test_milestone_mirrors_to_both_channels_when_dual(make_harness) -> None:

@@ -59,6 +59,7 @@ from .broadcast import (
 )
 from .deps import OnboardingPlatform, get_onboarding_platform
 from .dispatcher import UnknownEventTypeError
+from .takeover import get_takeover_store, takeover_key
 from .email_inbound import SendgridInboundParser, to_inbound_request_dict
 
 
@@ -519,6 +520,22 @@ async def inbound(
         data_keys=sorted(req.data.keys()) if isinstance(req.data, dict) else None,
         message_id=message_id,
     )
+    # Human takeover: while a Madad teammate runs this chat from the CMS, the
+    # bot stays fully silent — the message is already logged upstream by the
+    # backend bridge, so nothing is lost; it just isn't dispatched to the
+    # workflow. 200 so the bridge never retries.
+    takeover = await get_takeover_store().get(
+        takeover_key(req.channel, _canon_event_identity(req.channel, req.identity))
+    )
+    if takeover:
+        _dbg_get_logger("workflow.inbound").info(
+            "inbound suppressed: human takeover active",
+            identity=req.identity, takeover_by=takeover.get("by"),
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"suppressed": True, "reason": "human_takeover"},
+        )
     result = await platform.dispatcher.inbound(
         req.channel,
         req.identity,
@@ -680,6 +697,23 @@ async def madad_event(
         journey_status=req.payload.get("journey_status") or req.payload.get("journeyStatus")
         if isinstance(req.payload, dict) else None,
     )
+    # Human takeover: backend state keeps changing upstream, but the bot must
+    # not message the user about it while a teammate runs the chat. Suppressed
+    # events are NOT queued — on release the workflow re-reads live state, so
+    # a stale flood on resume is impossible. 200 so the backend never retries.
+    takeover = await get_takeover_store().get(
+        takeover_key(req.channel, canon_identity)
+    )
+    if takeover:
+        _dbg_get_logger("workflow.event").info(
+            "backend event suppressed: human takeover active",
+            event_type=event_type, identity=canon_identity,
+            takeover_by=takeover.get("by"),
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"suppressed": True, "reason": "human_takeover"},
+        )
     try:
         result = await platform.dispatcher.on_backend_event(
             event_type=event_type,
@@ -764,6 +798,107 @@ async def forget_session(
         deleted_runs=len(thread_ids),
         deleted_checkpoint_threads=cleared_threads,
         thread_ids=thread_ids,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Human takeover — pause/resume the bot for one conversation (CMS live chat)
+# ---------------------------------------------------------------------------
+
+
+class TakeoverRequest(BaseModel):
+    channel: Channel
+    identity: str
+    by: str | None = None
+
+
+class TakeoverStatusResponse(BaseModel):
+    active: bool
+    by: str | None = None
+    since: str | None = None
+
+
+class TakeoverEndResponse(BaseModel):
+    released: bool
+    resumed: bool
+    current_step: str | None = None
+
+
+@app.post(
+    "/workflow/admin/takeover/start",
+    response_model=TakeoverStatusResponse,
+    dependencies=[Depends(require_admin)],
+)
+async def takeover_start(req: TakeoverRequest) -> TakeoverStatusResponse:
+    """Flag the conversation as human-run: the bot suppresses all inbound
+    dispatch and backend-event messaging for this identity until released.
+    Idempotent — starting an already-taken-over chat returns the original
+    record (first admin wins the attribution)."""
+    key = takeover_key(req.channel, _canon_event_identity(req.channel, req.identity))
+    rec = await get_takeover_store().start(key, by=req.by)
+    return TakeoverStatusResponse(
+        active=True, by=rec.get("by"), since=rec.get("since"),
+    )
+
+
+@app.post(
+    "/workflow/admin/takeover/end",
+    response_model=TakeoverEndResponse,
+    dependencies=[Depends(require_admin)],
+)
+async def takeover_end(
+    req: TakeoverRequest, platform: Platform
+) -> TakeoverEndResponse:
+    """Release the conversation back to the bot.
+
+    If an in-flight run is waiting for this identity, a synthetic resume is
+    dispatched so the workflow re-reads its CURRENT state and re-prompts the
+    step the user is actually on — state changes that happened during the
+    human conversation are naturally picked up. When no active run exists
+    (finished / never started) nothing is dispatched: releasing must never
+    START a new onboarding by side effect."""
+    canon = _canon_event_identity(req.channel, req.identity)
+    released = await get_takeover_store().end(takeover_key(req.channel, canon))
+
+    resumed = False
+    current_step: str | None = None
+    active = await _find_active_run(platform, req.channel, canon)
+    if active is not None:
+        try:
+            result = await platform.dispatcher.inbound(
+                req.channel,
+                canon,
+                text=None,
+                data={"resumed_after_human_takeover": True},
+                message_id=None,
+            )
+            if result is not None:
+                resumed = True
+                current_step = result.run.current_step
+        except Exception as exc:  # noqa: BLE001 — release must still succeed
+            from app.core.logging import get_logger
+
+            get_logger("workflow.takeover").warning(
+                "post-release resume failed", identity=canon, error=str(exc),
+            )
+    return TakeoverEndResponse(
+        released=released, resumed=resumed, current_step=current_step,
+    )
+
+
+@app.get(
+    "/workflow/admin/takeover/status",
+    response_model=TakeoverStatusResponse,
+    dependencies=[Depends(require_admin)],
+)
+async def takeover_status(channel: Channel, identity: str) -> TakeoverStatusResponse:
+    rec = await get_takeover_store().get(
+        takeover_key(channel, _canon_event_identity(channel, identity))
+    )
+    if not rec:
+        return TakeoverStatusResponse(active=False)
+    return TakeoverStatusResponse(
+        active=True, by=rec.get("by"), since=rec.get("since"),
     )
 
 

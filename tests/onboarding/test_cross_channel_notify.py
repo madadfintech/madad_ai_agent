@@ -57,6 +57,31 @@ async def test_switch_ping_fires_to_home_channel(make_harness) -> None:
         assert "financ" not in ans and "await" not in ans, f"ping leaked internal term: {ans}"
 
 
+async def test_email_destination_acknowledges_whatsapp_origin(make_harness) -> None:
+    """The channel the SME LANDS on (here email) must acknowledge the origin
+    channel on its first reply — the destination-side counterpart of the
+    origin switch-ping. Prepended once to the resume's first free-text reply."""
+    harness = make_harness()
+    msg = harness.messenger
+    await _drive_wa_to_financials(harness)
+    harness.identity.check_registration_overrides = {
+        EMAIL_ADDR: {"registered": True, "phoneNumber": PHONE, "email": EMAIL_ADDR},
+    }
+    before = len(msg.sent)
+    await harness.platform.dispatcher.inbound(
+        EMAIL, EMAIL_ADDR,
+        attachments=[{"filename": "Audit.pdf", "content_base64": AUDIT}],
+    )
+    email_answers = [
+        str((s.get("variables") or {}).get("answer", ""))
+        for s in msg.sent[before:]
+        if s["channel"] is EMAIL
+    ]
+    acks = [a for a in email_answers if "continuing from your whatsapp conversation" in a.lower()]
+    assert acks, f"email did not acknowledge WhatsApp origin; email answers={[a[:50] for a in email_answers]}"
+    assert len(acks) == 1, "cross-channel ack must be prepended exactly once per turn"
+
+
 async def test_milestone_mirrors_to_both_channels_when_dual(make_harness) -> None:
     harness = make_harness()
     runtime = harness.platform.runtime

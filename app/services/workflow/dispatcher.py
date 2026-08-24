@@ -427,6 +427,65 @@ class OnboardingDispatcher:
             return None
         return other_channel, other_identity
 
+    async def _maybe_destination_ack(
+        self,
+        *,
+        home_channel: Channel,
+        home_identity: str,
+        inbound_channel: Channel,
+        inbound_identity: str,
+    ) -> None:
+        """Cross-channel DESTINATION acknowledgment (counterpart of the origin
+        switch-ping): when the SME continues on a NEW channel, greet them THERE
+        naming the channel they came from — so e.g. an email continuation explicitly
+        acknowledges the WhatsApp conversation it's picking up from, matching how
+        WhatsApp already welcomes an email→WhatsApp switch. Sent as a short lead-in
+        BEFORE the resume reply so it reads as the opening line of the continuation.
+
+        Fires at most once per (inbound, home) switch via the same dedupe window as
+        the origin ping, so a burst of messages on the new channel doesn't repeat it.
+        Fully best-effort: no messenger, a dedupe hit, or a send error is swallowed —
+        the resume must never be affected.
+
+        NOTE: templates render server-side in the Communication service, so the
+        agent can't prepend into the resume's own (often structured) reply; a
+        dedicated one-line lead-in is the reliable, template-agnostic way to
+        acknowledge the origin on the destination channel."""
+
+        if self._messenger is None:
+            return
+        try:
+            claim_key = (
+                f"dest_ack:{inbound_channel.value}:{inbound_identity}:{home_channel.value}"
+            )
+            if not await self._dedupe.claim(claim_key):
+                return
+            origin_label = "WhatsApp" if home_channel is Channel.WHATSAPP else "email"
+            answer = (
+                f"👋 Continuing from your {origin_label} conversation — your Madad "
+                f"application is right where you left off. Here's the next step:"
+            )
+            await self._messenger.send(
+                channel=inbound_channel,
+                identity=inbound_identity,
+                template_key="onboarding.help.contextual",
+                variables={"answer": answer, "next_step": ""},
+                locale="en",
+            )
+            from app.core.logging import get_logger
+
+            get_logger(__name__).info(
+                "cross_channel.destination_ack_sent",
+                home_channel=home_channel.value,
+                inbound_channel=inbound_channel.value,
+            )
+        except Exception as exc:  # noqa: BLE001 — ack is best-effort
+            from app.core.logging import get_logger
+
+            get_logger(__name__).warning(
+                "cross_channel.destination_ack_failed", error=str(exc)[:200]
+            )
+
     async def _maybe_switch_ping(
         self,
         *,
@@ -542,6 +601,14 @@ class OnboardingDispatcher:
                         inbound_identity=identity,
                         canonical_channel=str(canon_channel),
                         canonical_identity=canon_identity,
+                    )
+                    # Destination-side lead-in: acknowledge the origin channel on the
+                    # channel the SME just switched TO, before the resume reply lands.
+                    await self._maybe_destination_ack(
+                        home_channel=canon_channel,
+                        home_identity=canon_identity,
+                        inbound_channel=channel,
+                        inbound_identity=identity,
                     )
                     result = await self._runtime.resume(
                         canon_channel,
